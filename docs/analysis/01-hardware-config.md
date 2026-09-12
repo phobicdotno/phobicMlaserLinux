@@ -1152,3 +1152,39 @@ What can be replaced by existing Linux / open-source pieces:
 * Language files: `Lang/lang.txt` (`ID#zh#en`) and the per-language `ID#text` files can be loaded as-is (UTF-16LE) or converted to gettext.
 
 Not replaceable (must be re-implemented against the card): everything that turns these parameters into MCC100 register writes (`RegName*`, `AxisRWRegName*`, `SystemRWRegName*`) — covered by the protocol analysis.
+
+## Verification notes
+
+Adversarial re-check of this document against the primary files under `SRC` (verifier session, 2026-09-12). Method: re-ran `objdump -d -M intel MainApp.exe` (kept at scratchpad `mainapp.dis`), wrote a minimal PE section mapper to translate string file-offsets to VAs, re-decoded every cited `lang.txt` id from the UTF-16 file, re-diffed the XML files, re-read the small state files with `xxd`, and re-parsed the descriptor table.
+
+### What was checked and held up
+
+* **Descriptor table (claim 1):** example descriptor `SOP.RemoteType` at `0x785875–0x7858fb` is exactly as described (section `"SoftParam"`, label `pd292`, value `g+0x4028`, type 4, default `"0"`, min 0, max 1, options `0xa490e8`×3 = `pd178/pd179/pd180`). Independent re-count of records gives 1 004 pattern hits of which 3 are false positives → ≈1 001. Attribute counts re-verified: `BkHardPara.xml` 446 + `BkManuPara.xml` 331 = 777.
+* **Laser family (claim 2):** `0x567263` copies the connection object's `+0x3c` into `g+0x46dc` (= `SP.m_iHardwareModel`, descriptor at `0x7a1765`); `0x567288–0x5672d5` maps `0xdd→2`, `0xde→1`, `0xdf→0` into `g+0x46d8` (= `SP.m_iEnableLaserType`, descriptor `0x7a1479`); `0x5672e4` tests for `0xe0` (224) and shows `A250607_2` (`0x841af0`); `0x41111c`/`0x4111c3` compare `g+0x46d8` with 0/1. `lang.txt` `A241024_0/1/2` = 光纤/CO2/蓝光激光器.
+* **CO2 control (claim 3):** combo constructor `0x780442–0x78047e` pushes `pd640, A250522_1, A250522_2, A250522_3` into `0xa48fc8`; descriptor `LGP.CO2LaserControlType` at `0x794c31–0x794cb4` has default `"2"`, max `3.0`, options `0xa48fc8`×4. XML values (`CO2LaserControlType=2`, `CO2DOLaser=9`, `LaserControlType=3`, `DOLaserGate=5`, `DORedLight=6`) re-read from `BkHardPara.xml`.
+* **Axis numbers (claim 4):** all `MAC*` values re-read from the XML; 8000/31.003 = 258.04, 8000/31.009 = 257.99 re-computed; labels `EtherAxisInfos_4/10`, `A241021_1`, `GoHomeAdv_2..5` re-decoded.
+* **ZF / endpoints (claim 6):** combo `0x780322/0x780338` = `pd170`, `pd1733_1` (2 entries) bound to `ZF.ZFType` (descriptor `0x783003`, value `g+0x490c`, label `pd248`); NCModule.dll contains the key names `OnBZFIP`, `OnBZFPort`, `OnBZFMinHardwareVer`, `NCZFMinHardwareVer`, `AFMinHardwareVer`, `EC3710IP`, `AdvAFIP`, `MonitorIP`, the RTTI names `CMCHalAPI/CAFNetHalAPI/CECNetHalAPI/CLaserNetHalAPI/CSerialHalAPI/CMonitorHalAPI/IHalAPI` and `CStdModbus/CIPGModbus/CRaycusModbus/CSerialModbus/CExtCardModbus/CFTC61Modbus/CMonitorModbus/CExtModbus/IModbus`, and the log tags cited. `pd171/172/173/1731/1732/1733` are indeed absent from MainApp.exe (only `pd1733_1` present).
+* **Gas / DO / DI (claim 7):** all XML values re-read; `pd273`, `pd283`, `pd264/263/265` re-decoded.
+* **Pendant switch (claim 8):** `0x498ed6` `cmp [g+0x4028],3`; `0x586e70` `LoadLibraryW(0x8430c0 "PHBX.dll")`, `GetProcAddress` `"Xinit"` (`0x8430d4`) then `"XOpen"` (`0x8430dc`); jump table at `0x597d2c` = cases 0,1→`0x599a80`, 2→`0x59a010`, 3→`0x599380`. PHBX.dll version strings and exports confirmed.
+* **Second backup (claim 9):** diff re-run: identical result (3 element groups).
+* **scFlie files (claim 11):** `0x4047d0` pushes `0x7c4744 "scFlie"`, `0x404809` pushes `0x7c474c "eof"`; AutosaveParam writer `0x446c50` (`fmul 0x7d0ec8`, constant read = 1000.0) and reader `0x43c9a2–0x43ca57` (int, double, double, int, int; `fld 0x7d0eb8`, constant read = 0.001); `JumpAddTime` reader `0x443b79–0x443baf` (`push 0x64` default 100, `fild`, `fmul 0.001`); `Is4Freq` reader `0x4afeb6` → byte `g+0x4cfd`; `PithCompensate` path push at `0x4b248b`, dialog reload at `0x5013bb`. `IsLimit/SlowRatio/K_X/Arc2SegVelK/LimitSamllCircleVel` are absent from MainApp.exe, MotionCtrl.dll, ControlModule.dll, NCModule.dll and ParaModule.dll strings (ASCII and UTF-16).
+* **lang.txt direction labels (claim 12):** `pd168#负向#Positive`, `pd169#正向#Negative` confirmed; direction combo `0xa48ec4` is built at `0x7802b2/0x7802c8` in the order `pd168`, `pd169`.
+* Log evidence: `Log/2025-07-18.log` ends 15:49:27 with `MC-RecvErr_selectFunc ErrCode:10060 Try-Times(R/S):3/3`, matching `MCMaxSendTime=2`/`MCMaxRecvTime=3`/`MCTimeout=500`.
+
+### What was changed
+
+1. **Claim 5 downgraded** (slot order X,Y1,Y2,Z,W): the axis-index list at `g+0xba58` *is* written — by the constructor `0x40b290` (`count=2`, indices `0,1,2,3,4`, Y master slot `g+0xbaa0=1`, Y slave slot `g+0xbaa4=2`). Slots 0/1/2 = X/Y1/Y2 are now `[confirmed]`; slots 3/4 are `[guess]` because the `WAxis` INI accessor uses slot 3 and the card registers only know X/Y1/Y2/W, contradicting the `A250516` list. The statement "slot 4 homes in the negative direction" was factually wrong (`MAC_4.GoOriginalDirection=1` = positive) and was corrected.
+2. **Claim 4 downgraded on limit polarity:** the descriptor labels for `NegativeLimitInput`/`ForwardLimitInput` are `EtherAxisInfos_8/9` = 正限位/负限位 (positive/negative), the reverse of the attribute names. §1 caveat, §2.2, §2.3, §2.8 and §8 now carry the ambiguity; the original text also mis-quoted `EtherAxisInfos_8/9` as "负限位/正限位".
+3. **Claim 8 partially downgraded:** the identification of the USB device VID 3689 / PID 8762 as the PHBX receiver is unsupported (no such constants in PHBX.dll or MainApp.exe; MainApp's own HID matching uses VID `2016`, PID `6125`/`2012` at `0x59b0ba–0x59b171`). Marked `[guess]` with the licence-dongle alternative.
+4. **Claim 10 corrected:** `0x567c3e` is the default-value push of a `GetPrivateProfileIntW` read, not a write of `NormalExit=1`. The real writers are `0x459a9e` (`"1"`, in the `--- Exit Sys ---` routine that then calls the axis-position writer `0x45cf80`), `0x48f32e` (`"1"`) and `0x56835b` (`"0"`, start-up). The reader reads `XAxis/YAxis/ZAxis` only; `WAxis` is never read back. The 0.001 mm unit remains `[likely]` but the text now states that no scaling instruction exists in MainApp to prove it.
+5. **§0.3 downgraded** (`[confirmed]`→`[likely]`): the primary `HardPara.xml`/`ManuPara.xml`/`SystemPara.xml`/`LayerPara.xml` named in the load sequence do not exist anywhere in the package.
+6. **Additions:** `AutosaveParam1/2` alternate by parity of the item index (`0x446cd4–0x446d04`), matching all four samples; `File/autosave.chf`, `File/BkLayerPara.xml`, empty `File/PM/` added to the file table; `File/Temp/` contains only five files; `lang.txt` has five duplicated ids (`A241224_0` twice with different meanings, `A250616_0`, `gp100`, `pd1001`, one blank); `CO2DOLaser`'s descriptor label is `pd264`, not `A241104_3`; descriptor type-code histogram; PHBX.dll full export list; dual-drive copy code `0x4b06a5–0x4b07f8` as evidence for slot 2 = Y2.
+
+### What remains uncertain
+
+* Physical +/− assignment of every limit-switch pair (§1 caveat).
+* Roles of `PMachineAxisConfig_3` and `_4` (Z vs W vs unused) and which slot the lifting table drives.
+* Whether the running program writes anything other than the `Bk*` files, and where the "primary" parameter files would be.
+* Units of the position register captured in `softPara.ini` (0.001 mm is plausible but unproven in code).
+* Identity of the USB "USBKey" device (pendant receiver vs licence dongle).
+* Everything listed under §7 items 2, 4, 5, 6, 7, 8, 9 by the original analyst is unchanged.

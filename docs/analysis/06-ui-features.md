@@ -22,18 +22,22 @@ package's own English column is misleading I say so.
 
 | File | Size | Encoding | Notes |
 |---|---|---|---|
-| `Lang/lang.txt` | 289 746 B, 3 485 lines | UTF-16LE with BOM `FF FE`, CRLF | master file, modified 2025-06-24 |
-| `Lang/lang.txt.orig` | 227 996 B, 2 814 lines | UTF-16LE BOM, CRLF | previous master, dated 2024-01-24 |
+| `Lang/lang.txt` | 289 746 B, 3 486 lines (3 485 CRLF; 3 431 records + **55 blank lines interspersed** from line 1421 onward, not only trailing) | UTF-16LE with BOM `FF FE`, CRLF, no stray CR/LF | master file, modified 2025-06-24 |
+| `Lang/lang.txt.orig` | 227 996 B, 2 815 lines, 2 800 records, 2 799 unique IDs (`pd1001` already duplicated) | UTF-16LE BOM, CRLF | previous master, dated 2024-01-24 |
 | `Lang/French.txt` … `Vietnamese_LE.txt` (10 files) | 249–296 KB | UTF-16LE BOM, CRLF | all dated 2024-09-26 |
-| `Lang/Readme.txt` | 1 190 B | UTF-8, CRLF | format description |
-| `Lang/lang.ini` | 303 B | UTF-8, CRLF | `[Global] hintStr=… Lang=English` |
+| `Lang/Readme.txt` | 1 190 B | UTF-8 **without BOM**, CRLF | format description; lists only Russian/German/Spanish as existing translations |
+| `Lang/lang.ini` | 303 B | UTF-8 without BOM, CRLF | `[Global] hintStr=… Lang=English` (`hintStr` value spans 4 physical lines) |
 | `Lang/语言修改记录.txt` ("language change record") | 4 140 B | UTF-8, CRLF | change log 2022-04 → 2024-03 |
 | `LanFormatEStr.txt` (root) | 258 B | ASCII, CRLF | `[SC] Var1..Var15` list of IDs |
 | `排样内核错误代码.txt` (root, "nesting kernel error codes") | 398 B | UTF-8 (not GBK – GBK decode fails at byte 11) | see §7.9 |
-| `Report/report.txt`, `Report/LogReport.txt`, `Report/TotalReport.txt` | – | GBK (Chinese `分`/`秒` decode correctly with `iconv -f GBK`) | CSV-like report rows |
+| `Report/report.txt` (198 B), `Report/LogReport.txt` (4 795 B), `Report/TotalReport.txt` (270 817 B, 2 950 rows) | – | **UTF-8, not GBK** (VERIFIER: `iconv -f GBK` fails at byte 2/23/62; python `.decode('utf-8')` succeeds for all three – the analyst's GBK statement was wrong) | CSV-like report rows |
+| `File/ProcessesStatistic.txt` | 53 B | **GBK** (`iconv -f GBK` → `未命名-1,0.0X0.0mm,0mm,0mm,0,0秒,1970-01-01 08:00:00`) | the only GBK text file found; same row layout as the old 7-column report |
+| `Report/lang.txt` | 7 B | ASCII `lang==0` (no newline) | language switch for `report.exe` |
 
-Nothing in `Lang/` is GBK; the whole UI string set is Unicode. The task brief's expectation of GBK applies only to
-some root-level text files and the report CSVs.
+Nothing in `Lang/` is GBK; the whole UI string set is Unicode. VERIFIER: the report CSVs are UTF-8 too; the only
+GBK text file found in the package is `File/ProcessesStatistic.txt`. `TotalReport.txt` rows written from 2025 on use a
+10-column layout (`名称, 幅面, 完成时间, 切割长度, 空走长度, 穿孔数, 耗时, xx Sec, xx Sec, xx Sec`) versus the 7-column layout
+of 2024 rows – a report parser must accept both.
 
 ### 1.2 Record format (EVIDENCE)
 
@@ -54,10 +58,28 @@ returns nothing). Every line is a three-field record `ID#Chinese#English` (first
 `0_SongFont#宋体#Arial`). Other language files are two-field `ID#text`. `#` is the separator and is never escaped;
 one malformed line exists: `mv24, ,##` (ID contains a comma and space, both texts empty).
 
-Runtime behaviour implied by Readme rule (2) is confirmed by the binary: 2 564 of the 3 427 unique IDs occur
-literally as UTF-16 strings in `MainApp.exe`; the remaining 863 are either numbered families that the code builds
-with `sprintf` (`RegName%d`, `AllAxisInfo_%d`, `RTC_RO_%02d` …) or dated `A2504xx_n` IDs that live in the module
-DLLs (`Module/LangModule.dll` = 69 120 B is the loader; INFERENCE, high).
+Runtime behaviour implied by Readme rule (2) is consistent with the binary, but the analyst's numbers were off
+(VERIFIER re-run): with `strings -a -e l` (default minimum 4 chars) 2 578 IDs occur literally in `MainApp.exe`; with
+`strings -n 2` (needed for 3-char IDs such as `gp1`, `zf0`, `pd0`) **2 771 of 3 427** occur literally, 656 do not.
+The claim that the missing IDs "live in the module DLLs" is **refuted**: only `Module/NCModule.dll` carries language
+IDs (374, every one of them also present in the exe) and `LangModule.dll` only `0_SongFont`; `AutoNest.dll`,
+`SmartNest.dll`, `Dxf2Grp.dll`, `CADModule/ControlModule/LogModule/ParaModule.dll` carry none. No `RegName%d`-style
+format string exists anywhere in the exe either; instead the bare roots `ab`, `af`, `de` (and `%d`/`%02d`) occur as
+standalone UTF-16 strings, so numbered IDs are evidently built by string concatenation (`CString + number`) rather
+than `sprintf` (INFERENCE, medium). The 656 non-literal IDs are dominated by `pd` (177), `RegName` (143), `mf` (105),
+`mp` (46), `SystemRWRegName_` (24), `ls` (all 14), `db`/`da` (all 17), `gmsg` (all 5); some of these families may be
+dead entries.
+
+Loader (EVIDENCE, high): `Module/LangModule.dll` (69 120 B, PDB `D:\SC2000\NexCut\NexCut_X1_Http\Release\Module\LangModule.pdb`,
+single export `newModuleProvider`) contains the UTF-16 strings `\Lang\lang.ini`, `\Lang\lang.txt`, `Global`, `Lang`,
+`glang`, `\*.txt*` (directory enumeration), `0_SongFont`, `0_FontSize`, the language names `English, Russian, German,
+Spanish, Portuguese, French, Italian, Polish, Vietnamese, 简体中文` (no `Turkdili`, no `Vietnamese_LE`) and a build
+date string `2014.9.22`. `MainApp.exe` itself also contains `\lang.txt` and `//LanFormatEStr.txt`, and a compiled
+language-name table `Turk dili, Vietnamese, Polish, Italian, French, Portugu[ese], Espa[ñol], Deutsch, English`
+adjacent to `pd362/pd361/Theme01/Theme02` – i.e. the `pd378` enum list is compiled into the exe, `lang.ini hintStr`
+is only a comment. Soft-parameter keys `SP.Lang` and `SP.Skin` (39 `SP.*` keys in total, e.g. `SP.UIDir`,
+`SP.SoftwareThemeType`, `SP.m_iHardwareModel`, `SP.MachineID`) show that language and skin are persisted as
+software parameters, not only in `ipAdd.ini`.
 
 `Lang/lang.ini` `[Global] hintStr` enumerates the language index → name table used by parameter `pd378`
 "软件.语言(Language)": `0 简体中文, 1 English, 2 русский, 3 Deutsch, 4 Español, 5 Portuguese, 6 French,
@@ -74,14 +96,17 @@ Var11=EtherAxisInfos_23  Var12..Var15=AFEtherCATIndex
 ```
 
 All listed IDs are parameter labels ("参数.扫描方向", "短距离不关气", "加工中不关气", "抱闸.输出端口",
-"EtherCAT.轴序号"). INFERENCE (medium): this is the exception list for the `MainItem.SubItem` format check
+"EtherCAT.轴序号"). VERIFIER: file content re-read and confirmed verbatim; `MainApp.exe` references the file as the
+UTF-16 string `//LanFormatEStr.txt`. The string `Lang Format Error` does **not** occur in any exe/dll of the package
+(ASCII or UTF-16), so the Readme's error text is either assembled at runtime or outdated – keep the exception-list
+interpretation at **medium**. INFERENCE (medium): this is the exception list for the `MainItem.SubItem` format check
 described in the Readme ("Lan Format E[xception] Str") – IDs whose text is allowed to violate the dotted format
 (pd113-1 and pd117 have no dot; pd719_x are reused inside a different group). A Linux port should treat the
 dotted convention as a *display* convention (group header / row label in a property grid), not as data.
 
 ### 1.4 Integrity of the master file (EVIDENCE)
 
-* 3 431 records, 3 427 unique IDs, 0 records with fewer than 3 fields.
+* 3 431 records, 3 427 unique IDs, 0 records with fewer than 3 fields (VERIFIER: re-parsed – every record splits into exactly 3 fields, so no `#` ever appears inside a text; the `mv24, ,##` line is the only ID containing whitespace/comma).
 * 4 duplicated IDs (first occurrence wins if the loader uses a map; unknown which wins in practice):
   * `gp100` = "电动调焦硬正限位告警 / Auto focus hardware positive limit alarm" (line 222) and "工艺 / Craft" (line 380)
   * `pd1001` = "停止交换 / Stop Exchange" (1181) and "一级穿孔基础.穿孔高度 / Third Drill Basic.Third Drill Height" (2455; the English is a copy-paste error)
@@ -105,9 +130,37 @@ dotted convention as a *display* convention (group header / row label in a prope
 | German.txt | 3 275 | 165 | 13 |
 | Russian.txt | 3 283 | 154 | 10 |
 
-All ten secondary files are dated 2024-09-26 and lack every ID added after that date (the `A2410xx…A2506xx`,
-`newLang*`, EtherCAT register families). Per Readme rule (2) those UIs display raw IDs for the new features.
-None of the secondary files contains an entry that helps fill a gap in `lang.txt`, so they were not needed.
+VERIFIER – the statement that the secondary files "lack every ID added after 2024-01 (`newLang*`, EtherCAT register
+families)" was **wrong**. Re-check against the 630-ID added set: French, Spanish, Russian, Turkdili and Vietnamese each
+contain **486 of the 630 added IDs**, including all 80 `newLang*`, all 41 `SBT*`, 131 of the `*RegName_*` bus-register
+IDs and every dated ID up to `A240919_3`. What they lack is only the ~144 IDs introduced from `A241009_1` (2024-10-09)
+onward plus a few reworked ones – consistent with their 2024-09-26 file dates. So non-Chinese/English UIs show raw
+IDs only for the 2024-10 → 2025-06 features (smooth pierce, laser class fiber/CO2/blue, CO2 IO set, device
+connection/login/offline files, capacitive edge-seek wizard, technology library, lifting platform, backlash
+compensation, pendant status).
+
+Full per-file statistics (entries = non-empty lines, unique = distinct IDs):
+
+| File | Entries / unique | Missing vs lang.txt | Obsolete | Defects found |
+|---|---|---|---|---|
+| French | 3 285 / 3 284 | 154 | 11 | 5 three-field records (`ec12#PWM#PWM`, `lp17##…`, `mp202##…`), dup `pd640_4th` |
+| German | 3 276 / 3 275 | 165 | 13 | `RegName101##…` (empty text, English fallback in 3rd field) |
+| Italian | 3 284 / 3 281 | 157 | 11 | broken line `pd604Cool Point.Cool Lead Position` (lost `#`), `gp142#…#…`, `mv24, ,##`, dups `pd1001`, `pdAFDA_FocusEnableDelay` |
+| Polish | 3 286 / 3 283 | 155 | 11 | `mp19#System recovery is done#Odzyskiwanie…` (English + Polish), dups `gp4`, `pd1001` |
+| Portuguese | 3 282 / 3 280 | 160 | 13 | one record without any `#`, `mf439#…#…`, dup `mf221` |
+| Russian | 3 284 / 3 283 | 154 | 10 | `RegName101##…` |
+| Spanish | 3 267 / 3 266 | 170 | 9 | one record with a lone LF before `pd1570-3` (`\npd1570-3`) |
+| Turkdili | 3 279 / 3 276 | 155 | 4 | `ab2 ` with trailing space, dups `mf49`, `pd1001` |
+| Vietnamese | 3 280 / 3 279 | 163 | 15 | **missing CRLFs** merge records (`mf248#…mf249#…`, `pd124#…pd125#…`, `pd1537-1#…pd1538#…`) → those IDs are lost; stray IDs `Large`, `multi-select)`, `hp38 ` |
+| Vietnamese_LE | 3 213 / 3 210 | 251 | 34 | same merges; 103 entries differ from `Vietnamese.txt` (mostly full-width `，` → `.`), 88 IDs fewer; not referenced by `lang.ini`, `LangModule.dll` or the exe language table |
+
+Every secondary file also carries the same `mv24, ,##` artefact or similar junk, and each has at least one duplicated
+ID (`pd640_4th` in all ten). A Linux port that re-uses these files must (a) tolerate 1- and 3-field lines, (b) split
+merged records on the `[A-Za-z0-9_]+#` pattern rather than on CRLF only, and (c) decide a first/last-wins rule for
+duplicates. Obsolete IDs common to most files: `hp101-103`, `mf159`, `mf410`, `mp127`, `pd231/232`, `pd80-1/2/3`,
+`pd980` (all deleted from `lang.txt` before 2024-01). The Readme names only Russian/German/Spanish; `Turkdili` is
+known to the exe (`Turk dili` in its language table) but not to `LangModule.dll`'s name list, and `Vietnamese_LE`
+("LE" unexplained) is known to nothing – possibly a translator's alternate copy.
 
 ---
 
@@ -115,13 +168,19 @@ None of the secondary files contains an entry that helps fill a gap in `lang.txt
 
 ### 2.1 Statistics (EVIDENCE, diff by ID)
 
-* Added: **630** IDs. Removed: **2** (`ab0#确定#OK`, `mp40#返回#Return`). Text changed: **45**.
+* Added: **630** IDs. Removed: **2** (`ab0#确定#OK`, `mp40#返回#Return`). Text changed: **43** by first-occurrence
+  comparison (VERIFIER re-diff; the analyst's 45 presumably counted the duplicated `gp100`/`pd1001` records). Four changed
+  IDs were missing from the table below and are added: `mp161` `—加工计数—` → `加工计数` (dashes removed),
+  `nset_UI_Sheet2MainView` `板材辅助到主视图` → `板材复制到主视图` ("copy sheet to main view"), `pd514/515`
+  `方飞切开/关Pwm提前时间` → `…Pwm时间修正` ("PWM advance time" → "PWM time correction"), `pd754-1`
+  `电容异常变大门限` → `电容异常变化门限` ("abnormal capacitance increase threshold" → "…change threshold").
 * The additions are exactly the new-generation feature set (see §5): EtherCAT bus axes (`EtherAxisInfos_*`,
   `AllAxisInfo_*`, `AxisTypeName_*`, `AxisInputStr_*`, `EtherCAT*`, `GoHomeAdv_*`, `SystemRWRegName_*`,
   `RORegName_*`, `RWRegName_*`, `AxisR[OW]RegName_*`, `PulseAxis*`), smart cutting-head telemetry (`RTC_RO_*`,
   `RTC_RW_*`), height-controller register view (`ZFReadOnly*`, `ZFReadWrite*`), touch-panel buttons/LEDs
   (`SBT01-42`, `SLED01-11`), themes (`Theme01/02`), burn-in test, laser test, single-axis test, disc centre finding,
-  4th/5th-level piercing (`newLang*`), and 166 dated `Ayymmdd_n` IDs (2024-08-27 → 2025-06-20).
+  4th/5th-level piercing (`newLang*`), and 164 unique dated `Ayymmdd_n` IDs (166 records; 2024-08-27 → 2025-06-20; VERIFIER: the
+  earliest date is `A240827`, there is **no** `A2406xx` ID – see corrections in §4.5/§6.2/§7).
 
 ### 2.2 Notable text changes (EVIDENCE, old → new)
 
@@ -168,7 +227,9 @@ The log stops at 2024-03; the 630 later additions are undocumented except by the
 
 ## 3. ID-prefix → module map
 
-Counts are unique IDs in `lang.txt`. The module attribution comes from (a) the text content, (b) MFC runtime-class
+Counts are *records* in `lang.txt` (VERIFIER: unique-ID counts are one lower for the duplicated families: `pd` 1 290,
+`gp` 161, `A<yymmdd>_n` 164; `AllAxisInfo_` has 15 numbered IDs plus the un-numbered root `AllAxisInfo`; `np` = 14 not 15;
+`EtherCAT*` = 20 exactly). The module attribution comes from (a) the text content, (b) MFC runtime-class
 names found as RTTI strings in `MainApp.exe` (`.?AVC…@@`, 171 classes, 69 application-specific windows – list in
 §9), and (c) which IDs appear literally in the exe. Confidence is given per row.
 
@@ -289,7 +350,7 @@ Ribbon top-level tabs / groups (INFERENCE from label grouping, high):
 
 | Feature | ID(s) | Formats |
 |---|---|---|
-| Open process file | mf149/150 | `*.dxf; *.chf; *.nc; *.txt; *.cnc; *.g; *.plt` (DXF, native CHF, G-code variants, HPGL) |
+| Open process file | mf149/150 | `*.dxf; *.chf; *.nc; *.txt; *.cnc; *.g; *.plt` (DXF, native CHF, G-code variants, HPGL). VERIFIER: the *display* half of the filter string reads `*plt` (typo, no dot) in both columns; the pattern half is correct `*.plt` |
 | Save process file | mf152, mf650 | native `.chf` ("Untitled-" default); autosave `File/autosave.chf`, `File/Temp/tempGraph.chf` |
 | Import limit | mf154 | files > 100 MB refused by Import; use Open |
 | Craft (layer) file | FileFilter_CraftFile, lp7-11 | "工艺文件" export/import of layer parameters; A250418_0-A250419_2 **technology library** (工艺库) with description, export-to-library, overwrite prompt |
@@ -369,7 +430,7 @@ SQLite-like "database connect failed" (`db9`). `A250421_0` warns when a task's l
 | Nozzle clean | mp134, pd2000-2012, ap40-43 | brush Z, dive depth, start XY, speed, direction, times, length |
 | Focus +/- , focus origin | SBT09/28/23, af14/15 | |
 | Pallet / exchange / auto-feed / rotate / unlimited roll | mp180-187, SBT26/30-32, mp500/501 | |
-| Handheld pendant status | A240613_0-5, A240828_1, mp0/01 | loaded, disconnected, low battery, poor signal, sleep/wake; "inactive page, handle unavailable" |
+| Handheld pendant status | A250613_0-5 (VERIFIER: not A240613 – no such IDs exist), A240828_1, mp0/01 | module loaded, disconnected, low battery, poor signal, dormant/wake (`手柄 休眠`/`手柄 唤醒`); A240828_1 "inactive page, handle unavailable"; mp0/mp01 "handle adapter connected/disconnected" (`手柄适配器已连接/已断开`) |
 | Dock/adjust points | ap2-10 (9 positions), ap20-22, ap30/31 | set zero, all zero, auto seek, seek settings |
 | Precise beam / burst test | newLang200-206 | laser test view: power/duty/freq, long-emission time, remaining time |
 
@@ -536,8 +597,11 @@ Small-circle speed limit `pd1560/1561` (also `JumpAddTime.txt [LimitSamllCircleV
 Alarm panel (`gp84-94`, `gp140`, `gp88/88-1`, `mf123/124`, `pd526/527`, `pd671/672`): time/description/message
 columns, "Alarm: %s %s" / "Alarm cleared", reconnect, clear alarm, Z home, settings; alarm bar colours; log enable.
 Work report (`gp130-146`, `mf252/253`, `Report/report.exe`, `Report/*.txt`): file name, size, cut length, dry length,
-pierce count, end time, process time, piece count; CSV rows in `Report/TotalReport.txt` (GBK:
-`未命名-1,20.84×20.84mm,0.07m,0.05m,0,0分01秒,2024-07-25 14:48:15`). Device report (`pd880-888`, `mf801`, `ap20-22`,
+pierce count, end time, process time, piece count; CSV rows in `Report/TotalReport.txt` (**UTF-8**, VERIFIER-corrected:
+`未命名-1,20.84×20.84mm,0.07m,0.05m,0,0分01秒,2024-07-25 14:48:15`; 2025 rows have 10 columns, e.g.
+`未命名-1,225.45×85.17 mm,2025-07-18 14:23:20,0.69 m,0.05 m,1,0分21秒,18.25 Sec,0.22 Sec,1.30 Sec`). `Report/report.exe`
+(45 789 184 B) is a **statically linked Qt5 application** (PDB strings `Qt5Core/Qt5Gui/Qt5Widgets/Qt5PrintSupport.pdb`,
+`qgif.pdb`, `libEGL/libGLESv2`; PE32 GUI, only ICON/GROUP_ICON/MANIFEST resources) – answers open question 9. Device report (`pd880-888`, `mf801`, `ap20-22`,
 `mp302`): total power-on, controller comm time, processing time, last processing time, laser-on time, processing
 count, X/Y/Z total travel; `A241105_1` run time. Statistics view `mf117`.
 
@@ -598,8 +662,12 @@ graph, `pd485` ruler, `pd375-377` refresh period & keyboard move step, `A250419_
 Codes: the language file carries no numeric codes; the *ID* is the code the software uses. Where the ID number
 maps to a controller bit (gp1-59 look like a bit-ordered alarm-word decode: servo 1-4, encoder 5-8, dual-drive
 9-12, network 13, FPGA 14/15, E-stop 16, hard +limit 17-20, hard -limit 21-24, soft +limit 25-28, soft -limit
-29-32, Z 33-43, laser 44-55, chiller 56, comm 57-59) I note it as INFERENCE (medium; consistent with `RegName5`
-"Alarm status" and `RegName31` "Laser alarm status" registers).
+29-32, Z 33-43, laser 44-55, chiller 56, comm 57-59) I note it as INFERENCE (VERIFIER: downgraded to **low**).
+Re-examination: `gp1…gp32` is exactly 32 entries and would fit one 32-bit word (`RegName5` 告警状态 "Alarm status"),
+but `gp33-59` cannot be in the same word; the FTC has its own `ZFReadOnly02` 报警状态, the laser its own `RegName31`,
+and the bus generation two words `RORegName_7/8` 报警状态_1/_2. So at most `gp1-32` is a plausible bit decode of one
+controller register, and `gp33-43` / `gp44-55` may be decodes of the FTC / laser alarm words – none of this has been
+confirmed in code; no `gp%d` format string exists in the exe (numbered IDs are concatenated at runtime).
 
 ### 6.1 Controller / axis alarms (`gp*`)
 
@@ -704,7 +772,7 @@ maps to a controller bit (gp1-59 look like a bit-ordered alarm-word decode: serv
 | A250213_2, A250220_3, A250212_10 | graphic <50×50 mm cannot auto-match sheet; start corner must be a box corner; wrong sheet size → head-crash risk |
 | A250606_0/1, A241220_0-3 | file error; >500 MB; offline file wrong / generated–upload? / upload failed / success |
 | A250607_0-3 | switched to / currently fiber or CO2 laser – check settings before processing |
-| A240613_1-3 | pendant disconnected / low battery / poor signal |
+| A250613_1-3 (corrected from A240613) | pendant disconnected / low battery / poor signal |
 | newLang24 | leaving page stops burn-in test |
 | jm2/3 | pendant pairing success / invalid signal |
 | is1, af23, hp37/38, zf37-39, zf50 | parameters written – hardware will restart / restart software / reconnect |
@@ -742,8 +810,14 @@ maps to a controller bit (gp1-59 look like a bit-ordered alarm-word decode: serv
 | 15 | 线段太短 | segment too short |
 | 100 | 内存分配失败 | memory allocation failed |
 
-These map 1:1 onto `mf496-506` (INFERENCE, high) and reveal the nesting kernel works through temp files, a
-Python script and `.grp` files (`Dxf2Grp.dll`, `dat/tmpnst1/`).
+VERIFIER: the "1:1 onto `mf496-506`" claim is **overstated**. Only five codes have a matching UI string: 1 → `mf496`
+没找到加密狗, 3 → `mf497` 排样出现不封闭轮廓, 9 → `mf498` 板材尺寸太小, 15 → `mf499` 线段太短, 100 → `mf500` 内存分配失败
+(and possibly 12 → `mf501` 输出结果错误 "output result wrong"). Codes 2, 4-8, 10, 11, 13, 14 have no UI text, while
+`mf502-506` (kernel unknown error, process/system out of memory, too much fill data, no nest part) and `mf520-524`
+have no code in this file – the software must map the remaining codes to a generic message (INFERENCE, medium).
+The file does reveal that the nesting kernel works through temp files, a Python script ("打不开py" = cannot open
+.py) and `.grp` files (`Dxf2Grp.dll`, `dat/tmpnst1/`). Note the file's own separator is inconsistent (`7---找不到grp`,
+`9-- 板材尺寸太小`).
 
 ---
 
@@ -751,7 +825,7 @@ Python script and `.grp` files (`Dxf2Grp.dll`, `dat/tmpnst1/`).
 
 | Category | Evidence | Item |
 |---|---|---|
-| Vendor | `ab6` (orig) 版权所有 2014起 奥森迪科 / AU3TECH; `ab2` SC激光切割系统; `mf459` SC System; `mf600` SC1000 V1.0.107 SP2; Readme "SC2000" | Original developer 奥森迪科 (Aosendike, "AU3TECH"); product line SC1000 → SC2000 |
+| Vendor | `ab6` (orig) 版权所有 2014起 奥森迪科 / AU3TECH; `ab2` SC激光切割系统; `mf459` SC System; `mf600` SC1000 V1.0.107 SP2; Readme "SC2000"; `MainApp.exe` string table 9 = `SC2000\n\nSC2000\n\n\nSC2000.Document` (MFC doc template); `File/softPara.ini` section `[SC2000]`; PDB paths `D:\SC2000\NexCut\NexCut_X1_Http\Release\MainApp.pdb` (same tree for Control/Lang/Log/NC/ParaModule.dll), `C:\Users\Michael\source\repos\CAD_head_update\sc2000-e\Release\Module\CADModule.pdb`, `DLL\HePin\Release\AutoNest.pdb`, `\MotionCtrl_dll_V1.3.22\Release\MotionCtrl.pdb`, `\DxfParseDllvc100-v1.4.92\…`, `\opennurbs_Dll\OpenNurbs_Dll_v1.3.14\Release\splineAnalyerVc100.pdb` (VERIFIER additions) | Original developer 奥森迪科 (Aosendike, "AU3TECH"); product line SC1000 → SC2000; internal project name **NexCut** (variant `NexCut_X1_Http`), CADModule rebuilt separately from a `sc2000-e` fork ("CAD_head_update"), spline DLL is openNURBS-based, nesting DLL from a third party ("HePin") |
 | Motion controllers | `pd1732/1733` MCC3721H / MCC3721NA; `RegName89` MCC3721硬件版本; `mf143` "MCC"; `Update/MCC100_V201.52.mcf`; `mp150` "MC Controller" | MCC3721H/NA (FPGA-based, "FPGA program not loaded"), MCC100 (this machine); Modbus port 502 in `ipAdd.ini` |
 | Bus generation | `EtherAxisInfos_*`, `SystemRWRegName_11-27` (16 bus axes + pulse axis), `pd640_EtherCAT`, `pd640_XY2` "XY V2_0", `EtherCATErrorInfo_*`, `A241009_1` | EtherCAT master controller variant (not the one fitted here – INFERENCE medium: `ipAdd.ini` has no EtherCAT keys and `EC3710IP` refers to the extended card) |
 | Height controllers (FTC/ZF) | `pd171-173, pd1731, pd1733_1` FTC10 (Ethernet 10.1.1.169:502), FTC61 (IO / PC serial / MCC serial), onboard FTC; `pd562/563` 联品 "Super", 天星 "TXStar" servo types; `zf67` follow lib version; `ipAdd.ini OnBZFMinHardwareVer=311, NCZFMinHardwareVer=325` | Capacitive height sensor with its own FPGA (`gp141`), PID params exposed |
@@ -759,7 +833,7 @@ Python script and `.grp` files (`Dxf2Grp.dll`, `dat/tmpnst1/`).
 | Smart cutting head | `RTC_RO_33` 切割头名称, lens temps, scatter, humidity | Head with sensor telemetry; "RTC" family (INFERENCE low: could be Raytools-style head) |
 | Lasers | `pd47-51` Raycus, IPG, Semiconductor, MaxPhotonics (创鑫), nLight, GZ (国志), Others; `A241024_*` fiber / CO2 / blue; `A241025_4` glass tube; `pd180` CypCut; `LaserIP 10.1.1.170:10001` | Laser vendor list; CO2 glass-tube support is new (2024-10) |
 | Servo drives | `pd380-383_1` Panasonic A5, Delta B2, Yaskawa, Inovance IS, Leadshine L7P/L7RS | |
-| Pendant | `RegName40-46, 90-96` 无线手柄 "LCR", USB adapter addresses & match codes; `jm0-3` pair by pressing Left+Right; `pd292-295` remoter type & 3 match codes; `A240613_*` battery/signal/sleep; `PHBX.dll` (`XGetDevRssi`) | Wireless handheld pendant with USB dongle receiver |
+| Pendant | `RegName40-46, 90-96` 无线手柄 "LCR", USB adapter addresses & match codes; `jm0-3` pair by pressing Left+Right; `pd292-295` remoter type & 3 match codes; `A250613_*` battery/signal/sleep; `PHBX.dll` (`XGetDevRssi`) | Wireless handheld pendant with USB dongle receiver |
 | Extended card | `ec27` "EBH Property", `EC3710IP=10.1.1.170:502`, `pd960-979` | "EC3710" 4th-axis/PWM extension board |
 | Gas | proportional valves via DA (0-10 V), Air/O2/N2 low/high | |
 | Metrology | `cp5` Renishaw formats `.rtl .ren .pos`; `mf702` ball-bar; `mf180` interferometer | |
@@ -769,7 +843,19 @@ Python script and `.grp` files (`Dxf2Grp.dll`, `dat/tmpnst1/`).
 
 Network map from `File/ipAdd.ini` (EVIDENCE): Card 10.1.1.168:502; ZF 10.1.1.169:502; OnB-ZF 10.1.1.168:999;
 OnB-Laser 10.1.1.168:888; Laser 10.1.1.170:10001; AF 10.1.1.168:888 / AdvAF :666; EC 10.1.1.168:888 / AdvEC :666;
-EC3710 10.1.1.170:502; Monitor 47.104.17.21:9001.
+EC3710 10.1.1.170:502; Monitor 47.104.17.21:9001. VERIFIER: file re-read and every value confirmed (`[Soft] MinHardwareVer=20152,
+OnBZFMinHardwareVer=311, NCZFMinHardwareVer=325, AFMinHardwareVer=133, Custom=1234, CheckUserID=109, Lang=0, Skin=1`).
+Keys the analyst did not mention that matter for a port: `[IP] ConnectWait=500, MaxItemPerFrame=60, MaxFillItem=2000,
+MCFifoTime=1600, MCTimeout=500, MCMaxSendTime=2, MCMaxRecvTime=3, MCSendInterval=1, FifoTimeout=600, FifoAlarmNum=30,
+MCCore=30, ZFCore=500, LaserCore=1000, MonitorCore=500, MCUpdateFactor=1, ZFUpdateFactor=20, AFUpdateFactor=30,
+ECUpdateFactor=30, MonitorReconnInterval=300000, OfflineTimeout=5000` (protocol pacing/poll periods) and `[Soft]
+RunModel=0, MaxZFDownItem=512, MaxAFDownItem=200, MaxECDownItem=200, EnableOvertime=1, FollowOvertime=20000,
+SectionDrillOvertime=20000, GradualDrillAddOvertime=20000, DAMinVal=50, ManuItemMaxCapcity=1000000, AccessType=1,
+EnableLog=0, R=255 G=1 B=2, AlarmDay=10, AdvLaserWrite=1`. `File/pingMC.bat`/`pingZF.bat` simply `ping 10.1.1.168` /
+`10.1.1.169`, corroborating the card/FTC addresses. `File/BkHardPara.xml` (UTF-8) holds
+`<LGP LaserType="0" LaserControlType="3" LaserDAPort="1" LaserDAType="0" DOLaserGate="5" DORedLight="6" … CO2LaserControlType="2" …/>`,
+`<ZF ZFType="1" …/>`, `<MP … CustomCompanyName="" CustomCompanyPassword="1234" EnableOpenOperatePermission="0" …/>` – the
+raw values behind open questions 4/5; the enum-index → `pd` label mapping is not established here.
 
 ---
 
@@ -778,7 +864,11 @@ EC3710 10.1.1.170:502; Monitor 47.104.17.21:9001.
 EVIDENCE:
 * PE resources of `MainApp.exe`: **7** `RT_DIALOG` (IDs 319, 331, 393, 443, 444, 448, 459), 2 `RT_MENU`, 12 string
   tables, 408 bitmaps, 71 PNG, 1 accelerator. `Dxf2Grp.dll` 3 dialogs, `AutoNest.dll` 1, `BCGCBPRO2210u100.dll` 32
-  (library), `mfc100u.dll` 27 (library). The six `Module/*.dll` have no resources at all.
+  (library), `mfc100u.dll` 27 (library) – VERIFIER re-walked all of these and confirms the counts. The six `Module/*.dll`
+carry only a `MANIFEST` resource each (not "none"). The 12 `RT_STRING` tables of `MainApp.exe` (lang 2052) hold only
+MFC boilerplate (`就绪`, `创建新文档\n新建`, `EXT/CAP/NUM/SCRL/OVR/REC` …) and the doc-template string
+`SC2000\n\nSC2000\n\n\nSC2000.Document` – no application UI text lives in resources, which supports the
+language-file-only model.
 * MFC/BCG RTTI in `MainApp.exe`: 171 class names, of which **69 are application-specific windows**:
   `BatchCutSetDlg, CAboutDlg, CAdjustPtDlg, CAutoFocusView, CBasicNestPanel, CCodeInputDlg, CCompensateDlg,
   CControlPanel, CCraftPropDlg, CDockPtDlg, CDOSelectDlg, CDualServoCheckDlg, CECStatusView, CEdgeSeekDlg,
@@ -799,7 +889,7 @@ language IDs support this: parameter pages are pure `Group.Item` label lists.
 
 Estimate of distinct user-facing windows: **≈ 70 named windows** (69 RTTI classes) + **≈ 15-20 property-grid pages**
 hosted inside `CHardwarePropView`/`CPropPanel` (hardware tabs `hp2-7, hp16-18, hp25, hp29-35, hp55/56, hp70-73,
-hp80/81` = 20 tab labels; layer dialog 12 groups; run-params) + ribbon (2 menus) + ~10 modal message-box flows ⇒
+hp80/81` = 25 tab/section labels (VERIFIER count; several are duplicates such as `hp5`/`hp32` 辅助气体, `hp6`/`hp17` 输入输出); layer dialog 12 groups; run-params) + ribbon (2 menus) + ~10 modal message-box flows ⇒
 **roughly 90-110 screens** to reproduce, of which ~60 are simple forms and ~10 are complex (main OpenGL view,
 control panel, layer dialog, hardware property view, nest panels, FTC/AF/EC status views, PLC editor, edge-seek
 wizard).
@@ -815,18 +905,23 @@ wizard).
    TCP 502) or the EtherCAT `*RegName_` family? `ipAdd.ini` and `Update/MCC100_*.mcf` point to the former; the
    EtherCAT strings may be dead code for this machine.
 3. **`RTC_*` head**: which cutting head model/protocol (serial? via FTC?) – no IP entry exists for it.
-4. **FTC type actually fitted**: `ZFIP=10.1.1.169` (FTC10 network) vs `OnBZFIP=10.1.1.168:999` (onboard) – needs the
-   `File/BkHardPara.xml` value of `pd248/259` "总体.控制方式".
-5. **Laser control type here**: `pd258` laser type and `pd259` control type values (SC MCC / SC PC / CypCut);
-   whether the "CypCut" option means CypCut-compatible laser protocol or PWM/DA emulation.
+4. **FTC type actually fitted**: `ZFIP=10.1.1.169` (FTC10 network) vs `OnBZFIP=10.1.1.168:999` (onboard) – `File/BkHardPara.xml`
+   has `<ZF ZFType="1" SerialPort="0" …/>` (VERIFIER); which `pd171/172/173/1731-1733_1` label index 1 denotes must come
+   from `ParaModule.dll`/the hardware-config analysis. (`pd248` and `pd259` are both labelled `总体.控制方式`; pd248 sits in
+   the FTC group, pd259 next to `pd258` 总体.激光器类型 in the laser group.)
+5. **Laser control type here**: `File/BkHardPara.xml` has `LaserType="0"` and `LaserControlType="3"` (plus
+   `CO2LaserControlType="2"`) (VERIFIER); if the enum follows the `pd174-181` order (DA1, DA2, 0-10V, 0-5V, SC板载,
+   SC电脑, CypCut, 1) index 3 is ambiguous, so the mapping is still open; also whether the "CypCut" option means
+   CypCut-compatible laser protocol or PWM/DA emulation.
 6. **Duplicate IDs** (`gp100`, `pd1001`, `A241224_0`, `A250616_0`): which occurrence the loader uses.
 7. Meaning of `SBT`/`SLED` prefixes (side-button / status-LED?) and whether the touch skin (`Skin=1`) uses them
    exclusively.
 8. `pd180` "CypCut", `pd178/179` "SC板载/SC电脑" – confirm these are laser-control options and not FTC options.
-9. Report generator `Report/report.exe` (45 MB, own `lang.txt` "lang==0"): separate binary, likely .NET/Qt – out of
-   scope here but needed for §4.17 parity.
-10. The `Ayymmdd_n` IDs are missing from every secondary language file – is there a newer translation set
-    upstream, or do those UIs really show raw IDs?
+9. Report generator `Report/report.exe` (45 MB, own `lang.txt` "lang==0"): VERIFIER – it is a statically linked **Qt5**
+   Widgets/PrintSupport application (see §4.17); still out of scope here but needed for §4.17 parity.
+10. VERIFIER-corrected: only the `Ayymmdd_n` IDs dated 2024-10-09 or later (and the other ~140 IDs of that period) are
+    missing from the secondary files; everything up to `A240919_3` is translated. Is there a newer translation set
+    upstream for the 2024-10 → 2025-06 additions, or do those UIs really show raw IDs?
 
 ---
 
@@ -835,7 +930,7 @@ wizard).
 **Must be replicated (behaviour visible to operators):**
 
 * The **string-ID indirection** itself: 3 427 IDs, `ID#zh#en` master + `ID#text` per language, fallback to the raw
-  ID when missing, per-language UI font (`0_SongFont/0_FontSize`), language index table from `lang.ini`. A port
+  ID when missing, tolerant parsing of the secondary files (blank lines, 1-/3-field lines, merged records, duplicate IDs – see §1.5), per-language UI font (`0_SongFont/0_FontSize`), language index table from `lang.ini`. A port
   can reuse the existing files verbatim (UTF-16LE → convert once to UTF-8; keep the IDs as translation keys) – this
   is the cheapest way to get 11 languages for free. Fix the known mistranslations listed in §1.4 in the English
   column only.
@@ -873,3 +968,72 @@ wizard).
 **Design consequences:** keep the ID namespace as the i18n key space; model parameters as a flat key→value store
 with group derived from the label; implement the alarm table as `ID → (source, bit, text)` so §6 can be loaded
 directly; treat `SBT/SLED` as the touch-skin widget set (a second front-end over the same command API).
+
+
+---
+
+## Verification notes (adversarial re-check, 2026-09-12)
+
+Everything below was re-derived from the primary files under `SRC` with `file`, `xxd`, `iconv`, `strings -a [-n 2] -e l`,
+`objdump -p`, a stdlib-only python PE resource walker and python UTF-16 parsing. Nothing under `SRC` was modified.
+
+**Checked and confirmed (unchanged):**
+* Encodings of all `Lang/*` files (UTF-16LE BOM `FF FE`, CRLF, no stray CR/LF), `Readme.txt`/`lang.ini`/`语言修改记录.txt`
+  UTF-8 without BOM, `LanFormatEStr.txt` ASCII, `排样内核错误代码.txt` UTF-8 (GBK decode fails at byte 11 = `0x8c`).
+* `lang.txt`: 3 431 three-field records, 3 427 unique IDs, duplicates `gp100` (lines 222/380), `pd1001` (1181/2455),
+  `A241224_0` (3353/3360), `A250616_0` (3480/3482); no section headers; `mv24, ,##` on line 1139.
+* Diff vs `lang.txt.orig`: 630 added, 2 removed (`ab0`, `mp40`), and the content of every row in §2.2 (`ab6` blanked,
+  `mf173` scb→mcf, `pd171`, `pd1732/1733`, `pd640_4th`, peak-current→peak-power set, dwell/gas re-labels, DI split,
+  `gp40/43`, `hp32/32-1`, `pd2114/2115`, `pd249/250`, `pd124`, `mp80/mf146`).
+* Vendor/product strings `ab2`, `ab6` (orig), `mf459`, `mf600`; file filters `mf149/173/308/438/623`, `cp5`, `hp9`;
+  laser vendor list `pd47-51`, `A241024_0-2`, `A241025_4`, `pd178-180`; servo presets `pd380-383_1`; FTC types
+  `pd171-173`, `pd1731-1733_1`, `pd641-644`; the whole `gp0-59/84-146/200-220/300/301/1000/2000/2001` alarm/label set in §6.1;
+  pendant registers `RegName40-46/90-96`, `jm0-3`, `pd292-295`; edge-seek `es0-4`, `mp88_1-4`, `newLang27-33`,
+  `ZFReadOnly15-17`, `RegName132-136`; licence strings `ab1-12`, `ls0-13`, `mp1-6`, `dogState_*`; ~50 further IDs cited in §4
+  spot-checked – all present with the quoted text.
+* `ipAdd.ini` network map and `[Soft]` values; `LanFormatEStr.txt` content; change log `语言修改记录.txt` (SBT35 absent, so
+  SBT01-42 = 41 IDs).
+* PE resources: `MainApp.exe` 7 `RT_DIALOG` {319, 331, 393, 443, 444, 448, 459}, 2 MENU, 12 STRING, 408 BITMAP, 71 PNG,
+  1 ACCEL; `Dxf2Grp.dll` 3, `AutoNest.dll` 1, `BCGCBPRO2210u100.dll` 32, `mfc100u.dll` 27 dialogs; 171 `.?AV…@@` RTTI names
+  and the §8 list of application window classes.
+* Prefix counts of §3 (as record counts).
+
+**Refuted / corrected in place:**
+1. `Report/*.txt` are UTF-8, not GBK (§1.1, §4.17, §7). The only GBK text file is `File/ProcessesStatistic.txt`.
+2. Secondary language files do **not** lack "every ID added after 2024-01": they contain 486/630 added IDs incl. all
+   `newLang*`, `SBT*`, most `*RegName_*` and dated IDs through `A240919_3` (§1.5, open question 10).
+3. "2 564 IDs literal in the exe, the rest in module DLLs": correct figure is 2 771 (min-length-2 strings), and the
+   remaining 656 are in no DLL; no `sprintf` format strings exist (§1.2).
+4. `A240613_*` does not exist; the pendant-status IDs are `A250613_0-5` (§4.5, §6.2, §7).
+5. "Nesting error codes map 1:1 onto mf496-506": only 5-6 codes have UI strings (§6.3).
+6. Text-change count 45 → 43; four changed IDs (`mp161`, `nset_UI_Sheet2MainView`, `pd514/515`, `pd754-1`) were missing
+   from §2.2 and are now listed (§2.1).
+7. Module DLLs "have no resources at all" → each has a MANIFEST (§8); hardware tab label count 20 → 25 (§8).
+8. `report.exe` "likely .NET/Qt" → confirmed Qt5, statically linked (§4.17, open question 9).
+
+**Downgraded:**
+* Alarm bit-order hypothesis for `gp1-59` (medium → low): only `gp1-32` can be one 32-bit word; §6 intro rewritten.
+* `LanFormatEStr.txt` = format-check exception list stays **medium**: the `Lang Format Error` string is absent from all
+  binaries, so the check's implementation could not be located.
+* §3 counts are records, not unique IDs (minor).
+
+**Added (missed by the analyst):**
+* Loader evidence in `LangModule.dll` (`\Lang\lang.txt`, `\Lang\lang.ini`, language-name list, `\*.txt*`, export
+  `newModuleProvider`, build date `2014.9.22`) and the compiled language table in `MainApp.exe` (`Turk dili … English`
+  adjacent to `pd378`-area strings); `SP.Lang`/`SP.Skin` soft-parameter keys (§1.2).
+* Interspersed blank lines in `lang.txt` (55, from line 1421) and the malformed/merged records in every secondary file,
+  with a parsing recipe for the port (§1.1, §1.5).
+* Internal project name **NexCut** and the per-DLL PDB provenance (§7); `SC2000.Document` MFC template and the fact
+  that the exe string tables hold no UI text (§7, §8).
+* `TotalReport.txt` 7-column (2024) vs 10-column (2025) row layouts (§1.1, §4.17).
+* The `ipAdd.ini` pacing/timeout keys and the `BkHardPara.xml` raw values relevant to open questions 4/5 (§7, §9).
+* `mf149` filter typo `*plt`; `pd248`/`pd259` both labelled `总体.控制方式` (§4.3, §9).
+
+**Still uncertain after verification:**
+* How numbered IDs (`RegName<n>`, `gp<n>`, `ls<n>` …) are assembled at runtime (no format strings found; roots `ab`,
+  `af`, `de` seen standalone) – needs disassembly of the `LangModule` lookup call sites.
+* Which of duplicated IDs wins in `LangModule.dll` (first vs last occurrence).
+* Whether `gp1-32` really is a bit decode of `RegName5` (needs the alarm-decode routine).
+* Meaning of `Vietnamese_LE` and how `Turkdili.txt` is selected when `LangModule.dll`'s own name list lacks it (the
+  exe's table has `Turk dili` with a space; the `\*.txt*` enumeration may make the file name authoritative).
+* Enum index → label mapping for `ZFType="1"`, `LaserType="0"`, `LaserControlType="3"` in `BkHardPara.xml`.

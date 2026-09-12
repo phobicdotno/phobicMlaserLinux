@@ -16,7 +16,7 @@ Throughout the document **EVIDENCE** means something directly observed (bytes in
 * `.chf` is a **plain-text, line-oriented, CRLF-terminated ASCII file** (Chinese strings inside it are GBK), not a binary format. Every value is on its own line. The container starts with the literal line `scFlie` (sic — a typo of "scFile", and MainApp.exe also carries the string `cAscFlie`) followed by an integer **format version** and ends with the literal line `eof`. **EVIDENCE:** all 8 sample files; writer `0x100da450`/`0x100d9a30`, reader `0x100da140`.
 * The reader/writer live entirely in **`SRC/Module/CADModule.dll`** (class `CCADModule`, helper class `CLIFileBasic`), not in MainApp.exe. **EVIDENCE:** the marker strings `<Begin Graphs>`, `####Gly: `, `<Crafts>`… exist only in CADModule.dll (§3).
 * The file is a list of **graphs** (`IGraph`, type ids 8–12: contour, group, text, scan(fly-cut), contour-ex) each containing **glyphs** (`IGlyph`, type ids 1–7: point, segment, arc, circle, ellipse-arc, lwpolyline, cubic B-spline) plus a per-contour **`<Crafts>`** block (kerf compensation, PWM curve, lead-in ("GuideCurve"), cooling points).
-* Units are **millimetres**, angles in the arc/ellipse records are **radians**, coordinates are absolute machine/canvas coordinates in a **Y-up** right-handed frame (inference, high). Arc direction is the sign of `end_angle - start_angle`, polyline arcs use the **DXF bulge convention** (`bulge = tan(θ/4)`, negative = clockwise).
+* Units are **millimetres**, angles in the arc/ellipse records are **radians**, coordinates are absolute machine/canvas coordinates in a **Y-up** right-handed frame (inference, medium — see §10: the file alone cannot separate "Y-up + DXF bulge sign" from "Y-down + mirrored bulge sign"; Y-up rests on the 1:1 DXF import path). Arc direction is the sign of `end_angle - start_angle`, polyline arcs use the **DXF bulge convention** (`bulge = tan(θ/4)`, negative = clockwise in a Y-up frame).
 * Cut order = order of graphs in the file; within a contour the glyph order plus a per-glyph **direction flag** (`1` forward, `-1` reversed) defines the tool path; the contour's start point is stored explicitly.
 * The Python parser (`tools/chf_parse.py`) parses all 8 samples, and a self-check recomputes contour length, bounding box, start and end point from the geometry and matches the values stored in each file to <1e-3 mm — which proves the geometric interpretation of every field that the samples exercise (segment, circle, closed bulge polyline).
 * The current writer emits **version 5**; the reader accepts versions 1–5 with documented differences (§9). Older sample files (`Graph/Work*/*.chf`, 2020) are version 4 and contain blank "reserved" lines that version 5 dropped.
@@ -39,11 +39,21 @@ Throughout the document **EVIDENCE** means something directly observed (bytes in
 **EVIDENCE:** `md5sum`, `file` (all "ASCII text, with CRLF line terminators"), parser output.
 MainApp.exe contains the path template `\Graph\Work%d\%d.chf` (UTF‑16 string), so `Graph/WorkN/M.chf` are per-"work slot" job files (the same three shapes were stored in two slots in a different order).
 
-Other files that use the same container (`scFlie … eof`) but are **not** graphic files: `File/Temp/tempIsBreak.ini` (`scFlie`,`1`,`1`,`eof`). The `CLIFileBasic` writer is a generic text serializer; the `.chf` grammar is only one client of it.
+Other files that use the same container (`scFlie … eof`) but are **not** graphic files (**EVIDENCE:** `grep -l scFlie -r SRC`, verified by the verifier; the analyst only listed the first one):
+
+| File | Lines between `scFlie` and `eof` | Interpretation |
+|---|---|---|
+| `File/Temp/tempIsBreak.ini` | `1`, `1` | "is break" flag file (breakpoint/resume state). INFERENCE medium (name). |
+| `File/PithCompensate.pcf` | `0` | pitch-compensation table with 0 entries (`hp25 螺距补偿 = Pitch compensate`). INFERENCE medium. |
+| `File/AutosaveParam1.ini`, `File/Temp/AutosaveParam1.ini` | `38`, `979454`, `342126`, `7`, `486` | five ints. `979454`/`342126` scaled by 1/1000 give (979.454, 342.126) which lies inside the 1300×900 bed — plausibly a resume position in µm. INFERENCE low. |
+| `File/AutosaveParam2.ini`, `File/Temp/AutosaveParam2.ini` | `37`, `965189`, `340285`, `7`, `132` | same layout. |
+| `File/ManuContour.dat`, `File/Temp/ManuContour.dat` | `24`, then `0`…`23` | a count followed by 24 indices — the same number of graphs as `File/autosave.chf` has (24). INFERENCE medium: manual cut-order list of the current document (graph indices, 0-based). |
+
+Note the version line is absent in these files (the second line is already payload), so `scFlie` + `eof` is the only thing the container guarantees; the integer version is part of the `.chf` grammar, not of the container. The `CLIFileBasic` writer is a generic text serializer; the `.chf` grammar is only one client of it.
 
 ### 2.1 The `Report/*.chf.jpg` previews
 
-`Report/rpt.chf.jpg` (rectangle with a circle inside), `Report/111.chf.jpg` and `Report/222.chf.jpg` (byte-identical; a tall rectangle) are renders of jobs named `rpt.chf`, `111.chf`, `222.chf` — **none of those .chf files exist in the package**, so a 1:1 comparison with the samples is impossible. What can be verified is that the shapes they show (rectangles, circles) are exactly the glyph kinds the samples use (lwpolyline with 4 vertices / circle), and that my renders of the samples (`tools/out/*.png|svg`) show the expected geometry: 24 parallel tilted segments in a 3×8 grid (`File_autosave`), a stadium (`Work1_3`), a circle (`Temp_tempGraph`), a rectangle (`Work1_2`).
+`Report/rpt.chf.jpg` (rectangle with a circle inside), `Report/111.chf.jpg` and `Report/222.chf.jpg` (byte-identical, `cmp` verified; a tall rectangle) are renders of jobs named `rpt.chf`, `111.chf`, `222.chf` — **none of those .chf files exist in the package**, so a 1:1 comparison with the samples is impossible. **Added by verifier:** `Report/report.txt` (UTF-8, not GBK) is the report log for exactly these two jobs: `222.chf,15.45x34.34 mm,2025-03-07 16:04:41,3.57 m,1.05 m,0,1分26秒,62.28 Sec,11.32 Sec,0.00 Sec` and `111.chf,15.45x34.34 mm,2025-03-07 16:04:50,0.10 m,0.21 m,0,0分03秒,1.47 Sec,1.69 Sec,0.00 Sec` (`1分26秒` = "1 min 26 s"). So both jobs had the same 15.45 × 34.34 mm extent (consistent with the identical preview) but very different cut lengths (3.57 m vs 0.10 m), i.e. the preview shows the outline, not the number of passes/copies. `Report/LogReport.txt`/`TotalReport.txt` hold the same per-job records (`未命名-1` = "Untitled-1", size, cut length, move length, …). What can be verified is that the shapes they show (rectangles, circles) are exactly the glyph kinds the samples use (lwpolyline with 4 vertices / circle), and that my renders of the samples (`tools/out/*.png|svg`) show the expected geometry: 24 parallel tilted segments in a 3×8 grid (`File_autosave`), a stadium (`Work1_3`), a circle (`Temp_tempGraph`), a rectangle (`Work1_2`).
 
 ---
 
@@ -103,6 +113,8 @@ vtables (RTTI complete-object-locator scan): `CGlyContour vt=0x10111df4 Read=0x1
 * An empty line yields an empty token. `ReadInt` accepts an empty token (returns `atoi("")=0`); `ReadDouble` likewise (`atof("")=0`).
 * `ReadInt` validates chars ∈ `[0-9-]`, `ReadDouble` ∈ `[0-9.-]` with at most one `.`; `ReadPoint` splits at the first `,` and validates both halves the same way (each half must be ≤ 30 chars else it is replaced by `"0"`); `ReadBool` is `strcmp(token,"1")==0`. No exponent notation is accepted anywhere.
 * Markers such as `<Glyphs>` are **not compared** by the reader — it just consumes one token where it expects a marker. (The only string compares are `scFlie` and `eof`.) Consequently a file with a wrong marker still loads as long as the line counts match. My parser is stricter and checks markers.
+* **Added by verifier (re-read of `0x100d9990`):** (a) `[this+0x1c]` is a one-token push-back flag — when set, `ReadToken` clears it and returns `true` without advancing, i.e. the previous token is re-delivered. (b) A token that reaches the end of the buffer **without** a terminating `0x0d`/`0x0a` is still copied but `ReadToken` returns `false` (`xor bl,bl` at `0x100d99e9` → return 0), and the typed readers then set error 4 (`0x100d9dbc`); in practice this never triggers because `eof\r\n` is always last. (c) The `=`-handling branch at `0x100d99e1` is dead in this function (`al` is set to 1 at `0x100d9994` and never cleared), so `=` is an ordinary character. (d) The `eof` check in `OpenForRead` (`0x100da2f8…0x100da321`) walks back from the end over every byte whose *signed* value is ≤ `0x0d` (so CR, LF, NUL — and also any byte ≥ `0x80`), then requires the three preceding bytes to be `e`,`o`,`f`.
+* `ReadInt` error path: if `ReadToken` fails, `[this+4]=4` and `false`; if the validator rejects the token, `false` without setting a code (`0x100d9dcd…0x100d9dd4`).
 
 ---
 
@@ -127,7 +139,7 @@ eof
 
 **EVIDENCE:** writer `0x100a52a0` (`WriteStr("<Begin Graphs>")`, `WriteInt(count)`, loop `{WriteStrInt("####graph NO:",i+1); WriteInt([graph+8]); graph->Write(file, level+1)}`, `WriteStr("<End Graphs>")`, `WriteBool(arg3)`, `WriteDouble(arg4)`, `WritePoint([this+0x9cd0])`, `WritePoint([this+0x9ce0])`), reader `0x100a9900` + `0x100ab4c5…0x100ab54b`, save entry `0x100ddf89` (`WriteInt([this+0x970])` then `WriteGraphs`, then `WriteEof` `0x100d9a30`).
 
-Reader-side validation in `0x100a9900`: after each graph is read, if its stored length `[graph+0x48] ≤ 0.01` (constant at `0x1010f7e8`) then the graph must be either type 8 with **exactly one glyph of type 1 (point)**, or type 9 (group) with exactly one child; anything else aborts the load. (INFERENCE, high: this admits "single point" jobs — e.g. drilling — but rejects degenerate contours.)
+Reader-side validation in `0x100a9900` (**corrected by verifier**, disassembly `0x100a99ae…0x100a9ab8`): after each graph is read, if its stored length `[graph+0x48]` is **strictly less than** `0.01` (`fld 0.01; fcomp [edi+0x48]; test ah,0x41` — equality skips the check) then the graph is kept only if it is (a) a `CGlyContour` (`__RTDynamicCast` to `.?AVCGlyContour@@`) with **exactly one glyph whose type id is 1 (point)**, or (b) a `CGlyGroup` with exactly one child, **that child having exactly one glyph of type 1**. A graph failing this test is **not** a load error: it is deleted (`call [vtable+0]` with flag 1 at `0x100a9ab6`) and the loop continues with the next graph (`jmp 0x100a9a0f`), so degenerate contours are silently dropped and `ReadGraphs` still returns `true`. Graphs that pass are appended to the document list via `0x10018ac0`. (INFERENCE, high: this admits "single point" jobs — e.g. drilling — but discards zero-length contours.)
 
 ---
 
@@ -149,7 +161,7 @@ Field offsets are those of the C++ object (useful when reading other parts of th
 
 | # | Line(s) | Type | C++ member | Sample (autosave graph 1) | Meaning / confidence |
 |---|---|---|---|---|---|
-| 1 | `precision` | double | `[+0xc8]` | `0.010000` (v5) / `0.100000` (v4 files) | Geometric tolerance in mm used e.g. to decide closure (start==end within this). Constructor arg, default `0.01` (`0x1010f7e8`). INFERENCE high. |
+| 1 | `precision` | double | `[+0xc8]` | `0.010000` (autosave.chf) / `0.100000` (tempGraph.chf **and** the v4 files) | Geometric tolerance in mm used e.g. to decide closure (start==end within this). Constructor argument (`fld [ebp+8]; fst [esi+0xc8]` at `0x10064f48`), also stored ×0.1 in `[+0xd0]` (`fmul 0x10111088` = 0.1). **Verifier note:** the value is *not* tied to the file version — `File/Temp/tempGraph.chf` is v5 and carries `0.100000`; the caller chooses it. INFERENCE high. |
 | 2 | `<Glyphs>` | marker | | | |
 | 3 | `length` | double | `[+0x48]` | `284.266045` | Total path length (mm). Verified: equals Σ glyph lengths in all samples (parser `--check`). |
 | 4 | `bbox_min` | point | `[+0x28]` | `395.330000,302.907000` | min x,y of the contour. Verified. |
@@ -163,7 +175,8 @@ Field offsets are those of the C++ object (useful when reading other parts of th
 | 12 | glyph body | | | `395.330000,302.907000` / `677.258772,339.284906` | §7 |
 | 13 | `<End Glyphs>` | marker | | | |
 | 14 | `layer` | int | `[+0xc]` | `0` | Layer index (0-based). After reading, vtable slot 18 (`0x1005a8e0`) is called with it: it stores `[+0xc]`, propagates to every glyph's `[+0xc]` and to the lead-line object `[+0x100]`. UI: `gp80 图层1 = Layer 1`, `gp81 背景图层 = Bk Layer`, `gp82 标刻图层 = Mark Layer`. Layer parameters (speed/power/…) live outside the .chf in `File/BkLayerPara.xml`. Confidence high. |
-| 15 | `int58` | int | `[+0x58]` | `1` | Default 1 (`0x1005f59a`). Only consumer found: `0x1006b041` reduces it to its parity and turns it into ±1 which is combined with the compensation type. INFERENCE medium: a direction/side indicator (e.g. CW/CCW or "positive cut" state) — see Open questions. |
+| 15 | `int58` | int | `[+0x58]` | `1` | Default 1 (`0x1005f59a`, in the `IGraph` base ctor `0x1005f560`). **Verifier re-read:** no code in CADModule.dll writes `[+0x58]` other than the ctor, the file reader and the clone routine (`0x1006bad9`); grep for `inc/add/xor … [+0x58]` finds nothing, so the value can only come from the file or from a MainApp-side setter that was not found. Consumers all use **only its parity**: (a) `0x1006b027…0x1006b059`: `compensate_type==2 → −1`, `==3 → +1`, otherwise `int58 odd → +1, even → −1` (sign for the offset direction); (b) `0x1005cea2…0x1005cee7` (lead-line setter, see §6.1.1) and `0x1006ea6f`: `even(int58) XOR !orientation[+0xdc] XOR arg → lead.flag [+0x1c8]`. INFERENCE medium: a side/direction parity (which side of the path the offset and lead-in go). |
+| — | *(not in file)* `[+0xdc]` | byte | | | **Added by verifier:** contour orientation flag, ctor default 1 (`0x10064f69`), set to `1`/`0` by an orientation computation in `0x10063cb0…0x10064182` (compares an accumulated signed quantity against 0 at `0x10064150`), and **toggled together with `lead.flag [+0x1c8]` by `Reverse`** (vtable slot 44 = `0x1006c200`, which also swaps `start [+0x60]`/`end [+0x70]`; flips at `0x1006c338…0x1006c352`) and by slot 6 (`0x1006e470`, flips at `0x1006e4d1…0x1006e4e2`). Not stored in the file; recomputed. INFERENCE medium: 1 = counter-clockwise ("positive"). |
 | 16 | `<Crafts>` | marker | | | crafts block, §6.1.1 |
 | … | | | | | |
 | 33 | `<End Crafts>` | marker | | | |
@@ -174,7 +187,7 @@ Not stored, but derived after load: `closed = dist(start,end) ≤ precision` →
 
 | Line | Type | C++ member | Sample | Meaning |
 |---|---|---|---|---|
-| `compensate_type` | int | `[+0xf0]` | `-1` | Kerf-compensation state: `-1` = none (ctor default `0x10064f96`). `0x1006b460(bool positive)` sets it to `3` when *positive* (`阳切`, outside cut) else `2`, unless it is `-1`; the same routine flips the lead-line side flag. UI strings `pd506 割缝补偿参数.类型 = Compensate Parameters.Compensate Type`, `mf98 阴切 = Inside`, `mf99 阳切 = Outside`. INFERENCE (medium): 2 = compensate inward (inside cut), 3 = compensate outward (outside cut). |
+| `compensate_type` | int | `[+0xf0]` | `-1` | Kerf-compensation state: `-1` = none (ctor default `0x10064f96`). `0x1006b460(bool positive)` computes `ecx = positive ? 3 : 2` and stores it unless the current value is `-1` or already equal, then re-runs the offset (`0x1006aef0`); it then sets `lead.flag [+0x1c8] = orientation[+0xdc] XOR positive` and regenerates the lead (`0x1005c510`) if the flag changed (verifier re-read of `0x1006b460…0x1006b4ce`). `0x1006b027` maps type `2 → sign −1`, `3 → sign +1`. UI strings (`Lang/lang.txt`, UTF-16): `pd506 割缝补偿参数.类型 = Compensate Parameters.Compensate Type`, `mf98 阴切 = Inside`, `mf99 阳切 = Outside`, and `pd322 杂项.最外层为阴切 = Misc: outermost contour is an inside cut` (= `GRP.OutsideIsNegativeSide` in `File/BkManuPara.xml`). INFERENCE (medium): 3 = outside/"positive" cut (offset outward), 2 = inside/"negative" cut (offset inward). Which numeric side `+1` means geometrically is not proven. |
 | `compensate_width` | double | `[+0xf8]` | `0.0` | Compensation distance (mm) (`pd507 割缝补偿参数.补偿距离 = Compensate Width`). INFERENCE high. |
 | `<PWM Control>` | marker | | | per-contour laser PWM curve (`pd1608 激光参数.每段轮廓切换PWM使能 = Enable PWM Per Contour`, `GP.PWMCurveNodes`) |
 | `pwm_enable` | int | `[+0x104]` | `1` | ctor default 1. INFERENCE high: PWM curve enabled/inherit flag. |
@@ -183,21 +196,21 @@ Not stored, but derived after load: `closed = dist(start,end) ≤ precision` →
 | `nclose` | int | size of `[+0x12c]` | `0` | |
 | `nclose × ratio` | double | `[+0x12c][i]` | — | INFERENCE medium: path-ratio positions (0..1) where the laser is switched off; the debug dump `SRC/closePwmPosRatios.txt` (46 values 0.0166…0.9834, monotonically increasing, name "close PWM pos ratios") is exactly such a list. |
 | `<End PWM Control>` | marker | | | |
-| `double170` | double | `[+0x170]` | `0.0` | ctor default 0.0. Unknown (see Open questions). Candidates: over-cut length (`pd324 缺口封口.过切大小 = Gap Seal.Overcut Length`, `GRP.LoopGapOverCutLength`) or micro-joint length. |
-| `double188` | double | `[+0x188]` | `0.0` | ctor default 0.0. Unknown. |
+| `double170` | double | `[+0x170]` | `0.0` | ctor default 0.0 (`0x10064f90`). **Verifier finding:** the lead-line setter (`0x1005ce80`, non-virtual: `SetGuideLine(int type, double length, double radius, double angle, bool)`) passes `[+0x170]` to `0x1005b390` (`0x1005cf25`), and `0x1005b390` multiplies it by the contour length `[+0x48]` and walks the glyphs to find the point at that arc-length (tolerance `0x1010f6b8` = 0.05) — i.e. it is a **path ratio 0..1**. Other users subtract it from ratio arrays (`0x1005fda9`, `0x10060297`, `0x10060509`). Both are reset to 0 by slot 51 (`0x1005ec50`, "clear crafts"). INFERENCE (medium): the lead-in / start-point position along the contour as a ratio = `GRP.LeadPosPrecent` (`pd319 引线参数.起点位置 = Lead Line.Start Point Position`). |
+| `double188` | double | `[+0x188]` | `0.0` | ctor default 0.0 (`0x10064fa0`). **Verifier finding:** added to the contour length in `0x10060036…0x10060046` (`length + … + [+0x188]`) and tested `!= 0` at `0x1005e07a` before a special branch. INFERENCE (medium-low): over-cut length in mm (`pd324 缺口封口.过切大小 = Gap Seal.Overcut Length`, `GRP.LoopGapOverCutLength`, class `COpOverCutContourCmd`). |
 | `<GuideCurve Para>` | marker | | | lead-in line ("guide curve" = `引线` = *Lead Line*, class `CGuideCurve`, member object at `[+0x1a0]`, pointer `[+0x100]`) |
-| `lead.type` | int | `[+0x1a8]` | `0` | `GRP.GuideLineType` / `pd315 引线参数.类型 = Lead Line.Type`. INFERENCE high: 0 = none; other values = line / arc / line+arc (exact enum not recovered). |
+| `lead.type` | int | `[+0x1a8]` | `0` | `GRP.GuideLineType` / `pd315 引线参数.类型 = Lead Line.Type`. INFERENCE high: 0 = none; other values = line / arc / line+arc (exact enum not recovered). **Verifier:** the machine's own `File/BkManuPara.xml` has `<GRP GuideLineType="2" GuideLineAngle="90" GuideLineLength="8" GuideArcRadius="2" LeadPosType="0" LeadPosPrecent="0" …>` (and an older `GuideLine="1" GuideLineDir="0" GuideLineLength="100"` set), so `2` is a real enum value used on this machine (lead-in enabled with a 2 mm arc radius). |
 | `lead.angle_deg` | double | `[+0x1b0]` | `90.000000` | `GRP.GuideLineAngle` / `pd316 引线参数.角度 = Lead Line.Angle` in **degrees** (90 is the default UI value). |
 | `lead.length` | double | `[+0x1b8]` | `5.000000` | `GRP.GuideLineLength` / `pd317 引线参数.长度 = Lead Line.Length`, mm. |
 | `lead.arc_radius` | double | `[+0x1c0]` | `0.0` | only present when version > 1; `GRP.GuideArcRadius`. INFERENCE high. |
-| `lead.flag` | bool | `[+0x1c8]` | `0` | toggled by `0x1006b460` together with the compensation side: lead-in on the inside/outside of the contour. INFERENCE medium. |
+| `lead.flag` | bool | `[+0x1c8]` | `0` | **Verifier re-read:** computed, not merely toggled — `0x1006b460`: `flag = orientation[+0xdc] XOR positive`; `0x1005ce80` (SetGuideLine): `flag = even(int58) XOR !orientation XOR arg5`; `Reverse` (slot 44) inverts it together with `[+0xdc]`. So it encodes on which side of the path the lead-in lies, relative to the path direction. INFERENCE medium. |
 | `<End GuideCurve Para>` | marker | | | |
 | `<coolPos Para>` | marker | | | only when version > 2; cooling points (`mf406 冷却点 = Cool Point`, class `CCoolPoint`, `GP.CoolPostionDelay`) |
 | `ncool` | int | size of `[+0x14c]` | `0` | |
 | `ncool × pos` | double | `[+0x14c][i]` | — | INFERENCE medium: path positions of cooling stops (ratio 0..1 or mm along path — undetermined, no sample). |
 | `<End coolPos Para>` | marker | | | |
 
-Constructor defaults (`0x10064e70`): `[+0x104]=1`, `[+0xf0]=-1`, `[+0xf8]=0`, `[+0x170]=0`, `[+0x188]=0`, `[+0xd8]=0`(closed), `[+0xdc]=1`, `[+0x278]=1`, `[+0xc8]=arg`, `[+0xd0]=arg*k`. The `CGuideCurve` sub-object is constructed by `0x10061470` (defaults 90°, 5 mm are set there — consistent with every sample).
+Constructor defaults (`0x10064e70`, verified line by line at `0x10064f48…0x10064fa0`): `[+0x104]=1`, `[+0xf0]=-1`, `[+0xf8]=0`, `[+0x170]=0`, `[+0x188]=0`, `[+0xd8]=0`(closed), `[+0xdc]=1`, `[+0x278]=1` (16-bit), `[+0xc8]=arg`, `[+0xd0]=arg*0.1`. The lead-line parameter block at `[+0x1a0]` is initialised by `0x10061470`, which is called at `0x10064f43` with `push 0x101119e8` — **verifier correction:** the 90°/5 mm defaults are not literals inside `0x10061470`; they are copied from the constant block at `.rdata` VA `0x101119e8` = `{int 0 (type), pad, double 90.0 @0x101119f0, double 5.0 @0x101119f8, double 0.0 (arc radius), 0 (flag)}` (bytes `00000000 0000903f | 0000000000805640 | 0000000000001440 | 00…`). Consistent with every sample.
 
 ### 6.2 Type 9 — `CGlyGroup` (EVIDENCE: Write `0x10074630`, Read `0x10076910`)
 
@@ -295,7 +308,7 @@ The per-glyph `direction` (`1`/`-1`, §6.1 line 10) is stored **outside** the gl
 
 | Line | Type | Where it comes from | Sample | Meaning |
 |---|---|---|---|---|
-| `trailer_bool` | bool | 3rd argument of `WriteGraphs` (`0x100a52a0`) — passed in from the save entry `0x100ddf89` which gets it from its own caller (MainApp through `ICADModule`); the single-graph exporter `0x100e5159` passes constant `0`. On load it is returned to MainApp through an out-pointer (`0x100ab51c`). | `0` | Unknown (see Open questions). |
+| `trailer_bool` | bool | 3rd argument of `WriteGraphs` (`0x100a52a0`) — passed in from the save entry `0x100ddf89` which gets it from its own caller (MainApp through `ICADModule`); the single-graph exporter `0x100e5159` passes constant `0` (`push 0; push 0; fldz` at `0x100e5176…0x100e5188`, verified). On load it is returned to MainApp through an out-pointer (`0x100ab51c`). **Verifier:** the save entry's frame (`ret 0x28`, `cmp [ebp+0x1c],8` SSO test) shows the signature `Save(std::string path /*0x1c bytes by value*/, bool [ebp+0x24], double [ebp+0x28])`; MainApp's autosave path builder is at `0x45907a` (`L"autosave.chf"` + `L"\File\"`) and the document save wrapper at `0x4253e0` (`this+0xf3cc`), but the actual argument values were not traced. | `0` | Unknown (see Open questions). |
 | `trailer_double` | double | 4th argument, same path; exporter passes `0.0`. | `0.0` | Unknown. |
 | `trailer_pt1`, `trailer_pt2` | point | `[CCADModule+0x9cd0]`, `[+0x9ce0]`; if the graph list is empty they are reset to the default pair at `0x10113278` (`0x100a5353…`). Read straight back into the same members. | `0,0` / `0,0` | INFERENCE (medium): document-level reference points, e.g. the job's origin/anchor ("dock point", cf. `COpDockPtCmd`) and the last machine position; both are `0,0` in every sample. |
 
@@ -322,13 +335,13 @@ The blank lines in v2–v4 are simply consumed (`ReadToken` in a counted loop); 
 ## 10. Coordinate system, units, order, layers — what a job means
 
 * **Units:** millimetres. **EVIDENCE:** the autosave job spans x 395…1247, y 302…601 on a 1300×900 mm bed; lead-line default 5 (mm), angle 90 (deg); circle radii 1.195 / 47.42.
-* **Frame:** absolute canvas coordinates, origin bottom-left, +X right, +Y up (INFERENCE high: arc angles are standard CCW-from-+X math angles, DXF is imported 1:1 through `Dxf2Grp.dll`/`DxfParse` classes, and the bulge sign convention matches DXF; the OpenGL canvas of MainApp is y-up). The SVG renderer therefore flips Y.
+* **Frame:** absolute canvas coordinates, origin bottom-left, +X right, +Y up (INFERENCE **medium**, downgraded by verifier: the arc/bulge conventions only prove *internal consistency* — the stadium in `Work1/3.chf` is traversed clockwise under Y-up/DXF-sign and counter-clockwise under Y-down/mirrored-sign, and either pair reproduces the stored length 9.673958 (verifier recomputation: 9.673961). What favours Y-up is that DXF entities are imported 1:1 through the `DxfParse::CDxf*2d` classes without a sign flip being visible in the samples, and that the machine coordinates in `autosave.chf` (y up to 600.9) are positive. The "OpenGL canvas is y-up" statement was not verified.) The SVG renderer therefore flips Y.
 * **Cut order:** graphs are cut in file order (`####graph NO:1…N`); the `CAutoSort`/`COpAutoSortCmd` commands rewrite this order. Inside a contour glyphs are cut in list order, each in the direction given by its `direction` flag; `start`/`end` cache the resulting first/last points ("Show path start" `mf41`, "Adjust Start Pt" `mf604`, "Reverse" `mf94` = `COpReverseContourCmd`).
 * **Layer:** `layer` int per contour (children of groups carry their own). Layer→process parameters mapping is in `File/BkLayerPara.xml` (not part of this report).
 * **Lead-in/out:** only *parameters* are stored (`<GuideCurve Para>`); the lead geometry itself is regenerated at load (`0x1005c510` is called with `(0,0,0,0)` when the `flag` argument of `Read` is false; the `CGuideCurve` object is owned by the contour at `[+0x1a0]`/`[+0x100]`). No lead-out parameters exist in the file.
 * **Compensation:** `compensate_type/width` per contour; the offset contour is not stored (regenerated).
 * **Micro joints / bridges / over-cut:** not found as explicit fields in type 8; candidates are `double170/double188` and the type‑12 link records. The MainApp parameters (`GRP.MicroLinkLength`, `GRP.AutoMicroLinkNum/Step/Type`, `GRP.LoopGapOverCutLength`) are global settings, not per file.
-* **Groups/arrays:** an array copy is stored as independent graphs (autosave: 24 separate segments, no array record). "Group" (`COpGroupGraphCmd`) = type 9. **Nesting results are not in `.chf`**: `CNestResult`/`CSheetInfo`/`CPartInfo` have their own writer (`0x100ccd20`, wide strings, marker strings `Result Graphs`, `Sheet Graphs`, `Part Graphs`) — a different file type produced by `SmartNest.dll`/`AutoNest.dll` (not analysed here).
+* **Groups/arrays:** an array copy is stored as independent graphs (autosave: 24 separate segments, no array record; `File/BkManuPara.xml` has `ArrayRowNum="8" ArrayColNum="3"`, matching the 3×8 layout). "Group" (`COpGroupGraphCmd`) = type 9. **Nesting results are not in `.chf`**: `CNestResult`/`CSheetInfo`/`CPartInfo` have their own writer (`0x100ccd20`). **Verifier correction:** its marker strings are *narrow* ASCII written with the same `WriteStr`/`WriteStrInt` (`0x100d9860`/`0x100d9aa0`), not wide: `.rdata` file offsets `0x112440…0x1124d4` hold `Result Graphs`, `Result_`, `<Begin NestResults>`, `<End Sheets>`, `Sheet Graphs`, `Sheet_`, `<Begin Sheets>`, `<End Parts>`, `Part Graphs`, `Part_`, `<Begin Parts>`; only the payload names go through `WriteWStr` (`0x100ccdf7`). It is a separate grammar inside the same `scFlie` container, produced by `SmartNest.dll`/`AutoNest.dll` (not analysed here).
 * **Bitmaps:** no bitmap/raster glyph exists in the format (no such class; `CGlyScan` is vector fly-cut, `CWglFontBitmap` is only OpenGL font rendering).
 * **PWM curve / cool points:** per-contour arrays (§6.1.1); empty in every sample.
 
@@ -352,13 +365,14 @@ python3 tools/chf_parse.py --check --outdir tools/out $(find SRC -name '*.chf')
 
 | Field | Location | What is known |
 |---|---|---|
-| `int58` | contour/group line after `layer` | default 1; parity → ±1 sign in compensation code (`0x1006b041`). Likely cut-direction/side indicator. |
-| `compensate_type` values 2 vs 3 | Crafts | set from a bool "positive" (outside) cut; which of 2/3 is inside is not proven. |
+| `int58` | contour/group line after `layer` | default 1; only its parity is used: offset sign when `compensate_type ∉ {2,3}` (`0x1006b041`), lead side in `0x1005cea2` / `0x1006ea6f`. No setter found in the DLL. Likely a side/direction parity. |
+| `compensate_type` values 2 vs 3 | Crafts | set from a bool "positive" (`阳切`/outside) cut → 3, else 2; `0x1006b027` maps 2 → −1, 3 → +1. Geometric meaning of the sign not proven. |
 | `pwm_nodes` pair semantics | Crafts | (ratio, value) is a guess; no sample has nodes. |
-| `pwm_close_pos_ratios` | Crafts | strongly suggested by `closePwmPosRatios.txt` debug dump but not proven from code. |
-| `double170`, `double188` | Crafts | defaults 0.0; not correlated with any UI string. |
-| `lead.type` enum values | Crafts | 0 = none; others unknown (line/arc/…). |
-| `lead.flag` | Crafts | inside/outside side of lead-in (medium). |
+| `pwm_close_pos_ratios` | Crafts | suggested by `closePwmPosRatios.txt` debug dump (46 lines, CRLF, 0.0165935…0.983406, verified) but not proven from code — the dump's producer was not located. |
+| `double170` | Crafts | path ratio (proven: multiplied by contour length in `0x1005b390`); *which* ratio (lead start position = `LeadPosPrecent`?) is inference (medium). |
+| `double188` | Crafts | added to the contour length (`0x10060046`); over-cut length is inference (medium-low). |
+| `lead.type` enum values | Crafts | 0 = none; `2` is used in `File/BkManuPara.xml` (`GuideLineType="2"`, with `GuideArcRadius="2"`); full enum unknown. |
+| `lead.flag` | Crafts | side of the lead-in relative to path direction; computed as `orientation XOR positive` (`0x1006b460`) and flipped by Reverse (medium). |
 | `cool_pos` unit | Crafts | ratio vs mm undetermined. |
 | `trailer_bool`, `trailer_double` | trailer | provided by MainApp; always 0 / 0.0 in samples. |
 | `trailer_pt1/pt2` | trailer | document reference points (medium). |
@@ -376,7 +390,10 @@ python3 tools/chf_parse.py --check --outdir tools/out $(find SRC -name '*.chf')
 3. Exact enum of `lead.type` and of `compensate_type` (2/3) — best answered by running the Windows program once with a lead-in / compensation set and diffing `autosave.chf`.
 4. Meaning of `double170`/`double188` and of `int58` (same experimental approach: toggle "Reverse", "Over cut", "Micro joint" in the UI and diff).
 5. Whether `_tempSource.chf` / `tempGraph.chf` (single-graph export, bool 0/double 0.0) is also the format handed to the Report/preview generator.
-6. The nesting-result file written by `0x100ccd20` (`Result Graphs`/`Sheet Graphs`/`Part Graphs`, wide strings) — separate format, separate report.
+6. The nesting-result file written by `0x100ccd20` (`<Begin NestResults>`, `<Begin Sheets>`/`<End Sheets>`, `<Begin Parts>`/`<End Parts>`, `Result_`/`Sheet_`/`Part_` + index — narrow markers, wide payload names) — separate format, separate report.
+7. *(added by verifier)* Who writes `[+0x58]` (`int58`)? No setter exists in CADModule.dll; either MainApp pokes it through an `IGraph` accessor not identified here, or the value is effectively constant 1 in practice. Diff `autosave.chf` after "Reverse"/"Positive" commands in the Windows UI.
+8. *(added by verifier)* `File/AutosaveParam1.ini`/`AutosaveParam2.ini` (five ints in the `scFlie` container) and `File/ManuContour.dat` (24 indices) — their producers in MainApp were not located; the "resume position in µm" and "manual cut order" readings are unproven.
+9. *(added by verifier)* Which MainApp routine produced `SRC/closePwmPosRatios.txt` and `SRC/linkFlyLine_pathGlys.txt` (debug dumps in the program root) — they date the fly-cut/PWM features but were not tied to code.
 
 ---
 
@@ -398,3 +415,47 @@ python3 tools/chf_parse.py --check --outdir tools/out $(find SRC -name '*.chf')
 * Keep the crafts block as an opaque-but-typed struct (all fields, even the unknown ones) so files re-saved by the Linux program keep the Windows program's values.
 * Store the direction flag at the contour-element level as the original does; do not bake it into the glyphs.
 * The reader in the DLL does not verify marker names; a Linux implementation should verify them (as the parser does) to fail fast on corrupt files, but must not *require* the blank lines of v2–v4.
+
+---
+
+## Verification notes
+
+Adversarial re-check of this report against the primary files (`SRC/File/*.chf`, `SRC/Graph/Work*/*.chf`, `SRC/Module/CADModule.dll`, `SRC/MainApp.exe`, `SRC/Lang/lang.txt`, `SRC/File/BkManuPara.xml`, `SRC/Report/*`). Every address quoted below was re-disassembled with `objdump -d -M intel` and read again; every file fact was re-run (`md5sum`, `file`, `cmp`, `cat -A`, `xxd`).
+
+### What was checked and confirmed as stated
+
+| # | Claim | How it was re-verified |
+|---|---|---|
+| 1 | Container `scFlie` / int version / `eof`, CRLF, one value per line | `cat -A` of all 8 samples; `0x100da450` pushes `0x10113fec` (= `scFlie`) into `WriteStr` and `_wfopen_s(L"wb")` (`0x10113ff4`); `0x100d9a30` pushes `0x10113f9c` (= `eof`); `mov [esi+0x970],5` at `0x100e5662`; `OpenForRead` compares the first token with `scFlie` (error 5 at `0x100da2ea`) and the last three non-trailing bytes with `e`,`o`,`f` (error 4 at `0x100da333`). |
+| 2 | All `.chf` code lives in CADModule.dll | `grep -l 'Begin Graphs' -r SRC` hits only the `.chf` samples and `Module/CADModule.dll`; MainApp.exe holds only `scFlie`/`cAscFlie` (narrow, `0x3c3544`/`0x3c3526`) and UTF-16 file names. `.rdata` offsets `0x110344…0x1103f0`, `0x111bd0…0x111bf0`, `0x1127a0…0x1127f4` confirmed with `strings -t x` and `xxd`. |
+| 3 | Top-level grammar and trailer | `WriteGraphs 0x100a52a0`: `WriteStr(0x101133f0="<Begin Graphs>")`, `WriteInt`, loop `{WriteStrInt(0x101133e0="####graph NO:"), WriteInt([g+8]), g->vt[24]}`, `WriteStr(0x101133d0="<End Graphs>")`, `WriteBool`, `WriteDouble`, `WritePoint([this+0x9cd0])`, `WritePoint([this+0x9ce0])` (defaults from `0x10113278` = `{0.0,0.0}` when the list is empty). Reader `0x100ab4c5…0x100ab54b` mirrors it. |
+| 4 | Type ids and classes | Jump tables read from the file bytes: `0x100a4844` → `0x100a4728/4769/47cf/479e/4800` (index = type−8, `cmp eax,4` at `0x100a4718`) → ctors `0x10064e70/0x100760e0/0x100a26b0/0x100933c0/0x10071a20`; `0x10059d50` → 7 stubs (index = type−1, `cmp eax,6`) → ctors `0x100892b0/0x1008a0b0/0x1007dbb0/0x1007faf0/0x10081660/0x10084c10/0x1008cec0`. The vtable each ctor stores was resolved through the RTTI complete-object-locator to `.?AVCGlyContour@@`, `CGlyGroup`, `CGlyText`, `CGlyScan`, `CGlyContourEx`, `CEditablePoint`, `CEditableSegment`, `CEditableArc`, `CEditableCircle`, `CEditableEllipsArc`, `CEditableLwpoly`, `CEditableSpline` — all match. Object sizes 0x280/0xb8/0x148/0xd0/0xd8 and 0x98/0xd8/0x138/0x108/0x148/0xd0/0x178 confirmed. |
+| 5 | `CGlyContour` body and field offsets | `0x1005ab20` writes `[+0xc8]`, `<Glyphs>`, `[+0x48]`, `[+0x28]`, `[+0x38]`, `[+0x60]`, `[+0x70]`, count of `[+0xa8]` (8-byte elements), per element `WriteStrInt("####Gly: ")`, `WriteInt([e+4])`, `WriteInt([glyph+8])`, `glyph->vt[24]`, `<End Glyphs>`, `[+0xc]`, `[+0x58]`, `<Crafts>`. Reader `0x1006b4e0` is the exact mirror; vtable slots 23/24 of `0x10111df4` confirmed by dumping the table. |
+| 6 | Crafts block and version gates | Writer `0x1005ac37…0x1005ae27` and reader `0x1006b70a…0x1006b9ca` re-read field by field; `cmp ebx,1` (`0x1006b86f`) gates the arc-radius line, `cmp ebx,2` (`0x1006b95d`) gates `<coolPos Para>`; ctor defaults at `0x10064f51…0x10064fa0`. PWM pairs are written interleaved from two parallel arrays `[+0x108]`/`[+0x118]`. |
+| 7 | Direction flag ±1 | `cmp [ecx+eax*8+4],-1` → `fsubrp` (1−t) at `0x1005b438`/`0x1005b4a8`; `fild [edx+ebx*8+4]` at `0x1005b4db` (then `fmul 0.05`). |
+| 8 | Layer applied via slot 18 | `0x1005a8e0` iterates `[+0xa8]` calling slot 18 on each glyph, stores `[+0xc]`, then calls slot 18 on `[+0x100]` if non-null; the reader calls it at `0x1006b6dd…0x1006b6e3`. |
+| 9 | Glyph geometry | Arc: `0x10001410` = `c + r·(cos a, sin a)` for both angles via the `_CIcos`/`_CIsin` thunks (`0x10100470`/`0x10100476`, IAT `0x1010f2f0`/`0x1010f2ec`), and `0x1007ebc8…0x1007ebd5` = `|a1−a0|·r`. Ellipse: `_hypot` (IAT `0x1010f2fc`), `fmul [esi+0x80]` (ratio), `0x10009350` (angle helper), 2π constant at `0x1012d918`. Lwpoly writer `0x10083e70`: `WriteInt`, `WriteInt`, then `WritePoint(rec+8)`, `WriteDouble(rec+0)`. Spline reader `0x1008f2a6…0x1008f31a`: 3 `ReadInt`, `ReadPointArray(n)`, `ReadInt`, `ReadDoubleArray(nk)`, then `n ≥ 4` and `nk == n+4`. Numerics re-done independently: stadium length 9.673961 vs stored 9.673958; rectangle 2.279 × 1.696; circle start = centre + (r,0) in `tempGraph.chf` and `Work1/1.chf`; `autosave.chf` x∈[395.33,1247.12], y∈[302.91,600.93]. |
+| 10 | Version-dependent blank lines | Counted loops: `mov esi,5` @`0x100a991d`, `mov ebx,0xa` @`0x1006b51a`, `mov ebx,3` @`0x1006b64f`, `mov ebx,0x14` @`0x1006b6f7`, `mov edi,3` @`0x1007694b`, `mov ebx,5` @`0x10094944`, `mov ebx,5` @`0x100a40b7`, each guarded by `add eax,-2; cmp eax,2; ja`. `Work1/3.chf` shows exactly 5/10/3/20 blank lines. |
+| 11 | Parser self-check | `python3 tools/chf_parse.py --check` re-run: `check: OK` for all 8 files. |
+| 13 | `0x1006b460` semantics | Confirmed and made precise (see §6.1.1). |
+| 15 | Report previews | `cmp Report/111.chf.jpg Report/222.chf.jpg` identical; `find` finds no `rpt.chf`/`111.chf`/`222.chf`. |
+
+Also confirmed: `WriteDouble` thresholds (constants `0x10113fd0` = 1e-10, `0x10111dd0` = 1e-6; `"%d\r\n"` with 0 in buffered mode, `"0.0\r\n"` in file mode, `"%12.10f\r\n"`, `"%f\r\n"`), `ReadBool` = `strcmp(token,"1")` (`0x10113fe8`), `ReadInt`/`ReadDouble` validators (`0x100d97b0`: `[0-9-]`; `0x100d9800`: `[0-9.-]` with ≤ 1 dot; empty token valid), the text reader defaults (`L"宋体"` at `0x1010f838`, 1.0 / 20.0 (`0x1010f830`) / 0.0 at `0x100a4095…0x100a40a3`) and the text writer order, group/scan/contour-ex writer and reader orders, all lang.txt translations quoted (file is UTF-16LE, not GBK).
+
+### What was changed in the document
+
+1. **§5 — refuted:** a graph failing the "length < 0.01 ⇒ single point" test is deleted and skipped, the load does **not** abort; the comparison is strict `<`, and the group case additionally requires the single child to contain one point glyph.
+2. **§10 — refuted:** the nesting-result writer's markers are narrow ASCII (`<Begin NestResults>`, `<Begin Sheets>`, `<Begin Parts>`, …), not wide strings.
+3. **§6.1 — corrected:** `precision` `0.1` also occurs in a v5 file (`tempGraph.chf`); it is a constructor argument, not version-dependent.
+4. **§6.1.1 — corrected:** the 90°/5 mm lead defaults are copied from the constant block at `0x101119e8`, not set as literals in `0x10061470`; `lead.flag` is *computed* (`orientation XOR positive`), not just toggled.
+5. **§1/§10 — downgraded:** Y-up frame from "high" to "medium" (the file evidence is symmetric under a Y-flip plus bulge-sign flip).
+6. **§6.1/§12 — refined `int58`:** only its parity is consumed; type 2/3 map directly to ∓1; no setter exists in the DLL.
+7. **Added:** `[+0xdc]` orientation flag and `Reverse` (slot 44) behaviour; `double170` is a path ratio (probably `LeadPosPrecent`), `double188` is added to the length (probably over-cut); `ICADModule::Save(std::string, bool, double)` signature and the MainApp call sites `0x45907a`/`0x4253e0`; tokenizer push-back flag, EOF-without-newline behaviour, dead `=` branch, signed trailing-byte skip in the `eof` check; the other `scFlie` files (`PithCompensate.pcf`, `AutosaveParam1/2.ini`, `ManuContour.dat`); `Report/report.txt` naming `111.chf`/`222.chf` with 15.45 × 34.34 mm; `File/BkManuPara.xml` GRP attributes (`GuideLineType="2"`, `GuideArcRadius="2"`, `LeadPosType`, `LeadPosPrecent`, `OutsideIsNegativeSide`, `ArrayRowNum="8" ArrayColNum="3"`).
+
+### What remains uncertain
+
+* Values MainApp passes as `trailer_bool`/`trailer_double` (the wrapper chain `0x45907a → 0x4500c0 → 0x4253e0` was located but not followed to the `ICADModule` vtable call).
+* Which of `compensate_type` 2/3 offsets to the geometric left/right; the exact `lead.type` enum beyond {0, 2}; the meaning of `LeadPosType`.
+* `double170` = lead start ratio and `double188` = over-cut length are medium/medium-low inferences from data flow only.
+* `int58`'s writer, the `AutosaveParam*.ini` and `ManuContour.dat` producers, and the spline flag ints remain unidentified.
+* No sample exercises arcs, ellipses, splines, text, scan, contour-ex, PWM nodes or cool points; those readers are proven only by disassembly.

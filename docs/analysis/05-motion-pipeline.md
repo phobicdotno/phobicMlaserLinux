@@ -54,9 +54,9 @@ in a file/binary; **INFERENCE** = interpretation, with a confidence tag
 
 | File | Size / build stamp | Exports | Imports of interest | Who imports it |
 |---|---|---|---|---|
-| `SRC/MotionCtrl.dll` | 115 200 B, export TS `0x61021cd7` = 2021-07-29; PDB `D:\project\CAM\<GBK text>\MotionCtrl_dll_V1.3.22\Release\MotionCtrl.pdb`; UTF-16 version string `1.3.23` | `arcInterp`, `newContourSmooth`, `newVelocityPlanning`, `segInterp`, `segInterp_time` | `splineAnalyerVc100.dll!?newSpline2DAnalyer@@YAPAVISpline2DAnalyer@@XZ`, MSVCR100 `_CIsin/_CIcos/_CIacos/_CIatan2/_CIpow/_CIsqrt/_hypot`, MSVCP100 (only `_Xlength_error`, `_Xout_of_range`, `_Orphan_all`) | **nobody** (no static import, and no binary contains the string `MotionCtrl` or any export name) |
+| `SRC/MotionCtrl.dll` | 115 200 B, export TS `0x61021cd7` = 2021-07-29; PDB `D:\project\CAM\加减速规划\MotionCtrl_dll_V1.3.22\Release\MotionCtrl.pdb` (directory name is UTF-8, not GBK: 加减速规划 = “acceleration/deceleration planning”); UTF-16 version string `1.3.23` | `arcInterp`, `newContourSmooth`, `newVelocityPlanning`, `segInterp`, `segInterp_time` | `splineAnalyerVc100.dll!?newSpline2DAnalyer@@YAPAVISpline2DAnalyer@@XZ`, MSVCR100 `_CIsin/_CIcos/_CIacos/_CIatan2/_CIpow/_CIsqrt/_hypot`, MSVCP100 (only `_Xlength_error`, `_Xout_of_range`, `_Orphan_all`) | **nobody** (no static import, and no binary contains the string `MotionCtrl` or any export name). *Verifier re-check:* `objdump -p` import tables of MainApp.exe, every `Module/*.dll`, AutoNest, Dxf2Grp, SmartNest, PHBX, DxfParseDllvc100 — none lists MotionCtrl.dll; `strings -a` / `strings -a -e l` find no `MotionCtrl` and no `arcInterp/segInterp/newContourSmooth/newVelocityPlanning` in any other PE; the Delay Import Directory of MainApp.exe and all modules is empty (no delay-load either) |
 | `SRC/Module/CADModule.dll` | 1 299 456 B, TS `0x684d4218` = 2025-06-14; PDB `C:\Users\Michael\source\repos\CAD_head_update\sc2000-e\Release\Module\CADModule.pdb` | `newModuleProvider` | `splineAnalyerVc100.dll` (same factory), `DxfParseDllvc100.dll!newDxfFileParse`, `AutoNest.dll!Nest_*`, OPENGL32, mfc100u | MainApp.exe (module provider) |
-| `SRC/splineAnalyerVc100.dll` | 1 027 072 B, TS `0x5e705333` = 2020-03-17; source path `D:\project\CAM\NURBS`, `..\Nurbs\OpenNurbs\opennurbs_*.cpp` | `?newSpline2DAnalyer@@YAPAVISpline2DAnalyer@@XZ`, `?newSpline3DAnalyer@@YAPAVISpline3DAnalyer@@XZ` | RPCRT4 (UUIDs for ON_ classes), GDI32/USER32 (ON_Font/bitmap) | MotionCtrl.dll, CADModule.dll |
+| `SRC/splineAnalyerVc100.dll` | 1 027 072 B, TS `0x5e705333` = 2020-03-17; PDB `D:\project\CAM\NURBS曲线\opennurbs_Dll\OpenNurbs_Dll_v1.3.14\Release\splineAnalyerVc100.pdb` (NURBS曲线 = “NURBS curve”; product version 1.3.14), source paths `D:\project\CAM\NURBS`, `..\Nurbs\OpenNurbs\opennurbs_*.cpp` (19 distinct openNURBS translation units, 123 `.?AVON_*` RTTI descriptors) | `?newSpline2DAnalyer@@YAPAVISpline2DAnalyer@@XZ`, `?newSpline3DAnalyer@@YAPAVISpline3DAnalyer@@XZ` | RPCRT4 (UUIDs for ON_ classes), GDI32/USER32 (ON_Font/bitmap) | MotionCtrl.dll, CADModule.dll |
 | `SRC/CircleFitDLL.dll` | 69 632 B, TS `0x54f815e8` = 2015-03-05, statically linked old CRT | `??0CCircleFit@@QAE@XZ`, `?mainFit@CCircleFit@@QAEXQAVMyPoint@@HHQAVCdlFitOut@@@Z`, `??0MyPoint@@QAE@NN@Z`, `??0CdlFitOut@@QAE@D@Z`, globals `?Ang_CircleFit@@3NA`, `?Err_CircleFit@@3NA`, `?Len_CircleFit@@3NA`, `?Rmax_CircleFit@@3NA`, `?fitOutSequence@@3HA` | KERNEL32 only | `AutoNest.dll`, `Dxf2Grp.dll` only |
 | `SRC/Module/NCModule.dll` | 788 480 B | `newModuleProvider` | – | MainApp.exe |
 
@@ -97,7 +97,7 @@ OverCutContour,Bridge,CoolPoint,ShareEdge,SplitContour,MergeGraph,…}Cmd`.
 | Token (as seen in code / files) | Meaning | Evidence |
 |---|---|---|
 | **Gly / Glyph** | one geometric entity ("图元" primitive): point, line segment, arc, circle, ellipse-arc, polyline, spline. `IGlyph` is the base interface; `CGlyContour` = a contour (closed/open chain of glyphs), `CGlyContourEx`, `CGlyGroup`, `CGlyText`, `CGlyScan` (scan/fly-cut path object). The `.chf` file writer emits `<Glyphs>` … `####Gly: ` … `<End Glyphs>` (CADModule `0x1005ab20`). | RTTI names; strings at `.rdata:0x10111be4`, `0x10111bf0` |
-| **Glyph type code** (first column of `linkFlyLine_pathGlys.txt`) | `1`=Point, `2`=Segment (straight line), `3`=Arc, `4`=Circle, `5`=Ellipse/ellipse-arc, `6`=Lwpoly (polyline), `7`=Spline (NURBS) | constructors store the code: `CEditablePoint` `[this+8]=1` (`0x10089240`), `CEditableSegment` `=2` (`0x1008a030`), `CEditableArc` `=3` (`0x1007db50`), `CEditableCircle` `=4` (`0x1007fac0`), `CEditableEllipsArc` `=5` (`0x100815d0`), `CEditableLwpoly` `=6` (`0x10084bb0`); `CCreateSpline` `[this+0x40]=7` (`0x100dfd50`), `CCreateSegment` `=2`, `CCreateEllipse` `=5`, `CCreateLwploy` `=6` |
+| **Glyph type code** (first column of `linkFlyLine_pathGlys.txt`) | `1`=Point, `2`=Segment (straight line), `3`=Arc, `4`=Circle, `5`=Ellipse/ellipse-arc, `6`=Lwpoly (polyline), `7`=Spline (NURBS) | constructors store the code: `CEditablePoint` `[this+8]=1` (`0x10089240`), `CEditableSegment` `=2` (`0x1008a030`), `CEditableArc` `=3` (`0x1007db50`), `CEditableCircle` `=4` (`0x1007fac0`), `CEditableEllipsArc` `=5` (`0x100815d0`), `CEditableLwpoly` `=6` (`0x10084bb0`); `CEditableSpline` `[this+8]=7` (`0x1008cfea`); `CCreateSpline` `[this+0x40]=7` (function `0x100dfd50`, the store is at `0x100dff60`), `CCreateSegment` `=2`, `CCreateEllipse` `=5`, `CCreateLwploy` `=6` |
 | **Ct** (`CGlyCt`, `GetCtGly`, `calcGraphCtInterpPt`) | "contour" (轮廓). `calcGraphCtInterpPt` = "calculate graph-contour interpolation points". | naming + the function writes `calcGraphCtInterpPt.txt` |
 | **seg / segments** | (a) in `segments.txt`: the raw scan-line segments `(x0,y0) (x1,y1)` generated by the scan-fill operation; (b) in `setDataWithoutReFit_segs.txt`: the *PWM segments* = consecutive pieces of the processed path with constant laser state; (c) in `segInterp`: one straight motion segment of length L for velocity profiling. | writers at CADModule `0x100a0e70`, `0x100ec5e0`; MotionCtrl `segInterp` |
 | **pathGlys** | the ordered list of glyphs that make up a fly-cut/scan path after linking (lines + type-7 spline connectors) | `linkFlyLine_pathGlys.txt` written in `0x10096fc0` |
@@ -109,7 +109,7 @@ OverCutContour,Bridge,CoolPoint,ShareEdge,SplitContour,MergeGraph,…}Cmd`.
 | **closePwmPosRatios** | positions, as a fraction of the total path length, where the PWM (laser) state toggles (close = off, next = on, …) | file content; verified numerically below |
 | **micoLink / MicroLink / 微连** | micro-joint (uncut bridge left in a contour); `p_micoLinkLenPos` = list of micro-joint length/position pairs along the contour | lang `mf100`, `pd325`, `pd343–pd346` |
 | **fly line / 飞行切割 / Scan cut** | "flying cut": continuous high-speed motion over several collinear features with the laser switched by position (`RegName37/38/39` "flycut data cache …", `FCP.*` parameters) | lang.txt |
-| **JumpAddTime** | `[Jump] AddTime=200`: extra time (ms) added per rapid ("jump", 空跳) move in time estimation | `JumpAddTime.txt`, MainApp strings `Jump`,`AddTime` |
+| **JumpAddTime** | `[Jump] AddTime=200`: extra time (ms) added per rapid ("jump", 空跳) move in time estimation | `JumpAddTime.txt` (114 bytes, **LF line endings, no CR**, no trailing newline — verified with `xxd`), MainApp strings `Jump`,`AddTime` (UTF-16 only) |
 | **Arc2SegVelK K_X/K_Y** | per-axis velocity coefficient (percent, default 100) applied when converting arcs to segments; read by `CInterpMrg` ctor from `JumpAddTime.txt` | CADModule `0x100f5ea0` |
 | **VelDecc** | node-velocity log `NodeID:%d V:%f mm/s` written by the CADModule copy of `CVelocityPlanning::plan` to `Log\VelDecc.txt` (append mode `"at+"`) | CADModule `0x100ff220`, strings `0x1011513c`, `0x1011515c` |
 
@@ -138,7 +138,7 @@ OverCutContour,Bridge,CoolPoint,ShareEdge,SplitContour,MergeGraph,…}Cmd`.
  CNurbsContour: vector of 0x48-byte piece records {cum. length, radius/curvature, feed, …}
         ▼
  CVelocityPlanning::plan (CADModule 0x100fffe0 == MotionCtrl 0x10016720)
-        │  param block {acc, accTime, cornerPrecision, vmax, cutSpeed, factor, slowStartLen, slowStartSpeed}
+        │  param block {acc, accTime, cornerPrecision, vmax, minSpeedFloor, factor, slowStartLen, slowStartSpeed}
         │  node builder (0x100169b0): junction speed limits v = f(radius, 0.5/accTime, cornerPrecision)
         │  slow-start clamp (0x10017270); look-ahead core (0x100114d0): backward/forward passes,
         │  7-phase S-curve solver (0x1000eeb0), cubic closed forms (Cardano, 0x10012220…)
@@ -190,7 +190,9 @@ length"), 7 × `7, 2.65861` (type-7 **spline** U-turn connecting the end of one 
 to the next row's run-in, 1 mm apart). Total path = 600 + 48 + 840 + 18.61 = **1506.6 mm**.
 
 `closePwmPosRatios.txt` (46 values in (0,1)): multiplying by the total NURBS length
-1506.62 gives 25.00, 28.00, 53.00, 56.00, 81.00, 203.66, 228.66, … i.e. the successive
+1506.62 gives 25.00, 28.00, 53.00, 56.00, 81.00, 203.66, 228.66, … (verifier re-computed all
+46: successive differences are exactly the repeating pattern 3, 25, 3, 25, 122.66, 25, …, and
+the sum of the 61 PWM segments is 1506.62483) i.e. the successive
 laser **off / on** toggle positions (off after each 25 mm cut, on after each 3 mm gap or after
 the 122.66 mm turnaround = 60 + 2.66 + 60). The first "on" at 0 and the final end-of-path are
 implicit (48 toggles − 2). **INFERENCE (high):** these ratios are the data behind
@@ -199,7 +201,8 @@ switches the PWM enable bit when the normalised path position crosses each ratio
 
 Geometry constants of the connector construction (`0x10097140–0x10097400`): 0.005 (collinearity
 distance), 0.035 (relative tolerance), 0.14, 0.4 and 0.5 (fractions of the row gap used to
-place control points), 30, 4; it builds control polygons of 3 and 5 points
+place control points) — these five were re-found by the verifier in that range; the "30, 4"
+are immediates outside it; it builds control polygons of 3 and 5 points
 (`vector<double>` sizes 6 and 10) that are fitted to a spline (type 7). Two variants exist
 (`[ebp+0x10] == 4` selects the second, `0x10097ac5`).
 **INFERENCE (medium):** the connector is a degree-3 NURBS through 3–5 control points giving
@@ -272,13 +275,15 @@ EVIDENCE (CADModule listing):
    to already-open streams).
 
 MotionCtrl's version of `process` shows the algorithmic core: it calls
-`newSpline2DAnalyer()` three times (`0x100061b5`, `0x100070ee`, `0x10007f6b`) and invokes
+`newSpline2DAnalyer()` three times (`0x100061b5`, `0x100070ee`, `0x10007f6b`; a fourth call
+at `0x1000aa4d` lies outside `process`, after `setParams`) and invokes
 **`ISpline2DAnalyer` slot 1** (`vtable+0x4`) as
 `fit(ON_NurbsCurve* out = contour+0x20, std::vector<pt>* points, int 0, int degree = 3)`;
 the analyzer pointer is stored at `CNurbsContour+0x80`, the curve domain at `+0x68/+0x70`
 (0..1 or −1 = not yet), the cached length at `+0x78` (initialised −1). A corner test uses the
-cosine threshold `−0.984375` (≈ cos 170°): consecutive tangents whose dot product is below it
-are treated as a reversal (no blending). Constants 2, −1, 0.001 and 1e-5 also appear.
+cosine threshold `−0.984375` (`.rdata:0x100199d8`, used at `0x10006383/0x100063d0/0x100064e5/0x10006551`;
+≈ cos 170°): consecutive tangents whose dot product is below it are treated as a reversal (no
+blending). Constants 2, −1, 0.001 and 1e-5 also appear.
 
 **INFERENCE (high):** `CContoutSmooth` converts every contour into a chain of degree-3
 NURBS pieces (openNURBS) with a chord tolerance = "Spline Precision" (0.01–0.3 mm), merges
@@ -298,11 +303,27 @@ piece its length, curvature radius and programmed feed. Straight segments stay s
 | `after_setDataWithoutReFit.txt` | `0x100f0ddd` | `141, 2.66069, 201, 2.66069, …, 141` + `totalNurbsLength: 1506.62` | NURBS pieces: consecutive collinear/straight PWM segments were merged into one straight piece (141 = 25+3+25+3+25+60 for the first row, 201 = 60+25+3+25+3+25+60 for middle rows); the 7 spline connectors remain separate pieces |
 
 The files are opened with `ofstream(name, ios::out /*=2*/, 0x40 /*_SH_DENYNO*/)`
-(`0x100a12ac`), i.e. truncated on every run. The mismatch between the 284.266 mm contour in
-the first three files and the 1506.62 mm scan path in the last two is an **open question**
-(§13); the most likely explanation (INFERENCE, medium) is that the last invocation processed a
-list of two contours and the four dumps are produced at different loop positions, or that
-scan paths bypass merge/smooth.
+(`0x100a12ac`; the same `push 0x40 / push 0x2` pair precedes every `ofstream` ctor call in
+`process`, e.g. `0x100f0791–0x100f07a4`), i.e. truncated on every run.
+
+**Verifier finding (EVIDENCE):** `process` (`0x100f0410`) is *not* a straight-line function.
+At `0x100f0ce8` it tests its fourth argument, a `bool` at `[ebp+0x14]`
+(`cmp BYTE PTR [ebp+0x14],0; jne 0x100f12d2`), and when the flag is set it **skips
+`setDataWithoutReFit` (`0x100ec5e0`) together with the two dumps
+`setDataWithoutReFit_segs.txt` and `after_setDataWithoutReFit.txt`**, jumping to the
+epilogue at `0x100f12d2`. The prototype is therefore
+`process(vector<glyphRec(0xd0)>* in, double tol, bool skipSetData, double a, double b)`
+(the entry loop at `0x100f04d0–0x100f0638` walks 0xd0-byte records, divisor magic
+`0x4ec4ec4f >> 6` = ÷208, and tests `[rec+0] == 1`). Each stage function has exactly one
+caller inside `process` (`0x100ed4f0` ← `0x100f0694`, `0x100ef340` ← `0x100f08c6`,
+`0x100efef0` ← `0x100f0ae3`, `0x100ec5e0` ← `0x100f0cf5`).
+**INFERENCE (medium-high):** the package state is produced by two successive calls: an earlier
+`process(scanPath, …, skipSetData=false)` wrote all five files with the 1506.62 mm scan path,
+and a later `process(284.266 mm contour, …, skipSetData=true)` rewrote only the first three.
+The 284.266 mm closed contour is the last object that went through merge/smooth (e.g. a
+Ø 90.5 mm circle, or the outline around the engraving); nothing in the dumps identifies it
+further. This replaces the earlier "loop position" hypothesis; a controlled run is still the
+only way to prove it (§13).
 
 ### 6.4 `CNurbsContour` piece record (0x48 = 72 bytes) – EVIDENCE from `CVelocityPlanning` node builder
 
@@ -313,7 +334,9 @@ The node builder reads pieces with stride 0x48 (`imul 0x38e38e39 ; sar 4` = ÷72
 | `+0x00` | cumulative arc length at the *end* of the piece (differences give piece lengths) |
 | `+0x08` | curvature radius of the piece (argument `a` of the junction speed formula) |
 | `+0x10` | programmed feed for the piece (layer `GP.CutSpeed`, or slow-down speed) |
-| `+0x18..+0x40` | remaining 6 doubles: not read by the planner (INFERENCE low: start/end tangent, PWM/power flags, piece type) |
+| `+0x18` | **per-piece speed cap (EVIDENCE, corrected by verifier):** read by node builder A at `0x10016eb5` (`vJ = min(vJ, piece[+0x18])`) and used *directly* as the node speed limit by node builder B (`0x10016fc6`). CADModule `0x100f6310` writes **0.0** into it (forced stop) for the piece that ends at a listed path position, or inserts a new piece ending exactly at that position with `+0x18 = 0` (see §8). |
+| `+0x40` | **per-piece speed factor (EVIDENCE, corrected by verifier):** node builder A multiplies the (Vmax-clamped) junction limit by it at `0x10016e49–0x10016e56` (`vJ *= piece[+0x40]`); 1.0 = neutral. |
+| `+0x20..+0x38` | remaining 4 doubles: not read by the planner (INFERENCE low: start/end tangent or PWM/power flags). `setDataWithoutReFit` does not use the `vector<piece>` helpers `0x100f5150/0x100f5230`, so its writers were not traced. |
 
 ---
 
@@ -332,10 +355,10 @@ triplets of nodes / profile pieces), `+0x138` a flag byte.
 | P1 `+0x30` | 0.125 | `[0.06, 0.25]` s | **acceleration time Ta** (time from rest to A-profile completion) | high (lang `de2/de4`: "加速时间 … 范围 60 - 250", `MC.AccTime="200"` ms, `EmptyMoveAccTime="125"`) | pd92 加工加速时间 Process Acc Time |
 | P2 `+0x38` | 0.05 | – (formula cut-off 0.03) | **corner precision c** (mm) | high (`MC.CornerAccuracyRate="0.05"`, lang `de6` "拐角部分的控制精度, 0.01–1.0") | pd94 拐角控制精度 Corner Precision |
 | P3 `+0x40` | 200 | – | **maximum speed Vmax** (mm/s) | high | `MC.XFastMoveSpeed="500"`, `FCP.MaxSpeed="3000"` |
-| P4 `+0x48` | 0 | – | programmed cut speed of the contour (upper bound for P7) | medium | `GP.CutSpeed` |
+| P4 `+0x48` | 0 | – | **minimum-speed floor** (corrected by verifier): `plan` does `P7 = max(P7, P4)` at `0x10016797–0x100167ae` (fcomp sets C0 when P7 < P4 and *that* branch loads P4), and node builder A does `vJ = max(vJ, P4)` at `0x10016e75–0x10016e89`. It is *not* an upper bound / cut speed. With the default 0 it is inert. | medium (semantics), high (max, not min) | unknown UI parameter (no candidate found; possibly `MP.*` small-circle limit or an internal constant) |
 | P5 `+0x50` | 1.0 | – | speed factor passed to the core (`[esp+0x78]`) | low | `MP.EmptyMoveSpeedFactor="1.1"` / `FlycutCircleVelRatio` |
-| P6 `+0x58` | 0 | – | **slow-start length** (mm): nodes with cumulative s ≤ P6 (+0.05) are clamped | high (`0x10017270`) | `GP.SlowStartLength="1"` (pd134 起步距离) |
-| P7 `+0x60` | 10 | `min(P7,P4)`, then `max(0.1,P7)` | **slow-start speed** (mm/s) | high | `GP.SlowStartSpeed="10"` (pd135 起步速度), `GP.SlowStart` enable |
+| P6 `+0x58` | 0 | routine active only if P6 ≥ 0.1 | **slow-start length** (mm): nodes with cumulative s + 0.01 ≤ P6 are clamped, and a node is inserted at s = P6 unless one lies within 0.05 mm (details below) | high (`0x10017270`) | `GP.SlowStartLength="1"` (pd134 起步距离) |
+| P7 `+0x60` | 10 (MotionCtrl); **200 in the CADModule `CInterpMrg` default block** (`0x100f43e6`) | `max(P7,P4)` (see P4), then `max(0.1,P7)` when passed to the slow-start routine | **slow-start speed** (mm/s) | high | `GP.SlowStartSpeed="10"` (pd135 起步速度), `GP.SlowStart` enable |
 
 Derived in `plan` (`0x1001682c…0x1001685d`):
 `if (A·Ta/2 ≤ Vmax) J = 2·A/Ta else J = 4·Vmax/Ta²` — the **jerk** of a triangular
@@ -343,22 +366,42 @@ acceleration profile that reaches A in Ta/2 (or, when Vmax is reached before A, 
 reaches Vmax in Ta). The core receives `{A, J, Ta, P5, Vmax}` at `[esp+0x5c/0x68/0x70/0x78/0x80]`.
 
 `plan(this, CNurbsContour* contour, const double params[8], bool mode)` — `ret 0xc`; the bool
-selects node builder A (`0x100169b0`, full junction analysis) or B (`0x10016f60`, INFERENCE:
-simplified/rapid-move variant).
+selects node builder A (`0x100169b0`, full junction analysis) or B (`0x10016f60`).
+**Node builder B (EVIDENCE, verifier):** copies `piece[+0x18]` straight into the node speed
+limit (`+0x08`), `piece[+0x10]` into `+0x10`, P0 into `+0x18`, `piece[+0]` into `+0x20`, then
+computes the lengths; it applies **no** junction formula, no Vmax clamp, no P4 floor and does
+**not** zero the first/last node — i.e. mode B replays speed limits that were pre-computed
+into the piece list. The only CADModule call site found (`0x100f61a8`) passes `1` (mode A).
+
+**Slow start (EVIDENCE `0x100167e8–0x1001682c` and `0x10017270`, corrected by verifier):** the
+routine runs only when `P6 ≥ 0.1` mm, with `v = max(0.1, P7)`. Walking nodes i ≥ 1: while
+`s_i + 0.01 ≤ P6` both `+0x08` and `+0x10` are clamped to `≤ v`. At the first node beyond,
+if `|s_i − P6| ≤ 0.05` it is clamped as well and the walk stops; otherwise a **new node is
+inserted at s = P6** (`0x10017344–0x1001739d`, insert helper `0x10017830`) splitting the piece
+(`len = P6 − s_{i−1}`, next `len = s_i − P6`, limits `min(v, feed)`), and the walk stops.
+
+**Acceleration time (lang `de2/de4`):** 机床从静止到最大空走/加工速度所需的时间 = “time the
+machine needs from standstill to the maximum move/cut speed”. Both jerk branches are consistent
+with this: a triangular acceleration profile reaching `A` at `Ta/2` has `J = 2A/Ta`; a
+triangular profile that reaches `Vmax` after `Ta` without saturating has `v(Ta) = J·Ta²/4`,
+i.e. `J = 4Vmax/Ta²`; the branch is chosen by whether `A·Ta/2` (the speed gained by the
+triangular profile) is below `Vmax` (`0x10016836–0x1001685d`; equality goes to the second
+branch, where both formulas coincide).
 
 ### 7.2 Node records (0x28 = 40 bytes) built from the piece list (EVIDENCE `0x100169b0`)
 
-| offset | content |
+| offset | content (corrected by verifier from the full listing `0x100169b0–0x10016f54`) |
 |---|---|
-| `+0x00` | length of the piece ending at this node (`s_i − s_{i−1}`) |
-| `+0x08` | junction speed limit `f(piece.radius, 0.5/Ta, cornerPrecision)` (see 7.3), later also `min` with neighbour |
-| `+0x10` | feed limit = `min(piece_i.feed, piece_{i+1}.feed)` |
-| `+0x18` | acceleration A (P0) |
-| `+0x20` | cumulative length s_i |
+| `+0x00` | length of the piece ending at this node (`s_i − s_{i−1}`), pass 2 (`0x10016bc0`) |
+| `+0x08` | pass 1: `f_i = f(piece_i.radius, 0.5/Ta, cornerPrecision)` (§7.3, call `0x10016a65`). Pass 4 (`0x10016db5–0x10016f16`): `v_i = min(f_i, Vmax=P3)`; `v_i *= piece_i[+0x40]`; `v_i = max(v_i, P4)`; `v_i = min(v_i, piece_i[+0x18])`; `v_i = min(v_i, piece_i[+0x10])`. Finally **node[0].+0x08 = 0 and node[last].+0x08 = 0** (`0x10016f1f–0x10016f4b`): the contour starts and ends at rest. There is **no** `min` with the neighbouring node. |
+| `+0x10` | pass 1: `piece_i.feed`; pass 2 (`0x10016b30–0x10016b93`): `max(f_{i−1}, f_i)` then `min(·, piece_i.feed)` (uses the *raw* radius limits, before pass 4); pass 3 (`0x10016be5–0x10016db2`, iterated until stable, unrolled ×4): every node whose `+0x10 ≤ 0.01` inherits the previous node's value (or, for node 1, the next node's if larger) — a fill-in for pieces with no programmed feed. The analyst's `min(feed_i, feed_{i+1})` is **not** what the code does. |
+| `+0x18` | acceleration A (P0), pass 1 (`0x10016a91`) |
+| `+0x20` | cumulative length s_i, pass 1 (`0x10016af2`) |
 
-CADModule's copy adds a `0.99` factor and the `VelDecc.txt` log (`NodeID:%d V:%f mm/s` per
-node, via `fprintf_s`, only when a flag byte `[ebp-0x49]` is set → the log file in the package
-is empty).
+CADModule's copy (`0x100ff220`, called from the plan copy at `0x1010007b`) adds a `0.99`
+factor (`.rdata:0x101116d0`, used at `0x100ff866`) and the `VelDecc.txt` log (`NodeID:%d V:%f mm/s`
+per node, via `fprintf_s`, only when a flag byte `[ebp-0x49]` is set → `Log/VelDecc.txt` in the
+package is 0 bytes and dated 2024-06-19, i.e. it has not been rewritten by any 2025 run).
 
 ### 7.3 Junction / arc speed formula (EVIDENCE: full listing of `0x100170e0`, args `(a, b, c)`)
 
@@ -373,6 +416,15 @@ else:                  v0 = sqrt( a · (102.4·b² + 1032·b − 2020) )
 if c ≥ 0.03:           v = v0 + 73.8·(c − 0.05) · min( a, 25·b² / (73.8·c − 3.69)² )
 else:                  v = v0 + 15·(30·c − 1)   · min( a, b² / (3 − 90·c)² )
 ```
+
+*Verifier re-derivation:* every branch was re-traced through the x87 stack (`0x100170e0–0x10017264`);
+the breakpoints are `a ≤ 1.6` (`test ah,0x41; jp`), `a ≤ 6` (`test ah,1; jne`), `a < 12`
+(`test ah,0x41; jne`), and the correction selects `c ≥ 0.03` vs `c < 0.03`. The radicand is
+C0-continuous at the breakpoints: at a = 1.6 both forms give 12.8·b; at a = 6 both give
+102.4b² + 132b − 220; at a = 12 both give 102.4b² + 1032b − 2020. Since
+`73.8c − 3.69 = 73.8(c − 0.05)`, the first correction can be written
+`73.8(c−0.05)·min(a, 25b²/(73.8(c−0.05))²)`, which for `a ≥ Q` collapses to
+`25b²/(73.8(c−0.05))` (independent of a).
 
 **INFERENCE (high):** this is a "centripetal acceleration" rule `v = sqrt(a_n · r)` with an
 empirically fitted `a_n(b)` (e.g. b = 4 → 3746 mm/s²; b = 2.5 → 1200 mm/s²), linearised for
@@ -436,12 +488,20 @@ int arcInterp(std::vector<double>* out, double theta0, double theta1, double rad
               double vmax, double vs, double ve, double accX, double accY,
               double jerkX, double jerkY, double dt_ms, int type);
 ```
-Validation in `0x10010090`: L < 1e-4 → return 1 (skip); vmax ∉ (0.001, 10000) → −2;
-vs, ve < 0 → −2; L ≥ 1e6 → −2; acc ≤ 5 → −2; `L < 0.00025·min(vs,ve)` → return 1
-(**a segment shorter than one 250 µs cycle at the entry speed is dropped** — matches
-`AX.InterpolationCycle="250"`); vs, ve are clamped to vmax. `arcInterp` additionally requires
-jerkX, jerkY ≥ 2, dt ≥ 0.01 ms, and uses `L = |θ1 − θ0|·r`, `acc = min(accX, accY)`,
-`jerk = min(jerkX, jerkY)`.
+Validation in `0x10010090` (re-traced by verifier): L < 1e-4 → return 1 (skip); vmax < 0.001
+or vmax > 10000 → −2; `L < 0.00025·min(vs,ve)` → return 1 (**a segment shorter than one
+250 µs cycle at the entry speed is dropped** — matches `AX.InterpolationCycle="250"`);
+vs < 0 or ve < 0 → −2; L > 1e6 → −2; **acc < 5** (not ≤) → −2; vs, ve are clamped to vmax;
+the profile struct is filled as `{L, vs, vmax, ve, A, J}` at `+0x00..+0x28` (`0x10010166–0x1001017f`).
+`segInterp` itself does **not** validate `dt`. **Return values (EVIDENCE `0x10010221–0x10010241`):**
+`segInterp` returns **0** both on success and on "skip" (validator 1; the output vector was
+cleared at `0x100101e0`, so an empty vector means "dropped"), and **−2** on a parameter error;
+the sample count returned by the sampler in `eax` is discarded (`xor eax,eax`).
+`segInterp_time` (`0x10010260`) writes `*t_ms = 0` first, then `(t1+…+t7)·1000` on success,
+and always returns 0. `arcInterp` (`0x10010320`) additionally requires jerkX, jerkY ≥ 2,
+dt ≥ 0.01 ms, r ≥ 0, and uses `L = |θ1 − θ0|·r`, `acc = min(accX, accY)`,
+`jerk = min(jerkX, jerkY)` (`0x1001048e–0x100104a1` picks the smaller); unlike `segInterp` it
+**returns the number of samples** (`(end−begin)>>3`, `0x100104c9–0x100104d1`).
 
 Sampler `0x1000f730(out, profile, dt_ms)`: `N = round(T_total / (dt_ms/1000))`, reserve N+5,
 then for k = 0..N pushes **one double per cycle = s(t_k)/L**, the normalised position along the
@@ -462,12 +522,55 @@ Per-node speeds are in mm/s (`VelDecc` format), lengths in mm, times in s intern
   default 1.0). Other fields: `+0x50 = arg[+0x58]`, `+0x60`, `+0x80 = 10.0`, `+0xd8 = arg[+0x60]`,
   `+0x148 = 6000 (0x1770)`, `+0x14c = 0`, `+0x7c = 1`. Called from `CCADModule` members
   `0x100dab10` (wrapper, `ret 0x64`) and `0x100dea8b`.
-* `calcGraphCtInterpPt` `0x100f6f10` (`ret 0x24` → 9 args) is the point generator: it times
-  itself with `QueryPerformanceCounter`, walks the glyph list (`0x10067dc0`, `0x1005fb80`,
-  `0x10060730`, `0x10060140`, `0x10060a80` accessors), uses constants 10, ±2, 6, 3π/2 (4.71239),
-  0.05, 0.5, 0.1, 1000 (s→ms), calls the smoother/planner through `0x100f5450/0x100f5150`,
-  and dumps `calcGraphCtInterpPt.txt` and `p_micoLinkLenPos.txt` (both **empty** in the
-  package: the dump branches were not taken in the last run, or the lists were empty).
+* `calcGraphCtInterpPt` `0x100f6f10` (`ret 0x24` → 9 args; the function body extends to
+  `0x100f8182`; it is called from the `CCADModule` member `0x100dab90`, which pushes 7 dwords
+  + 1 double = 9 dwords) is the point generator: it times itself with
+  `QueryPerformanceCounter`, walks the glyph list (`0x10067dc0`, `0x1005fb80`, `0x10060730`,
+  `0x10060140`, `0x10060a80` accessors), uses constants 10, ±2, 6, 3π/2 (4.71239), 0.05, 0.5,
+  0.1, 1000 (s→ms), and dumps `calcGraphCtInterpPt.txt` (`0x100f7d5e`) and
+  `p_micoLinkLenPos.txt` (`0x100f7e3e`) (both **empty** in the package: the dump branches were
+  not taken in the last run, or the lists were empty).
+  **Correction (verifier):** `0x100f5150` and `0x100f5230` are *not* smoother/planner calls —
+  they are `std::vector<piece(0x48)>::resize` (copies 0x12 dwords per element) and
+  `::insert(pos, const piece&)`; `0x100f5450` (`ret 0xc`, constants 30000 and 0.05, helper
+  `0x10026570` called 11×) is a large piece-list post-processing routine that contains no
+  virtual calls. The planner is actually created and used in **`0x100f6130`** (`ret 0x20`):
+  it copies the **10-double** block `CInterpMrg+0x88..+0xd0` to the stack (`rep movs` 0x14
+  dwords at `0x100f6182`), then **overwrites P3 (Vmax) with a computed speed, sets P6
+  (slow-start length) = 0 and P8 = 0**, creates a `CVelocityPlanning` via `0x100ff1b0`
+  (CADModule's `newVelocityPlanning`; ctor `0x100fee80` stores vtable `0x1011511c`), calls
+  `plan(&pieces, &block, mode=1)` through vtable slot 1 (`0x100f61a5–0x100f61b7`), fetches the
+  node speeds through slot 4 (`+0x10`, args `(&vector<double>, −1)`), and converts them with
+  sqrt/trig-like helpers (`0x1010063c`, `0x10100476`, `0x10100470`; INFERENCE low: speed
+  components along an arc) into an output vector of 16-byte pairs. Its piece loop
+  (`0x100f6130–0x100f6167`) fills only `+0x00/+0x08/+0x10` from an angle increment
+  (`2π/N`, `0x100f60da`), so this call site plans **circle/arc pieces** (INFERENCE medium:
+  the circle fly-cut `CircleFly*` / `FlycutCircleVelRatio` path).
+* `CInterpMrg` default ctor `0x100f4350` (stores vtable `0x10114fd4`) seeds the planner
+  block at `+0x88` = {2000, 0.125, 0.05, 200, 0, 1, 0, **200**, 0, 200} (P0..P9; the
+  MotionCtrl default P7 = 10 is instead stored at `+0x10`), the smoother block at `+0xe0` =
+  {0.001, 0x25, 4.0, 2.2, 1.2}, and creates the smoother (`0x100ebdd0` → `+0x108`) and the
+  planner (`0x100ff1b0` → `+0x10c`). The 23-dword ctor `0x100f5ea0` copies its **first ten
+  doubles straight into `+0x88..+0xd0`** (`lea edi,[ebx+0x88]; lea esi,[ebp+0x8]`,
+  `0x100f6000–0x100f6010`); the `CCADModule` wrapper `0x100dab10` (`ret 0x64`) assembles that
+  block from its own arguments in the order (a7, a8, a11, a1, a2, a9, a3, a4, a5, a6) (a_k =
+  k-th double argument). The wrapper is a virtual entry called from MainApp.exe, which is the
+  only binary containing the XML names (`MC.AccTime`, `MC.EmptyMoveAccTime`,
+  `MC.CornerAccuracyRate`, … as UTF-16); the exact UI→P mapping therefore lives in MainApp
+  and was not traced (see §13).
+* `0x100f6310` (`ret 0xc`; args `(vector<piece>*, vector<double>* outPositions,
+  vector<double>* ratios)`) — **split-and-stop routine (EVIDENCE, verifier):** for every ratio
+  r (processed last→first) it computes `s = r · totalLength`, ignores positions within 0.2 mm
+  of either contour end, locates the piece containing s, and with tolerance
+  `tol = min(0.25·pieceLen, 0.1 mm)`: if s is within `tol` of the piece end → that piece's
+  `+0x18 := 0`; if within `tol` of the piece start → the previous piece's `+0x18 := 0`;
+  otherwise a **new piece ending at s** is inserted (`0x100f5230`) with `+0x18 = 0`,
+  `+0x10 = CInterpMrg+0xa0` (P3 default 200) and the original radius. Every accepted s is
+  appended to `outPositions`, which is finally reversed. **INFERENCE (medium):** the ratio
+  list is the `closePwmPosRatios` list (or the micro-joint list `p_micoLinkLenPos`); with
+  `+0x18 = 0` the planner brings the head to a **full stop at every laser on/off point** —
+  the behaviour needed when `LaserOnDelay/LaserOffDelay` dwell times apply — whereas fly-cut
+  keeps moving. Which list feeds it, and whether it is skipped for fly-cut, is open (§13).
 * MainApp reads `[Jump] AddTime=200` and `[Axis4Freq] Is4Freq=0` from `JumpAddTime.txt`
   (strings `Jump`, `AddTime`, `Axis4Freq`, `Is4Freq` in MainApp.exe). The section
   `[LimitSamllCircleVel] IsLimit=0 SlowRatio=3` is **not referenced by any binary** in the
@@ -495,14 +598,33 @@ margin", `RORegName_18` FIFO插补数据配置 "FIFO interpolation data configur
 deceleration / "minus deceleration", `RegName130` 运动轴4倍频 "Axis 4x frequency enable",
 `SystemRWRegName_6` 总线周期 "Bus cycle".
 
+*Verifier additions (EVIDENCE):* the FIFO strings are UTF-16 and all live in one NCModule
+function, `0x10052390` (`FillFifo Step1/2/3 Time` at `0x1005258c`, `first fillFifo error`
+at `0x10052630`, `Update MC Status Success: CalcBufferSize:%d, RealItemNum:%d` at
+`0x1005272c`); `false setPWM: %d` is in `0x1004cfd0`; `VM Start Fifo`/`VM Stop Fifo` belong to
+`CVirtualMachine` (`0x10050af0`) — a **software simulation target** that consumes the same
+FIFO stream (useful for the port's dry-run mode). NCModule also carries `CDog` (dongle
+check), `CFrogJumpSvr`/`CFJSAccSrv`, `CVerticalCorrect` and Boost property_tree/JSON.
+
 **INFERENCE (high):** The PC computes the complete trajectory (positions per 250 µs cycle plus
 PWM/power state) and pushes it as FIFO "items" (60 per Modbus frame, up to 2000 buffered,
-refilled every `MCFifoTime`/`MCCore` ms). The card only (a) clocks the items out to the
-servo/step outputs, (b) applies its own safety deceleration/jerk limits for stops, (c) gates the
-PWM from the item flags, (d) for encoder-checked fly-cut it verifies the encoder position
-against a tolerance. The per-item byte layout is outside the scope of this document (see the
+refilled every `MCFifoTime`/`MCCore` ms). Among the *named* registers in lang.txt the card
+exposes FIFO margin/config, PWM-enable flag, acc/jerk and fly-cut cache registers (there are
+many more registers — power, frequency, encoder, bus cycle — so "only" should not be read as
+an exhaustive register map). The card (a) clocks the items out to the servo/step outputs,
+(b) applies its own safety deceleration/jerk limits for stops, (c) gates the PWM from the item
+flags, (d) for encoder-checked fly-cut it verifies the encoder position against a tolerance. The per-item byte layout is outside the scope of this document (see the
 communication-protocol analysis); the strings show a two-step "calculate buffer size → fill"
 handshake.
+
+**Firmware file `Update/MCC100_V201.52.mcf` (verifier):** 120 456 bytes, dated 2025-05-26.
+It is *not* entirely structureless: the first dword `0x0001d688` = **120456 = the file size**,
+then `0x00f8b0f4`, `0x00000000`, `0x32ba741b`, and at `+0x10` `0x0001800c` = 98 316
+(INFERENCE low: payload length or load address; `0x00f8b0f4`/`0x32ba741b` look like a
+checksum/CRC and a key or magic). From `+0x14` on the content has 7.998 bits/byte entropy
+(every 4 KiB block ≥ 7.9), all 256 byte values occur, and `strings -a` yields 1485 random
+4+-char runs (196 with `-n 6`, 33 with `-n 8`, none meaningful; no UTF-16). The body is
+encrypted or compressed; the analyst's "no readable strings" holds.
 
 ---
 
@@ -551,11 +673,12 @@ value enters the pipeline.
 |---|---|---|---|
 | scan segment | 32 B | 0 x0, 8 y0, 16 x1, 24 y1 (double) | `0x100a0e70` |
 | `CContoutSmooth` | 0x48 | see §6.1 | `0x10005e10` |
-| `CNurbsContour` piece | 0x48 | 0 cum-length, 8 radius, 0x10 feed, rest unknown | §6.4 |
+| `CNurbsContour` piece | 0x48 | 0 cum-length, 8 radius, 0x10 feed, 0x18 speed cap (0 = forced stop), 0x40 speed factor, 0x20–0x38 unknown | §6.4 |
 | `CNurbsContour` object | ≥0x270 | +0x20 ON_NurbsCurve/analyzer data, +0x68/+0x70 domain, +0x78 length (−1), +0x80 `ISpline2DAnalyer*`, +0xc0/+0xc8 start point, +0x128/+0x160/+0x250 sampled data | `0x10005f70` |
-| planner param block | 8 doubles | A, Ta, c, Vmax, cutSpeed, factor, slowStartLen, slowStartSpeed | §7.1 |
+| planner param block | 8 doubles read by `plan` (CADModule stores 10 at `CInterpMrg+0x88`) | A, Ta, c, Vmax, minSpeedFloor (P4), factor (P5), slowStartLen, slowStartSpeed, [P8, P9 unused by `plan`] | §7.1, §8 |
 | `CVelocityPlanning` | 0x140 | +0x28 params, +0x68 & +0xd0 containers, +0x138 flag | `0x10016660` |
-| node | 0x28 | 0 len, 8 vJunction, 0x10 vFeed, 0x18 A, 0x20 s | §7.2 |
+| `CInterpMrg` (CADModule) | ≥0x150 | +0x10 = 10.0, +0x68/+0x70 K_X/K_Y·0.01, +0x88..+0xd0 planner block (10 doubles), +0xe0..+0x100 smoother block, +0x108 `IContourSmooth*`, +0x10c `IVelocityPlanning*`, +0x148 = 6000 | `0x100f4350`, `0x100f5ea0` |
+| node | 0x28 | 0 len, 8 vLimit (radius formula → Vmax clamp → ×piece[0x40] → max P4 → min piece[0x18] → min feed; ends = 0), 0x10 vFeed (min(feed, max(f_{i−1}, f_i)) with zero fill), 0x18 A, 0x20 s | §7.2 |
 | S-curve profile | ≥0x70 | L, vs, vmax, ve, A, J, t1..t7, distances | §7.5 |
 | `segInterp` output | `vector<double>` | s/L per interpolation cycle | §7.6 |
 | PWM ratios | `vector<double>` | toggle positions / total length | §5.2 |
@@ -570,10 +693,10 @@ value enters the pipeline.
 | Contour representation | degree-3 NURBS pieces fitted with openNURBS at a chord tolerance ("Spline Precision", clamp 0.01–0.3 mm; default 0.02) | high |
 | Line handling | straight segments preserved exactly and merged when collinear (0.001 mm) | high |
 | Corner treatment | blend corners sharper than 30° unless nearly a reversal (cos < −0.984); junction speed from radius via §7.3; corner precision c shifts the limit | high (structure), medium (exact geometry of blend) |
-| Look-ahead | whole-contour, multi-pass backward/forward with iterative refinement; no fixed window | high |
+| Look-ahead | whole-contour, multi-pass backward/forward with iterative refinement; no fixed window; first and last node speed forced to 0 | high (structure) / medium (pass details not re-traced by verifier) |
 | Profile | 7-phase jerk-limited S-curve (type 2) with A and J derived from (A, Ta, Vmax); trapezoid fallback (other types) | high |
 | Jerk | J = 2A/Ta or 4Vmax/Ta² (Ta clamped 0.06–0.25 s) | high |
-| Slow start | first `SlowStartLength` mm limited to `SlowStartSpeed` | high |
+| Slow start | first `SlowStartLength` mm limited to `SlowStartSpeed`; active only if length ≥ 0.1 mm; a node is inserted at the boundary unless an existing node is within 0.05 mm | high |
 | Sampling | analytic evaluation of s(t) every 250 µs → normalised abscissa; pieces shorter than one cycle dropped | high |
 | Rapids | same planner with `XFastMoveSpeed/XFastMoveAcc/EmptyMoveAccTime` (× speed/acc factors); `+200 ms` per jump in time estimates | medium |
 | Laser control | PWM toggles at path-length ratios (per contour); optional power/frequency-vs-speed curves; fly-cut PWM advanced/delayed by N cycles and speed-dependent position compensation tables | high |
@@ -584,14 +707,23 @@ value enters the pipeline.
 
 ## 13. Open questions
 
-1. Why do `before/after_mergeLinearGly.txt` and `after_smoothGly.txt` describe a single
-   284.266 mm glyph while `setDataWithoutReFit_segs.txt`/`after_setDataWithoutReFit.txt`
-   describe the 1506.62 mm scan path, although all five are written in one function
-   (`0x100f0410`) with truncating `ofstream`s? Candidates: loop over several contours with the
-   dumps at different loop depths, or a scan-path branch that skips merge/smooth. Needs a
-   controlled run (e.g. under Wine with a single circle, then a single scan region).
-2. Exact meaning of the remaining 6 doubles of the 0x48-byte piece record and of `P5`
-   (default 1.0) in the planner block.
+1. (Largely resolved by the verifier, §6.3) `process` has a `bool skipSetData` argument
+   (`[ebp+0x14]`, test at `0x100f0ce8`) that skips `setDataWithoutReFit` and its two dumps;
+   the package state matches a scan-path call followed by a 284.266 mm-contour call with the
+   flag set. Still open: which caller passes `true`, and what the 284.266 mm contour was.
+   Needs a controlled run (e.g. under Wine with a single circle, then a single scan region).
+2. Exact meaning of piece doubles `+0x20..+0x38` (`+0x18` = speed cap, `+0x40` = speed factor
+   are now known) and of `P5` (default 1.0; passed to the core at `[esp+0x78]`). Also which UI
+   value, if any, reaches `P4` (the minimum-speed floor) — the wrapper `0x100dab10` receives
+   it as its 9th double argument from MainApp.
+2b. The exact UI→P mapping: MainApp.exe is the only binary holding the XML names
+   (`MC.AccTime`, `MC.EmptyMoveAccTime`, `MC.CornerAccuracyRate`, `HPA3.AccTime_ms`, …); the
+   CADModule side only shows the argument order (a7, a8, a11, a1, a2, a9, a3, a4, a5, a6) →
+   P0..P9. Whether `AccTime` is divided by 1000 in MainApp or in the ParaModule layer was not
+   found (CADModule's only 0.001 constant, `.rdata:0x1010f778`, is used 89× but never next to
+   the block copy).
+2c. Which list (`closePwmPosRatios` or micro-joint positions) feeds the split-and-stop routine
+   `0x100f6310`, and whether fly-cut/scan bypasses it.
 3. Exact NURBS fitting method inside `CSpline2DAnalyer::fit` (interpolation vs least-squares,
    parameterisation) and what slots 3/4 return.
 4. Byte layout of a FIFO "item" and how PWM enable / power / frequency are encoded per cycle
@@ -647,3 +779,67 @@ cycle offsets, speed compensation tables, power/freq curves), (7) `fifo_stream.c
 Unit tests should reproduce the numbers in this package: total length 1506.62 mm for the
 24-segment raster with 60 mm side lines, toggle positions 25/28/53/56/81/203.66…, and
 `segInterp_time` for simple segments.
+
+---
+
+## Verification notes
+
+Adversarial re-check of this document against the primary files under `SRC` (2026-09-12).
+Tools: `objdump -p/-h/-d -M intel/-s`, `strings -a` and `strings -a -e l`, `xxd`, `iconv`,
+Python (stdlib) scripts that resolve every `ds:0x…` operand to its double/float value from the
+`.rdata`/`.data` dumps and that recover vtables from RTTI complete-object locators.
+Scratch listings: `mc.asm`/`cad.asm`/`nc.asm` in the session scratchpad.
+
+### What was checked and confirmed (evidence re-produced)
+
+| # | claim | re-check result |
+|---|---|---|
+| 1 | MotionCtrl.dll imported by nobody; classes statically linked in CADModule | import tables of all 13 PEs, ASCII+UTF-16 string search (`MotionCtrl`, export names), empty delay-load directories; RTTI names `.?AV{CNurbsContour,CContoutSmooth,IContourSmooth,CVelocityPlanning,IVelocityPlanning}@@` present in both; UTF-16 `1.3.23` at CADModule file offset `0x113908` = VA `0x10115108`; dump-file strings exist **only** in CADModule (MotionCtrl has no `.txt`/`NodeID`/`total` strings). Vtables: MotionCtrl `0x100196b0` (8 slots, exactly as listed) and `0x10019730` (8 slots). **Confirmed.** PDB directory names decoded (UTF-8): 加减速规划, NURBS曲线. |
+| 2 | splineAnalyer = openNURBS wrapper, 25-slot `ISpline2DAnalyer`, slot 1 = fit(out, pts, 0, 3) | 123 `.?AVON_*` descriptors, 19 `opennurbs_*.cpp` paths, PDB `OpenNurbs_Dll_v1.3.14`; vtables `ISpline2DAnalyer` `0x100e0b4c`, `CSpline2DAnalyer` `0x100e0bb4`, `CSpline3DAnalyer` `0x100e0cac` — 25 slots each; MotionCtrl `0x100061b5–0x100061d5` = `mov edx,[eax]; mov edx,[edx+4]; push 3; push 0; push esi; lea ecx,[edi+0x20]; push ecx; call edx`. **Confirmed.** |
+| 3 | CircleFitDLL used only by AutoNest/Dxf2Grp | import tables. **Confirmed** (11 exports incl. the ctors/dtors/operator= listed; the `?mainFit…` symbol and the five globals appear in the importers' tables). |
+| 4 | Trajectory computed on PC, streamed through FIFO | NCModule UTF-16 strings located in `0x10052390` (fillFifo), `0x1004cfd0` (setPWM), `0x10050af0` (VM); ini keys, `InterpolationCycle="250"`, lang entries all re-read. **Confirmed**, wording "only" softened; VM/simulation target added. |
+| 5 | 7-phase S-curve, J = 2A/Ta or 4Vmax/Ta², Ta ∈ [0.06, 0.25] | `0x1001675b–0x10016797` clamps (0.06 at `.rdata:0x100199b0`, 0.25 at `0x10019800`); J at `0x10016836–0x1001685d` (0.5, 4.0); profile generator `0x1000eeb0` re-traced (`(vmax−v) ≤ A²/J` test, `sqrt((vmax−v)/J)` vs `A/J`, `t2 = (vmax−v−J t1²)/A`, distances with `/6` and `0.5`; `vmax` is raised to `max(vs,ve)` if lower, `0x1000eee3–0x1000eeed`). Cardano constants in the core were **not** re-traced (analyst's evidence accepted as plausible). **Confirmed** (profile), **plausible** (core). |
+| 6 | Junction/arc formula | full x87 re-derivation of `0x100170e0` (see §7.3 addendum); breakpoints, coefficients, both corrections and the call-site arguments (`piece+8`, `0.5/[this+0x30]`, `[this+0x38]`) at `0x10016a4a–0x10016a65`. **Confirmed.** |
+| 7 | P-block ↔ UI parameters | defaults {2000, 0.125, 0.05, 200, 0, 1, 0, 10} confirmed in MotionCtrl `.data:0x1001c288` (8 doubles preceded by 2π, π/2, 180/π, π/180) and in `newVelocityPlanning` `0x100166a9–0x100166e6`; CADModule seeds the same block in `CInterpMrg::CInterpMrg` (`0x100f4350`) but with **P7 = 200**. P0–P3, P6, P7 mapping stays *likely*; **P4 refuted as "cut speed / upper bound"** — it is a floor (`max`). The UI→block path goes through MainApp (only holder of `MC.AccTime` etc.); not traced. **Downgraded** to *likely* for P0–P3/P6/P7, *unknown* for P4/P5. |
+| 8 | segInterp/arcInterp/validator/sampler | argument layout, every threshold (1e-4, 0.001, 10000, 0.00025, 1e6, 5, 2, 0.01), profile struct layout, sampler `N = int(T/dt·1000 + 0.5)`, reserve N+5, `(v t + J t³/6)/L` per cycle — all re-read. Corrections: `acc < 5` (not ≤); return-value semantics (segInterp returns 0/−2 and drops the count, arcInterp returns the count, segInterp_time always 0); `segInterp` does not check `dt`. **Confirmed with corrections.** |
+| 9 | Dump-file decoding | all eight files re-read; counts 24/16/14/7, sums 1506.61 (pathGlys) / 1506.62483 (PWM segs) / 1506.62 (NURBS pieces); all 46 PWM ratios × 1506.62 re-computed. Glyph codes 1–6 re-found in the `CEditable*` ctors (`0x100892ec`, `0x1008a054`, `0x1007dbec`, `0x1007fb32`, `0x100816c7`, `0x10084c7c`); code 7 at `0x1008cfea` (CEditableSpline) and `0x100dff60` (CCreateSpline). **Confirmed.** |
+| 10 | JumpAddTime.txt readers | `Jump/AddTime/Axis4Freq/Is4Freq/\JumpAddTime.txt` UTF-16 only in MainApp; `Arc2SegVelK/K_X/K_Y/\JumpAddTime.txt` UTF-16 only in CADModule, used at `0x100f5ed8–0x100f5fa6` with `push 0x64` default and `fmul 0.01`; `LimitSamllCircleVel/IsLimit/SlowRatio` in no binary (ASCII and UTF-16, min length 3). **Confirmed.** File uses LF-only line endings. |
+| 11 | .mcf opaque | entropy 7.998 bits/byte; string counts 1485/196/33 for min lengths 4/6/8 (the analyst's "196" is the `-n 6` count). **Confirmed**, with the 20-byte header structure (size field) added. |
+
+### What was changed in the document
+
+* §2.1: PDB paths decoded; import/delay-load re-check added.
+* §3: JumpAddTime.txt line-ending note; spline type-code store addresses.
+* §5.2: numeric re-verification of the PWM ratios; connector constants scoped.
+* §6.2: fourth `newSpline2DAnalyer` call site and the addresses using −0.984375.
+* §6.3: **replaced** the "loop position" hypothesis with the `skipSetData` flag finding.
+* §6.4: piece record — `+0x18` (speed cap / forced stop) and `+0x40` (speed factor) **are** read
+  by the planner; the "not read" statement was wrong.
+* §7.1: **P4 is a minimum-speed floor** (`max`, not `min`); P7 CADModule default 200; node
+  builder B described; slow-start algorithm corrected (0.1 mm activation, 0.01/0.05
+  tolerances, node insertion); acceleration-time semantics tied to lang `de2/de4`.
+* §7.2: node fields `+0x08`/`+0x10` corrected from the full four-pass listing (no
+  "min with neighbour"; `max(f_{i−1}, f_i)` then `min(·, feed)`; zero-fill pass; end nodes
+  forced to 0); 0.99 factor address; VelDecc.txt date.
+* §7.3: continuity check and algebraic simplification of the correction term.
+* §7.6: validator threshold and return-value corrections.
+* §8: `0x100f5150/0x100f5230/0x100f5450` re-identified (vector helpers / post-processing, not
+  planner calls); the real planner call site `0x100f6130` and its overrides (P3, P6 = 0,
+  P8 = 0, mode = 1); `CInterpMrg` layout (10-double block at `+0x88`, smoother block at
+  `+0xe0`, owned smoother/planner); the split-and-stop routine `0x100f6310`.
+* §9: FIFO string→function addresses; `CVirtualMachine` simulation target; "only" softened;
+  .mcf header analysis.
+* §11, §12, §13: tables and open questions updated accordingly.
+
+### What remains uncertain
+
+* The look-ahead core (`0x100114d0` and callees) was not re-traced; the "backward/forward,
+  five profile calls, Cardano" description is the analyst's and is rated *plausible*.
+* The exact UI parameter → P0..P9 mapping (needs MainApp.exe analysis of the caller of the
+  `CCADModule` virtual wrapper `0x100dab10`), including whether `AccTime` is divided by 1000
+  before it reaches P1 and which value feeds P4/P5/P8/P9.
+* Which position list feeds `0x100f6310` (PWM toggles vs micro-joints) and which flows skip it.
+* Semantics of piece doubles `+0x20..+0x38` and of the `CNurbsContour` fields beyond `+0x80`.
+* The role of the 0xd0-byte glyph records consumed by `process` and the identity of the
+  284.266 mm contour in the dumps.
+* The .mcf header fields beyond the size dword.

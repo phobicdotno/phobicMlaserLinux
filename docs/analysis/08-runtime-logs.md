@@ -29,7 +29,10 @@ artefacts prove or contradict. Chinese strings are quoted verbatim with an Engli
 * `Log/VelDecc.txt` is empty (0 bytes, dated 2024-06-19).
 * `Report/TotalReport.txt` is the cumulative **work report**: 2 950 CSV rows, 2024-07-25 → 2025-07-18, two row formats
   (7 fields until 2025-03-06, 10 fields from 2025-03-10). The times in it are the planner's *estimates*
-  (identical for repeated runs of the same drawing), the timestamp is the job **end time** (`gp135 加工完成时间`).
+  (identical for repeated runs of the same drawing), the timestamp is the time of the job's **end/stop event**
+  (`gp135 加工完成时间` "processing finished time") – but a row is written for *every* stop, including runs aborted by the
+  operator after 1–2 s (40 rows of the same 43-s job within 21 min on 2025-07-09 16:58–17:19, §6.2), so a row does **not**
+  prove a completed job. *(Verifier correction – the original text read "the timestamp is the job end time".)*
   The machine was used almost exclusively for **short test cuts of unsaved drawings** (99.6 % `未命名-1` / "Untitled-1",
   median job 4 s, 30×25 mm squares and 7 mm-high strips) – a factory/dealer test profile, not production.
 * The start-up handshake, the reconnect handshake, the jog/home/multi-axis command vectors with real parameter values, the
@@ -44,12 +47,13 @@ artefacts prove or contradict. Chinese strings are quoted verbatim with an Engli
 | File | Size | Encoding / format | Content (short) |
 |---|---|---|---|
 | `Log/2025-06-25.log` … `2025-07-18.log` (15 files) | 114 B – 85 KB, 316 KB total | ASCII, CRLF, one line per event | MCC100 driver error log (§2) |
-| `Log/2026-09-11.log` | 114 B | same | one `NC Start` at `2026-09-11 17:50:32.506` – written *on this Linux PC* (the file is newer than the 2025-07-29 copy date of everything else), i.e. somebody launched `MainApp.exe` (Wine) from this directory; the app writes `Log\<date>.log` next to the exe even without a card |
+| `Log/2026-09-11.log` | 114 B | same | one `NC Start` at `2026-09-11 17:50:32.506` – written *on this Linux PC* (the file is newer than the 2025-07-29 copy date of everything else), i.e. somebody launched `MainApp.exe` (Wine) from this directory; the app writes `Log\<date>.log` next to the exe even without a card. **Verifier addition:** 43 s later the same run wrote `Dump/20260911-175115.dmp` (28 206 B, `file`: "Mini DuMP crash report, 8 streams, Fri Sep 11 15:51:16 2026" = 17:51:16 local) – the Wine launch ended in MainApp's own minidump handler, i.e. it crashed `[confirmed]` |
 | `Log/Code.txt` | 88 860 B, 1 252 lines | ASCII, CRLF | licence/activation log 2024-06-19 → 2025-06-17 (§5) |
+| `Module/NCModule.dll`, `Module/LogModule.dll` (writers, for reference) | 788 480 B / 70 144 B, both built 2025-06-24 | – | `NCModule.dll` holds the UTF-16 templates `RecvDataErr`, `RecvErr_selectFunc`, `Recvfrom`, `Sendto`, ` ErrCode:`, ` Try-Times(R/S):`, ` Buffer:`, ` DataEx:`, the `NC Start` banner, `\Log\`, `.log`, `%04d-%02d-%02d %02d:%02d:%02d`, `CMCHalAPI::writeMCLog`, `\Log\Code.txt`; the file writer is `LogModule.dll` (`CLogModule::writeLog`, `GenNewLogFileDaily`, `LogFileDir`, `LogFileName`; PDB path `D:\SC2000\NexCut\NexCut_X1_Http\Release\Module\LogModule.pdb` – internal product name **NexCut_X1_Http**). Note `NCModule.dll` lives in `Module/`, not next to the exe (verifier addition) |
 | `Log/VelDecc.txt` | 0 B (2024-06-19) | – | empty; name suggests a velocity/deceleration dump that was never written |
 | `Report/TotalReport.txt` | 270 817 B, 2 950 lines | UTF-8 (Chinese `未命名`, `分`, `秒`, `×` decode as UTF-8; **not** GBK – `file` says "CSV Unicode text, UTF-8") | cumulative work report (§6) |
 | `Report/LogReport.txt` | 4 795 B, 40 lines | UTF-8 | work-report *export/print* log: `<write time>  <row>` (§6.3) |
-| `Report/report.txt` | 198 B, 2 lines | UTF-8 | the rows handed to `report.exe` for the last "Work Report [New]" (§6.4) |
+| `Report/report.txt` | 198 B, 2 lines | UTF-8, line ends are `0d 0d 0a` (`\r\r\n` – a CRLF written in text mode) | the rows handed to `report.exe` for the last "Work Report [New]" (§6.4) |
 | `Report/lang.txt` | 7 B `lang==0` | ASCII | language switch for `report.exe` (0 = Chinese; MainApp has `lang==0`/`lang==1` strings) |
 | `Report/report.exe` | 45 MB, Qt5 static build (`QDateTimeParser`, `QHeaderView` symbols, `csvgdsvgz` MIME list) | – | the report viewer/printer (out of scope; only its inputs matter) |
 | `Report/*.jpg` | 800×800 previews `111.chf.jpg`, `222.chf.jpg`, `rpt.chf.jpg`, `Untitled-1.jpg`, `未命名-1.jpg`; 838×709 `广告.jpg` ("advertisement") = `1111.jpg` | JPEG | job thumbnails rendered for the report, plus a vendor banner |
@@ -89,7 +93,10 @@ the `NC Start` banner of the first application start of that day. There is no he
 Field semantics (EVIDENCE from the values, consistent with the decoder description in `04-controller-protocol.md` §3.3):
 
 * `Try-Times(R/S):r/s` – receive attempt / send attempt counters. `Sendto` is logged with `0/1` (failed before any
-  receive). Exceptions are always `1/1` (first reply to the first send). Timeouts step through the ladder of §2.3.
+  receive). Exception **503** lines are always `1/1` (567/567). Exception **502** lines are `1/1` in 30 cases but `1/2` (×1,
+  2025-07-09 15:06:03) and `1/3` (×5, e.g. 2025-07-09 15:39:00, 2025-07-12 17:42:23) when the exception reply arrives
+  during a running timeout ladder – the exception then terminates the transaction at that rung. *(Verifier correction –
+  the original text read "Exceptions are always 1/1".)* Timeouts step through the ladder of §2.3.
 * `Data:` – the decoded reply vector as 32-bit words (hex, no `0x`): for exceptions `000000c0 00000003` = function
   `0xC0` (= `0x40|0x80`) + exception code 3; `000000b0 00000002` = `0x30|0x80` + code 2. For `Sendto` it is the request
   vector instead.
@@ -130,11 +137,24 @@ three (`MCMaxRecvTime=3`). `MCMaxSendTime=2` in `ipAdd.ini` therefore means "2 *
 x2, x3, x4, x5 – 58 of the 197 bursts) are transactions that succeeded on a later attempt; e.g. `2025-07-12 15:10:29.798
 x4` shows labels `1/1, 1/2, 2/2, 3/2` then success. A reply that finally arrives is not logged.
 
+**Verifier re-count** (grouping = consecutive timeout lines with identical `DataEx` and < 2 s apart): 188 timeout-only
+bursts; label sequences `1/1,1/2,2/2,3/2,1/3,2/3,3/3` ×138, `1/1` alone ×43, `1/1,1/1` ×2, `1/1,1/1,1/1` ×1,
+`1/1,1/2,2/2,3/2` ×2, `1/1,1/1,1/2,2/2,3/2` ×2. Inter-rung gap in the 138 full ladders: min 0.500 s, median 0.501 s,
+max 1.448 s (828 gaps). The analyst's 197/139 differ only by grouping rule; the ladder itself is `[confirmed]`.
+
+**Verifier addition – the single-try mode during streaming.** The 43 `1/1`-only bursts are *not* limited to FIFO frames:
+in the 2025-07-17 sessions and at 2025-07-13 09:09 the register reads `READ 60001 n=120`, `READ 50000 n=26`,
+`READ 1000 n=36` and `READ 10000 n=18` are also logged once with `1/1` and then the driver moves on to the next queued
+transaction, ~0.5–0.6 s apart (e.g. 13:32:19.172 FIFO 504 → 19.688 READ 60001 → 20.279 READ 60001 → 20.797 READ 60001 →
+21.399 FIFO 523 → 22.002 READ 1000/36, all `1/1`). So the "one try then continue" policy belongs to the *job-running
+state* of the driver (or to a round-robin queue serviced while the FIFO writer is active), not to FIFO frames as such –
+see §4.4. `[likely]`
+
 Distribution of timeout bursts by request (197 bursts):
 
 | Request (`DataEx`) | bursts | of which full (7 tries) | isolated (no other error ±60 s) | Note |
 |---|---|---|---|---|
-| `30 2710 12` READ 10000 n=18 | 83 | 76 | 60 | see §4.3 – the card regularly does not answer this block |
+| `30 2710 12` READ 10000 n=18 | 83 (verifier: 81) | 76 | 60 (verifier: 59) | see §4.3 – the card regularly does not answer this block |
 | `30 3e8 24` READ 1000 n=36 | 26 | 20 | – | status block (`checkMCStatus`) |
 | `30 ea61 78` READ 60001 n=120 | 22 | 10 | – | parameter block |
 | `40 66 12a …` FIFO frame | 22 | 0 (20 single-try `1/1`, 2 escalated `1/1,1/1,1/2,2/2,3/2`) | – | only on 2025-07-13 09:09 and 2025-07-17 (§4.4) |
@@ -180,8 +200,12 @@ Identical pairs: 2025-07-14 14:47:17→14:47:21 (Δ4 s), 17:22:31→17:22:38 (Δ
 after a start when the card is merely unpowered (`2025-07-10 08:38:57 NC Start → 08:39:06 READ 1000 n=2 ×7`, `10:52:55 →
 10:52:57`, `10:54:07 → 10:54:11`, `10:57:32 → 10:57:35`, `10:57:44 → 10:57:50`, `11:11:40 → 11:11:44`; 2025-07-11
 08:30:08 → 08:30:20, 10:32:53 → 10:32:56, 10:40:42 → 10:41:14, 14:32:34 → 14:32:56; 2025-07-12 08:43:42 → 08:43:53;
-2025-07-18 09:44:13 → 09:44:23). Δ between `NC Start` and the first datagram is 3–30 s = the time MainApp needs to
-load its modules/UI before the NC thread starts talking (`ConnectWait=500` is not the dominant term). `[confirmed]`
+2025-07-18 09:44:13 → 09:44:23). Δ between `NC Start` and the first *logged* datagram is **0.8–31.5 s** (verifier:
+2025-07-17 15:03:17.883 `NC Start` → 15:03:18.649 `READ 1000 n=2` answered with 502, seq `00 00`; 2025-07-10 10:52:55 →
+10:52:57 (2.4 s); 2025-07-11 10:40:42 → 10:41:14 (31.5 s)) – not "3–30 s", and the 0.8-s case shows the delay is not
+dominated by module loading. Because only *failing* datagrams are logged, the "first datagram is READ 1000 n=2" statement
+rests on the 21 starts (5 `Sendto` + 16 timeouts) where that datagram failed; in the other 91 starts nothing is known.
+`[likely]` *(verifier downgrade from `[confirmed]`)*
 
 `Sendto 10065` (host unreachable) means the Windows IP stack had no route/ARP to 10.1.1.168: NIC disabled, cable out,
 or the PC address not yet set (the package ships `File/IPSet.exe` and `pingMC.bat`/`pingZF.bat` for exactly this).
@@ -224,7 +248,7 @@ jobs, `end time` field):
 
 | Day | `NC Start` | first start | last log line | jobs finished | job end times | Σ est. process time |
 |---|---|---|---|---|---|---|
-| 06-25 | 2 | 18:13 | 19:27 | 11 | 11:07–18:46 | 543 s |
+| 06-25 | 2 | 18:13 | 19:27 | 11 | 11:07–18:46 | 543 s | ← the three `.nc` rows (11:07–11:16) predate the first `NC Start` of the day (18:13) and even `File/ipAdd.ini` (written 13:30 CST that day; `MainApp.exe` is dated 2025-06-24 10:20 CST) – the report file was carried over from the previous installation, and `NC Start` is therefore not a complete record of application starts (verifier) |
 | 06-26 | 2 | 08:32 | 10:49 | 49 | 08:35–10:43 | 388 s |
 | 06-28 | 2 | 08:28 | 08:40 | 0 | – | – |
 | 07-01 | 1 | 10:43 | 10:43 | 0 | – | – |
@@ -234,7 +258,7 @@ jobs, `end time` field):
 | 07-09 | 9 | 09:08 | 21:51 | 218 | 14:48–21:56 | 3 299 s |
 | 07-10 | 16 | 08:36 | 20:58 | 160 | 08:50–21:21 | 1 317 s |
 | 07-11 | 15 | 08:30 | 20:54 | 177 | 14:40–20:11 | 963 s |
-| 07-12 | 13 | 08:43 | 19:23 | 181 | 08:54–19:30 | 904 s |
+| 07-12 | 13 | 08:43 | 19:23 | 181 | 08:54–19:30 | 922 s (verifier re-sum; analyst wrote 904) |
 | 07-13 | 6 | 08:44 | 15:54 | 62 | 09:02–15:03 | 391 s |
 | 07-14 | 10 | 09:16 | 18:27 | 207 | 10:14–18:16 | 1 112 s |
 | 07-17 | 12 | 13:30 | 20:13 | 37 | 15:23–17:31 | 339 s |
@@ -270,10 +294,15 @@ normally before and after). A Linux port should treat block 10000 as *optional/s
 
 22 complete frames leaked on 2025-07-13 09:09:28 and 2025-07-17 13:32–15:21 (each logged because the card did not
 acknowledge it within 500 ms). Frame layout (EVIDENCE): `40 66 12a <frameId> <297 words>` = write 298 words to register
-0x66: word 0 = frame id, then **297 data words**. Frame ids are a **per-session counter** (reset by `NC Start`: 504, 523,
-633, 643, 654 … on the 13:31 session; 80, 87 after the 13:51 restart; 57, 115 after 14:22; 1931 on 2025-07-13 25 min
-into the session), incremented by the number of frames actually sent (504→523 in 2.2 s ≈ 8.5 frames/s ≈ 850 items/s
-while refilling after timeouts).
+0x66: word 0 = frame id, then **297 data words**. Frame ids are a counter incremented per frame sent (504→523 in 2.2 s
+≈ 8.5 frames/s ≈ 850 items/s while refilling after timeouts; 633→643→654 in 1.34 s ≈ 15 frames/s).
+**Verifier correction – they are *not* a per-session counter reset by `NC Start`:** on 2025-07-17 the ids run
+80, 87 at 13:57:34–35 and then **57**, 115 at 14:22:17–20 with *no* `NC Start` between 13:51:34 and 14:42:59 (the
+analyst's "57, 115 after 14:22" restart does not exist in the log). The counter therefore restarts with each job/Start
+(or with each streaming session) `[likely]`. This also removes the "1931 frames 25 min into the session" datum for
+2025-07-13: frame 1931 at 09:09:28.6 was sent 9.6 s after the report row of 09:09:19 (a 7-s job) and 32 s after the row of
+09:08:56, so 1931 × 99 ticks cannot have been streamed in real time at 1 ms/tick within any job visible in the report –
+the frame-id semantics (frames since job start? items? pre-fill far ahead of real time?) are an open question (§9).
 
 **The 297 words are not 99 fixed 12-byte items** (as assumed in doc 04 §3.7 from a single frame). They are a
 **TLV item list**: header word = `(payloadBytes << 16) | opcode`, followed by `payloadBytes/4` argument words. Parsing all
@@ -281,7 +310,7 @@ while refilling after timeouts).
 
 | opcode (dec) | header | args | occurrences | observed args | INFERENCE (confidence) |
 |---|---|---|---|---|---|
-| **3000** | `0x00080BB8` | 2 | 2 952 | arg0 = two int16 `(dY<<16 \| dX)` in −4…+8; arg1 = `(freq<<16) \| duty`: `0x13880004` (5000, 4), `0x13880000` (5000, 0), `0x07D00064` (2000, 100) | **interpolation tick**: axis increments for one bus cycle + laser PWM frequency (Hz) and duty (%) for that tick. `[confirmed]`: the (5000, 4) frames belong to the 200×200 mm test cut at 49.7 mm/s (`Report` row 2025-07-17 15:23:36: 1.65 m in 33.18 s) and the current `BkLayerPara.xml` CO2 layer with `CutSpeed="50"` has `CutFreq="5000" CutDuty="4"`; duty 0 = laser off (rapid moves, ramps); (2000, 100) on 2025-07-13 = a layer with 2 kHz / 100 % |
+| **3000** | `0x00080BB8` | 2 | 2 160 in the 22 distinct frames (2 952 if the 8 re-sent copies of frames 654 and 60 are counted – verifier) | arg0 = two int16 `(dY<<16 \| dX)` in −4…+8; arg1 = `(freq<<16) \| duty`: `0x13880004` (5000, 4), `0x13880000` (5000, 0), `0x07D00064` (2000, 100) | **interpolation tick**: axis increments for one bus cycle + laser PWM frequency (Hz) and duty (%) for that tick. `[confirmed]`: the (5000, 4) frames belong to the 200×200 mm test cut at 49.7 mm/s (`Report` row 2025-07-17 15:23:36: 1.65 m in 33.18 s) and the current `BkLayerPara.xml` CO2 layer with `CutSpeed="50"` has `CutFreq="5000" CutDuty="4"`; duty 0 = laser off (rapid moves, ramps); (2000, 100) on 2025-07-13 = a layer with 2 kHz / 100 % |
 | 3001 | `0x00000BB9` | 0 | 6 | – | segment boundary / sync marker `[likely]` |
 | 3002 | `0x00040BBA` | 1 | 3 | `5`, `4` | segment type/mode marker (5 before laser-on, 4 after laser-off) `[guess]` |
 | 9999 | `0x000C270F` | 3 | 5 | `[2, 4, 4]`, `[2, 0x100, 0x100]`, `[2, 0x100, 0]` | same "misc 9999" family as the 0x65 command: sub 2 = set outputs, `(mask, value)` bit-wise: bit 2 (value 4) and bit 8 (0x100) switched on before cutting, bit 8 off after `[likely]` (laser enable / gas valve) |
@@ -289,6 +318,11 @@ while refilling after timeouts).
 | 109 | `0x0008006D` | 2 | 1 | `[1000, 0]` | dwell 1000 ms after laser off `[guess]` |
 | 2001 | `0x000807D1` | 2 | 3 | `[0x03000002, 20000]` | laser/PWM configuration (mode bits, 20000 = ?) `[guess]` |
 | 118 | `0x000C0076` | 3 | 1 | `[4, 0, 0x23]` | end-of-contour bookkeeping (contour index 35?) `[guess]` |
+
+*Notation note (verifier):* in the reconstructions below the analyst prints each tick as `(high half, low half)` of
+arg0, i.e. `(dY, dX)` under the formula given in the table – frame 633's single non-zero tick is `arg0 = 0x0000FFFF`
+(low half −1, high half 0) and frame 523 starts with `arg0 = 0x0001FFFF` (low −1, high +1); the rapids' `(3,7)…(4,7)`
+are low = 7, high = 3…4. Which half is physically X is not established by these files.
 
 Reconstructed **start of a contour** (frame 504, 2025-07-17 13:32:19; identical in frame 57, 14:22:17):
 
@@ -317,18 +351,29 @@ Tick increments: cutting at the 50 mm/s layer shows |(dX,dY)| ≈ 2.1–2.2 unit
 files alone (open question §9); doc 04's estimate of a 1-ms bus cycle with ~1.6 s of look-ahead (`MCFifoTime=1600`)
 is consistent with 8.5 frames/s refill bursts.
 
-**Retry policy for FIFO frames differs from register reads** (EVIDENCE: the 30 FIFO timeout lines): a frame that is
+**Retry policy while streaming** (EVIDENCE: the 30 FIFO timeout lines and their neighbours): a frame that is
 not acknowledged is logged once with `1/1` and the streamer simply continues with later frame ids (1f8 → 20b, 279 → 283
-→ 28e within 1.3 s); only when the same frame id is sent again (28e on 13:38:50–52, 3c on 15:04:19–21) does the
-`1/1, 1/1, 1/2, 2/2, 3/2` ladder run, after which the job is dead (the operator restarted the application 80 s later).
-INFERENCE `[likely]`: streaming writes use `MaxRecvTime = 1` and rely on the card's FIFO-frame-id register to detect
-gaps; a re-send of a specific frame is the resynchronisation attempt.
+→ 28e within 1.3 s); only when the same frame id is sent again (28e on 13:38:50–52, 3c on 15:04:19–21; the re-sent
+payloads are byte-identical – verifier) does the `1/1, 1/1, 1/2, 2/2, 3/2` ladder run, after which the job is dead (the
+operator restarted the application 80 s later). **Verifier correction:** the single-try behaviour is *not* specific to
+FIFO frames – in the same seconds the register reads `READ 60001/120`, `READ 50000/26`, `READ 1000/36`, `READ 10000/18`
+are also logged once with `1/1` and skipped (§2.3, "single-try mode during streaming"). INFERENCE `[likely]`: while a
+job is streaming the driver services its transaction queue with one try each (so that the FIFO writer is never blocked
+for 3.5 s) and relies on the card's FIFO-frame-id register to detect gaps; a re-send of a specific frame is the
+resynchronisation attempt. `ipAdd.ini` also has `FifoTimeout=600`, `MaxItemPerFrame=60`, `MaxFillItem=2000`,
+`FifoAlarmNum=30`; note that `MaxItemPerFrame=60` does **not** match the 99 items per frame observed here, so that key
+governs something else (verifier).
 
 **Consequence of a lost FIFO frame:** every day on which FIFO frames timed out has *no* report row for the job that
 was running (2025-07-13 09:09 – the frame belongs to a run between the jobs that ended 09:09:19 and 09:12:57;
-2025-07-17 13:30–15:22 – 12 frames lost, 0 jobs finished, 9 application restarts, then the first finished job at
-15:23:36 once the network was stable). INFERENCE `[confirmed]`: an unacknowledged FIFO frame ends the job (FIFO
-starvation alarm `EtherCATErrorInfo_2_05`, doc 04), and only finished jobs are written to the report.
+2025-07-17 13:30–15:22 – **21 distinct frames lost** (57, 58, 60, 67, 69, 80, 87, 115, 132, 141, 212, 297, 504, 523,
+633, 643, 654, 725, 739, 1191, 1199; verifier – the analyst wrote 12), 0 report rows, 9 application restarts, then the
+first row at 15:23:36 once the network was stable). INFERENCE `[likely]` *(verifier downgrade from `[confirmed]`)*: an
+unacknowledged FIFO frame ends the job (FIFO starvation alarm `EtherCATErrorInfo_2_05`, doc 04). The second half of the
+original inference – "only finished jobs are written to the report" – is **refuted**: rows are written for runs the
+operator stopped after 1–2 s (§6.2), so the correct statement is "jobs that die from a communication alarm leave no
+row; jobs that reach the normal end/stop path do, finished or not". On 2025-07-17 every read was failing as well, so the
+missing rows could equally be due to the general link failure rather than the FIFO frame specifically.
 
 ### 4.5 Jog / home rejections (`ErrCode:503`, 567 lines)
 
@@ -336,7 +381,7 @@ All 567 exception-3 replies are answers to command-register writes:
 
 | Vector | count | decode |
 |---|---|---|
-| `[3, axis, v, 5999, 59990, target]` | 506 | single-axis move: axis 0 (X) 225×, axis 1 (Y) 277×, axis 4 (W/lift, `v` 50000/100000, `a` 4000, `j` 40000, target ±1 000 000) 4×; `v` = 50000 (slow jog, 231×) or 200000 (fast jog, 358×) |
+| `[3, axis, v, 5999, 59990, target]` | 506 | single-axis move: axis 0 (X) 225×, axis 1 (Y) 277×, axis 4 (W/lift, `v` 50000 ×3 / 100000 ×1, `a` 4000, `j` 40000, target +1 000 000 ×3, −1 000 000 ×1) 4×; `v` = 50000 (slow jog, **144×** X/Y + 3× W – verifier; analyst wrote 231×) or 200000 (fast jog, 358×). X/Y breakdown (verifier): Y/200000 absolute 151, X/200000 absolute 98, X/200000 continuous 63, Y/50000 absolute 55, Y/200000 continuous 46, X/50000 absolute 40, Y/50000 continuous 25, X/50000 continuous 24 |
 | `[1, axis, 2, vSlow, vFast]` | 60 | homing: axis 1 with (2000, 20000) 13× / (5000, 50000) 21×, axis 2 (2000/20000) 11× / (5000/50000) 8×, axis 31 (= all axes, bit mask 0b11111) (2000, 20000) 7× |
 | `[5, 0x80000003, 550000, 8999, 89990, 430178, 174097, 0, 0]` | 1 | two-axis move X+Y (mask bits 0,1; bit 31 = flag), v 550 000, a 8999, j 89990, to (430.178, 174.097) mm – 2025-07-08 13:24:33, i.e. "go to point" / return to start |
 
@@ -348,9 +393,15 @@ unit 0.001 mm/s and accel 5 999 ≈ 6 mm/s² ×1000? – see open questions). `�
 "continuous jog until key release" form. Speed constants 50 000 / 200 000 = `ManuPara` slow/fast jog speeds
 (50 and 200 mm/s), 5999/59990 = accel/jerk parameters.
 
-Why are they rejected? The bursts come at the keyboard/pendant auto-repeat rate (180–250 ms) and always while an axis is
-already moving; the report timestamps show them 4–15 s *before* a job end minus its duration (= right before pressing
-Start) or seconds after a job. INFERENCE `[likely]`: exception 3 ("illegal data value") is the card's answer to a new
+Why are they rejected? **Verifier correction on the timing:** the 503 lines come on *two* time scales, not "at
+key-repeat rate (180–250 ms)". (a) The dominant spacing is **52 ms** (129 of the 260 consecutive-line gaps < 2 s are
+0.05 s) between *identical* vectors: 437 groups of identical `DataEx` ≤ 70 ms apart, sizes 1 ×347, 2 ×65, 3 ×10, 4 ×15
+(never more than 4), the reply sequence numbers inside a group mostly consecutive (+1 ×96, +5 ×27) – i.e. an
+application-level re-send of the rejected command up to 3 times at ~50 ms, with no other transaction in between.
+(b) *New* targets follow every 0.2–0.4 s (inter-group gaps: 0.2 s ×37, 0.4 s ×30, 0.3 s ×10, 0.6 s ×12) – the UI jog
+timer / key auto-repeat, e.g. 2025-07-07 09:13:10.504 → .725 → .950 → 11.172 (221–225 ms) with targets 121 571 → 112 345
+→ 99 968 → 80 156, then 80 156 again at +52 ms. All while an axis is already moving; the report timestamps show them
+seconds *before* a job's stop event (positioning before Start) or seconds after it. INFERENCE `[likely]`: exception 3 ("illegal data value") is the card's answer to a new
 absolute move while a move on that axis is still executing (or to a homing request while another axis is homing –
 the 2025-07-17 15:09:29 burst alternates `home 1` / `home 2` 24 times in 3 s). The first press of a key succeeds (never
 logged); every auto-repeat during the motion is refused and logged. There is no evidence of soft-limit rejections
@@ -382,7 +433,7 @@ Check code Error: Hid:<i32> CallTime:<1|2|3> DataLen:32 CardTime:<Y-M-D h:m:s>  
 | `verify data area failed!` | 683 | licence data block on the card failed verification (`dogState_DataBroken 硬件数据区被损 / Data sector is error`, `dogState_VerifError 系统认证错误`). Written in triplets (3 attempts) at every start-up 2024-06-19…06-27 (every session!), then sporadically |
 | `Arm Clock is invalid!` | 103 | the card's (ARM) RTC is invalid (`dogState_ClockIllegal 板卡时钟非法 / Hardware clock is illegal`); 2024-06-28 and 2024-10-18…11-05, at every start |
 | `Admin data was broken (read admin data)!!!` | 88 | admin (vendor) record on the card unreadable; always follows a `Check code Error` triplet |
-| `Check code Error: Hid:… CallTime:1/2/3 DataLen:32 CardTime:… PcTime:…` | 237 (79 triplets) | the 32-byte licence record read from the card does not verify; logged three times per attempt with card and PC time; `CardTime` = `2000-0-1 0:0:0` from 2024-09-18 on (RTC lost) |
+| `Check code Error: Hid:… CallTime:1/2/3 DataLen:32 CardTime:… PcTime:…` | **264 (88 triplets)** – verifier re-count; the analyst's 237/79 is wrong (consistent with the 88 `Admin data was broken` lines that each follow a triplet) | the 32-byte licence record read from the card does not verify; logged three times per attempt with card and PC time; `CardTime` = `2000-0-1 0:0:0` from 2024-09-18 on (RTC lost) |
 | `Admin data is not current App data (read admin data)!!!` | 7 | licence written by a different application/product id (`dogState_NotTheApp 非匹配应用程序 / Unauthenticated App ID`), 2024-07-17 |
 | `User data is error (read user data)!!!` | 6 | user record unreadable |
 | `get card clock fail!!` / `you lose your clock (get clock fail)!` | 5 / 2 | reading the card RTC failed (`dogState_ClockBroken 获取板卡时钟失败`) |
@@ -407,7 +458,7 @@ Check code Error: Hid:<i32> CallTime:<1|2|3> DataLen:32 CardTime:<Y-M-D h:m:s>  
 | 2024-08-09 … 09-20 | `get card clock fail` ×5 |
 | 2024-09-18 (logged 10-18) | `CardTime:2000-0-1` from now on – the card RTC has reset (battery/firmware) |
 | 2024-10-18 … 10-23 | `Arm Clock is invalid!` at every start (101 lines) |
-| 2024-10-31 … 11-05 | 79 `Check code Error` triplets (Hid −652316513) + `Admin data was broken` – every start fails |
+| 2024-10-31 … 11-05 | **75** `Check code Error` triplets (lines 829–1128, Hid −652316513) + `Admin data was broken` – every start fails (verifier re-count; analyst wrote 79). `TotalReport.txt` has 97 job rows in the same window, so the machine kept cutting |
 | 2024-11-11 14:05–15:02 | code `OBYPHMAMCHLPWGPBXICL` (Hid 3642650783 = −652316513 as int32 ✔ – the same id the failing checks reported, **3 days**, UserCode 999) entered 11 times; alternating `reset clock OK` and `code overdue` (`lastLicenseClock:2054-11-11 6:06:14` = PC UTC time **+30 years** – the card stores/returns the clock with a 30-year offset, i.e. an epoch-2000 counter interpreted as epoch-1970 `[likely]`) |
 | 2024-11-15 … 2025-06-03 | one `Check code Error` triplet + `Admin data was broken` per start on 8 days (Hid drifting: −652316462, −652316214, −652316489, −652316227, −652316510, then −584860729 on 2025-04-22 and −585250654 on 2025-06-03) |
 | 2025-06-17 17:19–17:52 | code `ZMILVIOQKBPXJNEZRSZC` (Hid 3709908410, **180 days**, UserCode 999, CodeTime 2025-06-17 16:45:09): `hard ID is not match` ×4; `reset card clock fail`; **PC clock set to 2055-06-17** (lines timestamped 2055); `hard ID is not match`, `code overdue (lastLicenseClock:2085-6-16)`, `reset clock OK`, fails, `reset clock OK`, fails, `reset clock OK`; PC clock back to 2025-06-17 17:52:42: `reset clock OK`. No `Active OK` line is printed for this code, but the machine then ran without licence errors through 2025-07-18 (no further Code.txt lines) |
@@ -462,16 +513,31 @@ accept both `未命名-1`/`Untitled-1`, `分…秒`/`Min…Sec`, `×`/`x`, with/
 
 ### 6.2 Semantics established from the data
 
-* **`end time`**: `gp135` says 加工完成时间 "processing finished time". Consistent with `LogReport.txt` being written 2–6 s
-  *after* it (§6.3) and with jog rejections clustering 4–15 s before `end − duration` (= just before Start) `[confirmed]`.
+* **`end time`**: `gp135` says 加工完成时间 "processing finished time". Consistent with `LogReport.txt` being written
+  *after* it (§6.3) and with jog rejections clustering before `end − duration` (= just before Start). **Verifier
+  downgrade to `[likely]`, with an important qualification:** the timestamp is the time of the job's *end/stop event*, and
+  such an event is generated for runs that were stopped almost immediately. EVIDENCE: on 2025-07-09 16:58:13–17:19:44 the
+  file holds **40 rows** of the identical `200.00×200.00 mm … 0分43秒, 33.18 Sec` job, 1–3 s apart in places
+  (17:05:07, :08, :10, :11, :13, :14, :15, :19, :20, :21), while the `Log` for that window is empty; 40 real 43-s runs would
+  need ≥ 29 min. Over the whole file 49 rows follow their predecessor by less than their own estimated duration (a
+  start-time reading fares no better: 62 violations). So `TotalReport.txt` counts *Start events that reached the stop
+  path*, not completed jobs, and the estimate columns are written regardless of how far the job got. On 2025-07-14
+  15:14:26–15:15:16 ten `0.00×0.00` rows 2 s apart are followed at 15:15:30 by the `[9999,2,1,0]` output-off command
+  (§4.2) – the same post-stop sequence as after a real job.
 * **Times are planner estimates, not measurements**: repeated runs of the same drawing carry byte-identical
   `cut/idle/pierce` seconds (`4.91 Sec,0.19 Sec,1.75 Sec` for nine 30×25 mm runs on 2025-07-13; only `cut` changes when
-  the operator changes the layer speed: 4.11/4.91/5.70 s), and `total = round(cut + idle + pierce)` in 1 496 of 1 737
-  rows (±1 s in another 63). The `gp2001` dialog is the "estimated time report" (`mp26`, doc 06). Real wall-clock
-  duration is *not* stored anywhere in the reports.
+  the operator changes the layer speed: 4.11/4.91/5.70 s). **Verifier correction:** `total = round(cut + idle + pierce)`
+  holds in only **1 003** of the 1 708 non-garbage format-B rows; the total exceeds the rounded sum by +1 s in 530 rows,
+  +2 s in 22, +4 s in 19, **+5 s in 75**, +12…+19 s in 17 (e.g. the 200×200 mm job: 33.18 + 5.24 + 0 = 38.4 s but
+  `0分57秒` on 2025-07-17 and `0分43秒` on 2025-07-09 – same geometry, different total) and is 1 s *below* it in 12. The
+  `分秒` total therefore includes the two "system delay" terms of the `gp2001` string (`系统延时：%.1f + %.1f(秒)` /
+  `Sys Delay: (%.1f + %.1f)(s)`), which are *not* written as columns and vary with the parameter set in force. The
+  `gp2001` dialog is the "estimated time report" (`mp26`, doc 06). Real wall-clock duration is *not* stored anywhere in
+  the reports.
 * **pierce count / pierce time**: 1 064 rows have pierce ≥ 1; in format B `pierce time` is 0 exactly when pierce count is 0
   (993 rows) and 0.7–1.8 s (occasionally 7.2–8.2 s) when pierce = 1 – the per-pierce dwell of the layer (`t3` values
-  0.8 s ×268, 1.1 s ×182, 1.3 s ×156, 1.8 s ×55). Max pierce count 256 (a dot-matrix job), Σ = 4 043.
+  0.75 s ×268, 1.1 s ×182, 1.3 s ×156, 1.75 s ×55, 0.7 s ×27, 7.8 s ×25, 8.2 s ×17, 7.2 s ×10 – verifier; the analyst
+  rounded 0.75/1.75 to 0.8/1.8). Max pierce count 256 (a dot-matrix job), Σ = 4 043.
 * **Empty jobs**: 314 rows have size `0.00×0.00` (Start pressed with nothing selected / an empty drawing); they are still
   logged. 29 consecutive rows on 2025-07-14 10:14:12–11:39 carry garbage in `cut time`
   (`-553419785105102400000000000000.00 Sec`) and `LogReport.txt` 2025-03-07 shows
@@ -484,9 +550,15 @@ accept both `未命名-1`/`Untitled-1`, `分…秒`/`Min…Sec`, `×`/`x`, with/
 ### 6.3 `Report/LogReport.txt`
 
 40 lines, `YYYY-MM-DD HH:MM:SS  <TotalReport row>` – the time at which the "Work Report [New]" (`mf252 加工报告[最新]`)
-was generated (`report.exe` launched), followed by the row(s) it was given. Gaps `write − end time` are 2–6 s for
-2024-02-29…2024-11-15 and 2025-03-07 (report generated automatically at job end) but 28 min for 2024-06-25 10:47:51 /
-10:48:29 (the same 10:19:44 job reported twice – manual re-generation). Rows of 2024-02-29 … 2024-11-15 predate the
+was generated (`report.exe` launched), followed by the row(s) it was given. **Verifier correction:** gaps
+`write − end time` are *not* "2–6 s"; they are 2 s, 3 s, 4 s, 5 s, 6 s, 10 s, 18 s, 27 s, 30 s, 56 s, 2.5 min
+(2024-06-07), 4 min (2024-09-21 10:30:44) and 28 min (2024-06-25 10:47:51 / 10:48:29 – the same 10:19:44 job reported
+twice), so the report is generated on demand, not automatically at job end. Eight rows carry the end time
+`1970-01-01 08:00:00` (`time_t` 0 in UTC+8: 2024-06-25 13:50:55, 2024-07-08, 2024-09-04, 2024-11-15 13:09:05, and four
+2025-03-07 rows) = a report requested before any job had run in that session; the three 2025-03-07 rows with the
+`-9.26e61 Sec` garbage all have this 1970 end time. Also on 2024-09-20 16:21:05 / 16:21:20 / 16:22:22 three rows with
+estimated durations 10 min 12 s, 2 min 45 s and 2 min 37 s are 15 s and 62 s apart – further proof (§6.2) that rows are
+written on stop events, not only on completion. Rows of 2024-02-29 … 2024-11-15 predate the
 first `TotalReport.txt` row (2024-07-25), so `TotalReport.txt` was created/reset on 2024-07-25 while `LogReport.txt`
 was kept. The 2025-03-07 15:57–16:17 block is the installation test of the new report tool with `111.chf`/`222.chf`
 (their thumbnails `Report/111.chf.jpg`, `222.chf.jpg` are dated 2025-03-07).
@@ -508,15 +580,23 @@ generation; the current build writes `TotalReport.txt` instead (doc 01 §6.4 agr
 
 | File | Content | Reading (doc 01 §6.3 for the writer/reader code) |
 |---|---|---|
-| `File/AutosaveParam1.ini` (2025-07-18) | `scFlie / 38 / 979454 / 342126 / 7 / 486 / eof` | break-point slot 1: contour #38, X = 979.454 mm, Y = 342.126 mm, glyph 7, point 486 |
-| `File/AutosaveParam2.ini` (2025-07-18) | `scFlie / 37 / 965189 / 340285 / 7 / 132 / eof` | slot 2 (alternating), contour #37 |
+| `File/AutosaveParam1.ini` (2025-07-18 **15:35:14.05 CST**) | `scFlie / 38 / 979454 / 342126 / 7 / 486 / eof` | break-point slot 1: contour #38, X = 979.454 mm, Y = 342.126 mm, glyph 7, point 486 |
+| `File/AutosaveParam2.ini` (2025-07-18 **15:35:13.95 CST**) | `scFlie / 37 / 965189 / 340285 / 7 / 132 / eof` | slot 2, contour #37 – written **100 ms before slot 1**, i.e. the two slots are written by one event, not "alternating a few contours apart" (verifier; see below) |
 | `File/Temp/AutosaveParam1.ini` / `2.ini` (2025-04-23) | `30 / 89243 / 69837 / 1 / 4950`, `31 / 88331 / 71462 / 1 / 5323` | snapshot of an April job (Temp copy made when a break was recorded) |
 | `File/Temp/tempIsBreak.ini` (2025-04-23) | `scFlie / 1 / 1 / eof` | "a break-point exists" flag (1) + slot/valid flag (1) `[likely]` |
-| `File/softPara.ini` (2025-07-18) | `[SC2000] NormalExit=0 XAxis=1020277 YAxis=175510 ZAxis=0 WAxis=0` | **the last session did not exit normally** (`NormalExit=0`) and the head was last known at X = 1020.277 mm, Y = 175.510 mm (0.001 mm units) – consistent with the last log line of 2025-07-18 (15:49:24 output-command timeout) being the end of the record |
+| `File/softPara.ini` (2025-07-18 **15:49:27.575 CST**) | `[SC2000] NormalExit=0 XAxis=1020277 YAxis=175510 ZAxis=0 WAxis=0` | head last known at X = 1020.277 mm, Y = 175.510 mm (0.001 mm units). **Verifier correction on `NormalExit=0`:** the file was written 145 ms after the *last* log line of 2025-07-18 (15:49:27.430, the 7th and final try of the `[9999,2,1,1]` output command that began at 15:49:24.423) – i.e. MainApp *did* run an orderly shutdown path (output command → write `softPara.ini`) at 15:49:27. Either `NormalExit=1` is written by a later step that never ran, or `NormalExit` is set to 0 at start and only to 1 on a specific exit path; "crash/power-off" is therefore only a `[guess]`, not `[likely]` |
 
-The break-point position (979/342 mm) lies inside the 225.45×85.17 mm job region cut at 14:23–14:24 on 2025-07-18 only
-if the drawing was placed at ~(800…1000, 300…400) mm – plausible; the two slots are 14 mm apart, i.e. written a few
-contours apart during the same job.
+**Verifier correction:** the break-point files do *not* belong to the 14:23–14:24 job. File mtimes (all 2025-07-18,
+CST = mtime +8 h): `File/ManuContour.dat` 15:35:10.13, `File/autosave.chf` 15:35:10.17, the planner dump files in the
+package root `calcGraphCtInterpPt.txt` / `p_micoLinkLenPos.txt` 15:35:10.6 and `before_mergeLinearGly.txt` /
+`after_mergeLinearGly.txt` / `after_smoothGly.txt` 15:35:11.2 (content `284.266 / total: 284.266`), then
+`AutosaveParam2.ini` 15:35:13.95 and `AutosaveParam1.ini` 15:35:14.05. So a job was **started at 15:35:10 CST** in the
+session that began with `NC Start` 15:07:15 (after homing all axes at 15:32:59, `[1,31,2,2000,20000]`), the break-point
+pair was recorded ~4 s later, and that job has **no row** in `TotalReport.txt` (last row 14:24:36). The two slots being
+100 ms apart with different contour/point indices (#38 pt 486 vs #37 pt 132, 14 mm apart) means one event writes both
+(current + previous safe point) `[likely]`; whether the event is a pause/stop 4 s into the job or a periodic autosave
+cannot be told from the files. `File/BkHardPara.xml`, `BkLayerPara.xml`, `BkManuPara.xml` were written at 15:38:32 CST
+(parameter save after that job) and `SecondBkManuPara.xml` at 14:46:13 CST.
 
 ---
 
@@ -532,9 +612,9 @@ contours apart during the same job.
 | `MC-RecvErr_selectFunc 10060` | daily logs | 1 072 | see §2.3 table | (a) card off / rebooting (2025-06-28, 07-09 14:44–15:41, 07-14 09:19–10:05); (b) NIC/link trouble (2025-07-17 13:30–15:22: 9 restarts, FIFO frames and all reads failing, then `Sendto 10065` at 15:05:21 → cable/IP problem) `[confirmed]`; (c) the periodic `READ 10000` deafness `[likely]` |
 | `MC-Sendto 10065` | daily logs | 5 | 3–14 s after `NC Start` | Windows had no route to 10.1.1.168 (adapter down/unconfigured) `[confirmed]` |
 | `MC-Recvfrom 10038` | daily logs | 2 | 2025-07-09 15:27:13, 2025-07-17 15:07:07, both mid-burst | socket closed under the receiver during shutdown/reconnect `[confirmed]` |
-| Lost FIFO frame → job aborted | daily logs + report | 22 frames / ≥ 2 aborted jobs | §4.4 | FIFO starvation alarm `[confirmed]` |
+| Lost FIFO frame → job aborted | daily logs + report | 22 distinct frames (30 lines) / ≥ 2 aborted jobs | §4.4 | FIFO starvation alarm `[likely]` (verifier downgrade – the 2025-07-17 link was failing for every request, so the FIFO frame is not isolated as the cause) |
 | `verify data area failed`, `Arm Clock is invalid`, `Check code Error`, `Admin data was broken`, … | `Code.txt` | 1 252 | §5 | licence block/RTC on the card invalid, expired codes, wrong hardware id `[confirmed]` |
-| `NormalExit=0` | `softPara.ini` | – | last session | crash or power-off without closing MainApp `[confirmed]` |
+| `NormalExit=0` | `softPara.ini` | – | last session | crash or power-off without closing MainApp `[guess]` (verifier downgrade – the file was written by MainApp's own shutdown path 145 ms after the last log line, §6.6) |
 | garbage `-5.5e29 Sec` / `-9.3e61 Sec` | reports | 32 rows | empty jobs | uninitialised double `[confirmed]` |
 
 Machine alarms proper (limits, e-stop, servo, chiller, laser – `gp1..gp59`) are **not** written to any file in the
@@ -547,17 +627,18 @@ package; the alarm panel (`gp84-94`) keeps them in memory only (no alarm log fil
 * **Period**: 2024-07-25 → 2025-07-18, 68 distinct days. Monthly: 2024-07 121, 08 159, 09 230, 10 531, 11 114, 12 1,
   2025-01 3, 02 12, 03 158, 04 31, 05 25, 06 78, **07 1 487** (half of all jobs in the last 13 days before the package was
   copied on 2025-07-29; the archive name `CF1390-250715` suggests a machine built/commissioned 2025-07-15).
-* **Files**: 2 938 × `未命名-1` (unsaved "Untitled-1"), 8 × `Untitled-1` (English UI), 1 × `1111.chf` (2024-11-05, the
+* **Files**: 2 938 × `未命名-1` (unsaved "Untitled-1"), 8 × `Untitled-1` (English UI, 2025-07-12 09:16–09:22 and 11:44–11:45 – verifier; §6.1 says 09:16–09:21), 1 × `1111.chf` (2024-11-05, the
   longest job: 10 min 10 s, 1.50 m cut, 7.39 m rapid), 3 × `.nc` G-code imports on 2025-06-25: `金威刻logo-12线.nc`
   ("JWK logo, 12 lines" – 金威刻 = Jinweike, the brand), `大象-12线.nc` ("elephant, 12 lines"), `田字格-6线.nc`
   ("田-grid, 6 lines") – line-fill engraving tests (19.65 / 51.44 / 18.96 m of cut path in 113 / 288 / 105 s ≈ 175 mm/s).
-* **Sizes**: 57 % ≤ 50 mm, 28 % 50–200 mm, 4 % 200–500 mm, 8 rows ≥ 500 mm (5 × `800×0 mm` lines, 3 × `17926.87×555.30 mm`
+* **Sizes** (verifier re-count using max(W, H); the analyst's 57/28/4 % match no definition tried – max, min, W, H, diagonal, W+H): **67 % ≤ 50 mm** (63.5 % if the 314 empty `0.00×0.00` rows are excluded), 30 % 50–200 mm, 2.2 % 200–500 mm, 8 rows ≥ 500 mm (5 × `800×0 mm` lines, 3 × `17926.87×555.30 mm`
   on 2024-08-01 – a drawing with a stray far-away object, or an "unlimited roll" test). Most frequent July-2025 sizes:
   `33.00×25.00 mm` 282×, `30.00×25.00` 241×, `0.00×0.00` 222×, `25.00×25.00` 133×, `35.00×25.00` 110×, `200.00×200.00`
   64×, `109.00×7.00` 60×, `302.78×302.78` 30×, `94.00×7.00` 28×. 2024 favourites: `0.00×49.03 mm` (134×), `0.00×72.00`
   (73×) = vertical single lines (X extent 0).
-* **Durations (estimates)**: median 4 s, mean 6.9 s, 79 % < 10 s, 11 % 10–60 s, 30 jobs 1–5 min, 2 jobs > 5 min;
-  Σ = 20 212 s = 5.6 h of estimated processing in a year. Σ cut length 984 m, Σ rapid 354 m, Σ pierces 4 043.
+* **Durations (estimates)**: median 4 s, mean 6.9 s, **87.5 % < 10 s** (65 % < 5 s; verifier – the analyst wrote 79 %),
+  11.5 % 10–60 s, 30 jobs 1–5 min, 2 jobs > 5 min; Σ = 20 230 s (verifier re-sum; analyst 20 212) = 5.6 h of estimated
+  processing in a year – and, per §6.2, many of these "jobs" were stopped within seconds, so the real laser-on time is lower. Σ cut length 984 m, Σ rapid 354 m, Σ pierces 4 043.
 * **Working hours**: 08:30–22:00 CST; on 2025-07-09 218 jobs between 14:48 and 21:56.
 * **Interpretation** `[likely]`: parameter tuning and QA on a CO2 machine (`SC.m_iEnableLaserType=1`, doc 01): cut-speed
   ladders on 30×25 mm squares, 7 mm-high strips (`81/92/94/96/109×7 mm` = speed-test bars), 200×200 mm squares at the
@@ -587,6 +668,15 @@ package; the alarm panel (`gp84-94`) keeps them in memory only (no alarm log fil
 9. **Real durations**: nothing in the package records measured job time; only the device report counters
    (`pd880-888`) would, and they live on the card (`mp302` warns the report is wrong when the card is disconnected).
 10. `Log/VelDecc.txt` – which build wrote it (empty since 2024-06-19)?
+11. *(verifier)* **Frame-id semantics**: the id restarts without an `NC Start` (87 → 57 on 2025-07-17 13:57 → 14:22) and
+    reaches 1931 within 10 s of a 7-s job's stop event on 2025-07-13 – neither "frames since session start" nor "frames
+    since job start streamed in real time at 1 ms/tick" fits. Is the PC pushing frames far ahead of real time (card-side
+    buffering), is the tick shorter than 1 ms, or does the id count something other than frames?
+12. *(verifier)* What does `ipAdd.ini MaxItemPerFrame=60` limit, given that every leaked frame carries 99 items?
+13. *(verifier)* Which UI action writes a `TotalReport.txt` row for a run stopped after 1–2 s (Stop button? alarm
+    acknowledged?), and why do comm-alarm aborts (2025-07-17) not?
+14. *(verifier)* `NormalExit`: which exit path sets it to 1, given that `softPara.ini` was rewritten by the shutdown
+    sequence on 2025-07-18 15:49:27 and still holds 0?
 
 ---
 
@@ -595,8 +685,10 @@ package; the alarm panel (`gp84-94`) keeps them in memory only (no alarm log fil
 **Must be replicated (behaviour the operator/machine depends on):**
 
 1. **Transaction engine semantics** exactly as observed: UDP request/reply with seq check, 500 ms `select` timeout,
-   the 7-step retry ladder (≈ 3.5 s), exception decoding `500 + code`, and the *tolerance* for (a) exception 3 on jog
-   re-sends and (b) 3.5-s silences on non-critical register blocks. The 30-ms status poll of block 1000 must never be
+   the 7-step retry ladder (≈ 3.5 s) for idle transactions and the one-try-then-continue policy while a job streams
+   (§2.3), exception decoding `500 + code` (an exception arriving mid-ladder terminates the transaction), and the
+   *tolerance* for (a) exception 3 on jog re-sends (the Windows app itself re-sends a rejected jog up to 3× at ~50 ms –
+   §4.5 – which a port need not copy) and (b) 3.5-s silences on non-critical register blocks. The 30-ms status poll of block 1000 must never be
    blocked by a slow read of block 10000 – run slow reads on a separate queue/thread or drop them.
 2. **Start-up order**: `READ 1000 n=2` (version gate ≥ `MinHardwareVer`) → `READ 1000 n=36` → `READ 50000 n=26` →
    `READ 60001 n=120` (+ `10000 n=18`), then the `[9999,13,…]` handshake of doc 04; on comm loss: `0x65 ← [102]` then
@@ -607,12 +699,12 @@ package; the alarm panel (`gp84-94`) keeps them in memory only (no alarm log fil
    jerk 59 990, absolute target in 0.001 mm, `±4 000 000` for continuous jog, W-axis (4) with 50 000/100 000, 4 000,
    40 000, ±1 000 000; homing `[1, axis, 2, 2000, 20000]` (or 5000/50000) and `31` for all axes; two-axis go-to
    `[5, 0x80000003, v, a, j, x, y, 0, 0]`.
-4. **FIFO stream writer**: register 0x66, 298-word frames (`frameId` + 297 words), per-session frame counter, TLV items
+4. **FIFO stream writer**: register 0x66, 298-word frames (`frameId` + 297 words), frame counter restarting per job/stream (not per session – §4.4), TLV items
    with `header = (bytes<<16)|opcode`; per-tick items `3000[(dY<<16|dX), (freq<<16|duty)]`, contour prologue
    `3001, 3002[5], 3000, 3001, 9999[2,4,4], 103[1000,0], 2001[…], 9999[2,0x100,0x100]`, epilogue
    `3001, 9999[2,0x100,0], 109[1000,0], 2001[…], 118[…], 3001, 3002[4]`; keep ≈ 1.6 s queued; a frame that is not
    acknowledged within the ladder must abort the job and raise a FIFO alarm.
-5. **Work report**: append one row per finished job to `Report/TotalReport.txt` in format B (UTF-8, `×`, ` mm`, ` m`,
+5. **Work report**: append one row per job stop event (the Windows build writes a row for every run that reaches the stop path, finished or not – §6.2) to `Report/TotalReport.txt` in format B (UTF-8, `×`, ` mm`, ` m`,
    `Sec`, localised name/duration) if the user wants continuity with the Windows history; keep `end time` semantics and
    the estimate-based time columns, or – better – add measured wall-clock time as an extra column and document it.
    Provide the `gp2000/gp2001` estimate dialog from the planner output (cut length, rapid length, pierce count, times).
@@ -634,3 +726,107 @@ package; the alarm panel (`gp84-94`) keeps them in memory only (no alarm log fil
   "no route" before sending (Linux returns `ENETUNREACH`/`EHOSTUNREACH` from `sendto` just like 10065).
 * Time base: `clock_gettime(CLOCK_MONOTONIC)` for the retry ladder; `CLOCK_REALTIME` (UTC, ISO-8601 with offset) for
   report timestamps – avoid the 0-based-month bug seen in `Code.txt`.
+
+---
+
+## Verification notes
+
+Adversarial re-check of this document against the primary files under `SRC` (2026-09-12). Every quantitative claim
+was recomputed with independent scripts (`Log/2025-*.log` parsed line by line with a strict regex – 1 794 lines, no
+line failed; CRC brute-forced over 8 CRC-16 parameterisations; `TotalReport.txt` re-parsed with a tolerant grammar;
+`Code.txt` re-histogrammed after masking variable fields). File mtimes were read with `ls --time-style=full-iso`
+(this PC is at UTC+2, the machine ran at UTC+8, so CST = mtime + 6 h in the listings, + 8 h from UTC). Where the text
+was changed, the original wording is kept in the sentence or noted as "(verifier correction …)".
+
+### Claims checked and confirmed as written
+
+* Message inventory: exactly five templates, all `[Info]`; counts 112 `NC Start` (+1 in 2026), 1 072 `10060`,
+  567 `503`, 36 `502`, 5 `10065`, 2 `10038`; nothing about the dongle, pendant, laser or sub-devices.
+* CRC-16/MODBUS (poly 0xA001 reflected, init 0xFFFF, no final XOR) over `[len][unit][func][payload]`: only this
+  parameterisation reproduces all four frames (`8c75`, `4534`, `45d0`, `85f5`); ARC, CCITT-FALSE, XMODEM, X25,
+  KERMIT, USB, DNP do not. PC stores hi-first, card lo-first. `ErrCode = 500 + exception code`.
+* Ladder `1/1,1/2,2/2,3/2,1/3,2/3,3/3` at 500 ms (median 0.501 s), label counts 203/150/150/150/141/139/139.
+* `READ 1000 n=2` is the payload of all five `Sendto 10065` lines and of the first timeout after 16 starts; the
+  `1000/36 → 50000/26 → 60001/120` triplet and the `10000/18`-inserted variant (2025-07-12 19:14, 2025-07-13 09:31)
+  exist exactly as quoted; `40 65 01 66` → `30 3e8 02` on 2025-07-12 17:37:52–53 exists.
+* TLV grammar `(bytes<<16)|opcode` consumes exactly 297 words in all 22 distinct frames; opcodes and argument values
+  as tabulated (3001 ×6, 9999 ×5, 3002 ×3, 2001 ×3, 103 ×2, 109 ×1, 118 ×1); PWM words (5000,4) ×1 467, (5000,0) ×594,
+  (2000,100) ×99; increments dX ∈ −4…8, dY ∈ −2…4; frame 504 / 633 prologue and epilogue reproduced verbatim.
+  `BkLayerPara.xml` does contain a layer with `CutSpeed="50" CutFreq="5000" CutDuty="4"`; `BkManuPara.xml` has
+  `FastSpeed="200" SlowSpeed="50"` matching 200 000 / 50 000.
+* 503 decode: 506 single-axis moves (X 225, Y 277, W 4), 60 homes (axis 1: 34, axis 2: 19, axis 31: 7), one
+  `[5, 0x80000003, 550000, 8999, 89990, 430178, 174097, 0, 0]` at 2025-07-08 13:24:33; X targets −1 378 393…+1 795 859,
+  Y −560 652…+933 009; the 2025-07-07 09:13:10 burst values are as quoted.
+* 2025-07-17: 9 `NC Start` between 13:30:53 and 15:06:54, no report row until 15:23:36, `Sendto 10065` at 15:05:21.
+* `Code.txt`: 683 `verify data area failed` (668 of them 2024-06-19…06-27), 103 `Arm Clock is invalid`, 88
+  `Admin data was broken`, 3 activation codes with the quoted Hid/days/UserCode values, `Active OK` once,
+  `hard ID is not match` ×5, PC clock at 2055 on lines 1220–1249, `lastLicenseClock` = PC time − 8 h + 30 y,
+  0-based month in `Check code Error`/`PcTime`/`CardTime`, `CardTime:2000-0-1` from the 2024-09-18 check on.
+* `TotalReport.txt`: 2 950 rows, 1 213 × 7 fields to line 1213 (2025-03-06 16:53:22), 1 737 × 10 fields from line 1214
+  (2025-03-10 11:31:39); 68 days; monthly counts as listed; 2 938 `未命名-1`, 8 `Untitled-1`, the three `.nc` names and
+  `1111.chf` (10 min 10 s); 314 empty rows; 29 garbage rows on 2025-07-14 + 3 in `LogReport.txt`; pierce time 0 iff
+  pierce count 0 (993/993); July size ranking and 2024 favourites as listed; hours 08–21; one consecutive duplicate.
+* `2026-09-11.log` was written on this PC (mtime 17:50:32.507 local vs content 17:50:32.506).
+
+### Claims refuted or corrected in the text
+
+1. **"Frame ids are a per-session counter reset by `NC Start`"** – refuted (§4.4): 87 at 13:57:35 → 57 at 14:22:17 on
+   2025-07-17 with no `NC Start` in between; the analyst's "after 14:22 restart" does not exist.
+2. **"Only finished jobs are written to the report" / `end time [confirmed]`** – refuted / downgraded (§4.4, §6.2, §6.3,
+   §10): 40 rows of one 43-s job within 21 min on 2025-07-09 (10 of them 1–2 s apart), 49 rows overall closer to their
+   predecessor than their own duration, `LogReport.txt` 2024-09-20 rows 15 s apart with 10-min/2:45 estimates.
+3. **"total = round(cut+idle+pierce) in 1 496/1 737 rows"** – refuted (§6.2): 1 003 exact, +1 s ×530, +5 s ×75, up to
+   +19 s; the total includes the `gp2001` system-delay terms.
+4. **"Exceptions are always 1/1"** – corrected (§2.1): six 502 lines carry `1/2`/`1/3`.
+5. **"Retry policy for FIFO frames differs from register reads"** – corrected (§2.3, §4.4): register reads get the same
+   single try while a job streams.
+6. **"12 frames lost on 2025-07-17"** → 21 distinct frames (30 lines); **"2 952 opcode-3000 items"** → 2 160 distinct
+   (2 952 counts the 8 re-sent copies).
+7. **"Key-repeat rate 180–250 ms"** – corrected (§4.5): dominant 52-ms application re-sends of identical vectors in
+   groups ≤ 4, new targets every 0.2–0.4 s.
+8. **"v = 50000 231×"** → 147× (144 X/Y + 3 W); **"target ±1 000 000" for W** → +1 000 000 ×3, −1 000 000 ×1.
+9. **"Check code Error 237 (79 triplets)"** → 264 (88 triplets); **"79 triplets 2024-10-31…11-05"** → 75.
+10. **"Δ NC Start → first datagram 3–30 s [confirmed]"** → 0.8–31.5 s, `[likely]` (only failing datagrams are visible).
+11. **"LogReport gaps 2–6 s"** → 2 s to 28 min, plus eight rows with `1970-01-01 08:00:00`.
+12. **Usage statistics**: "79 % < 10 s" → 87.5 %; "57 % ≤ 50 mm / 28 % / 4 %" → 67 % / 30 % / 2.2 % (max(W,H));
+    Σ 20 212 s → 20 230 s; 07-12 Σ 904 s → 922 s; `Untitled-1` rows also at 11:44–11:45; `t3` 0.75/1.75 s not 0.8/1.8 s.
+13. **`NormalExit=0` = "did not exit cleanly" [likely/confirmed]** → `[guess]` (§6.6, §7): `softPara.ini` was written by
+    the shutdown path 145 ms after the last log line.
+14. **Break-point files "belong to the 14:23–14:24 job, slots written a few contours apart"** – refuted (§6.6): written
+    15:35:13.95 / 15:35:14.05 CST, 100 ms apart, 4 s after a job start (planner dumps, `autosave.chf`,
+    `ManuContour.dat` at 15:35:10) that has no report row.
+15. **Lost FIFO frame ends the job `[confirmed]`** → `[likely]` (the whole link was failing at the same time).
+16. **"READ 10000 … the card is periodically deaf"** – left as `[likely]` in §4.3 but note: no successful read of block
+    10000 is observable at all; "block 10000 is always slow and is only requested every 10–40 min" fits the same data.
+
+### Facts added
+
+* `Dump/20260911-175115.dmp` – MainApp minidump 43 s after the 2026 `NC Start`: the Wine launch crashed.
+* Writers: `Module/NCModule.dll` (templates) + `Module/LogModule.dll` (`CLogModule::writeLog`, `GenNewLogFileDaily`,
+  PDB `D:\SC2000\NexCut\NexCut_X1_Http\Release\Module\LogModule.pdb`); `NCModule.dll` is in `Module/`, not next to the exe.
+* The 2025-06-25 11:07–11:16 `.nc` rows predate the first `NC Start` and `ipAdd.ini` of that day (this installation is
+  dated 2025-06-24 10:20 CST) – `NC Start` is not a complete record of starts; `TotalReport.txt` was carried over.
+* 2025-07-18 15:35:10 CST job start left planner dumps in the package root (`before/after_mergeLinearGly.txt`,
+  `after_smoothGly.txt` = `284.266 / total: 284.266`, `calcGraphCtInterpPt.txt`, `p_micoLinkLenPos.txt`), plus
+  `segments.txt` / `closePwmPosRatios.txt` / `linkFlyLine_pathGlys.txt` / `setDataWithoutReFit_segs.txt` from 11:43:49
+  CST (a 25-mm hatch pattern at X 252–333 mm, Y 363–366 mm, `totalPwmSegments: 1506.62`) – doc 05 territory, but they
+  date the last two jobs.
+* `ipAdd.ini` FIFO-related keys not cited before: `FifoTimeout=600`, `MaxItemPerFrame=60` (contradicts the observed 99
+  items/frame), `MaxFillItem=2000`, `FifoAlarmNum=30`, `MCSendInterval=1`.
+* `Report/report.txt` uses `\r\r\n` line ends; `File/ProcessesStatistic.txt` is GBK with LF.
+* 502 replies arriving mid-ladder terminate the transaction; the reply sequence number is big-endian and the PC's own
+  seq restarts at 0 on a fresh socket (`00 00` on every `Sendto` frame and on the 2025-07-17 15:03:18 reply).
+* Post-stop sequence: the `[9999,2,1,0]` output-off command follows the report row by 1–14 s on all four occasions it
+  failed (2025-07-11 15:10:04 → 15:10:12; 2025-07-13 09:09:28 FIFO → 09:09:29; 2025-07-14 10:17:02 → 10:17:03,
+  15:15:16 → 15:15:30) and is itself followed by a `READ 10000 n=18` burst three times – so block 10000 is read right
+  after a job stops (`[likely]`, supports the "device report counters" guess in §9.3).
+
+### Still uncertain after verification
+
+* Frame-id semantics and tick period (§9.1, §9.11); the meaning of opcodes 3001/3002/103/109/2001/118; the output bits
+  2 and 8 of `9999[2,mask,value]`.
+* Whether exception 3 is "busy" or "out of range" – no capture separates the two.
+* Which event writes a report row for a 1-s run (§9.13) and which event writes the `AutosaveParam` pair (§6.6).
+* Everything about the licence registers and the card RTC encoding (§9.6–9.7) – the files only show the PC-side
+  messages.
+* Why `NormalExit` stayed 0 on 2025-07-18 although the shutdown path wrote `softPara.ini` (§9.14).

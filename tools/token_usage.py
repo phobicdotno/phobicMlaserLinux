@@ -32,7 +32,7 @@ def files():
 
 Z = lambda: dict(input=0, cache_w5=0, cache_w1h=0, cache_r=0, output=0, thinking=0, calls=0)
 by_key = collections.defaultdict(Z)           # (date, source, model)
-seen = set()
+seen = {}
 for source, path in files():
     for line in open(path, errors='replace'):
         try:
@@ -43,12 +43,18 @@ for source, path in files():
         if e.get('type') != 'assistant' or not isinstance(m, dict) or not m.get('usage'):
             continue
         rid = (m.get('id'), e.get('requestId'))
-        if rid in seen:          # streamed chunks repeat the same response
-            continue
-        seen.add(rid)
-        u = m['usage']; cc = u.get('cache_creation') or {}
-        ts = e.get('timestamp', '')[:10] or 'unknown'
-        k = by_key[(ts, source, m.get('model', '?'))]
+        u = m['usage']
+        # streamed responses repeat the same message id across entries with a growing
+        # output count; keep the entry with the largest output_tokens per response
+        prev = seen.get(rid)
+        if prev is None or u.get('output_tokens', 0) >= prev[1].get('output_tokens', 0):
+            seen[rid] = ((e.get('timestamp', '')[:10] or 'unknown', source, m.get('model', '?')), u)
+
+seen_list = seen
+seen = set(seen_list)
+for key, u in seen_list.values():
+        cc = u.get('cache_creation') or {}
+        k = by_key[key]
         k['input'] += u.get('input_tokens', 0)
         k['cache_w5'] += cc.get('ephemeral_5m_input_tokens', 0)
         k['cache_w1h'] += cc.get('ephemeral_1h_input_tokens', 0)

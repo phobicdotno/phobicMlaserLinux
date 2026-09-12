@@ -5,6 +5,8 @@ commit `faad384`, 2026-09-11). Static analysis + a working Wine setup, done by t
 owner on Linux Mint 22.3 / Wine 9.0. Everything below is **confirmed by that work** unless
 marked otherwise; it supersedes guesses elsewhere in this folder where they conflict.
 
+> **Correction (after 04/08 verification and 00 §contradictions):** "Modbus TCP" below is a loose label for *port 502*. The MCC100 is driven over **UDP/502** with a proprietary `CExtModbus` framing (seq, CRC-16/MODBUS, custom function codes 0x20/0x21/0x26/0x30/0x40) implemented in `Module/NCModule.dll`; `AccessType=1` in `ipAdd.ini`, the Wine run logged `Access: UDP`. Standard Modbus TCP is used only for the optional EC3710 extension box. See `04-controller-protocol.md §3` and `00-overview.md`.
+
 ## Identity
 | | |
 |---|---|

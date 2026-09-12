@@ -7,3 +7,5 @@ Status: **analysis phase** — see `docs/analysis/`.
 
 The original Windows package is proprietary and is *not* included in this
 repository; the analysis documents reference it by relative path only.
+
+Token usage for the project is tracked in `docs/TOKEN-USAGE.md` (regenerate with `python3 tools/token_usage.py`).

@@ -1,0 +1,70 @@
+{
+ "magic": "scFlie",
+ "version": 4,
+ "graphs": [
+  {
+   "type": "contour",
+   "precision": 0.1,
+   "length": 7.508761,
+   "bbox_min": [
+    4.726359,
+    12.345264
+   ],
+   "bbox_max": [
+    7.116472,
+    14.735377
+   ],
+   "start": [
+    7.116472,
+    13.54032
+   ],
+   "end": [
+    7.116472,
+    13.54032
+   ],
+   "glyphs": [
+    {
+     "type": "circle",
+     "center": [
+      5.921416,
+      13.54032
+     ],
+     "radius": 1.195056,
+     "direction": 1,
+     "type_id": 4
+    }
+   ],
+   "layer": 0,
+   "int58": 1,
+   "crafts": {
+    "compensate_type": -1,
+    "compensate_width": 0.0,
+    "pwm_enable": 1,
+    "pwm_nodes": [],
+    "pwm_close_pos_ratios": [],
+    "double170": 0.0,
+    "double188": 0.0,
+    "lead_line": {
+     "type": 0,
+     "angle_deg": 90.0,
+     "length": 5.0,
+     "arc_radius": 0.0,
+     "flag": false
+    },
+    "cool_pos": []
+   },
+   "type_id": 8,
+   "index": 1
+  }
+ ],
+ "trailer_bool": false,
+ "trailer_double": 0.0,
+ "trailer_pt1": [
+  0.0,
+  0.0
+ ],
+ "trailer_pt2": [
+  0.0,
+  0.0
+ ]
+}

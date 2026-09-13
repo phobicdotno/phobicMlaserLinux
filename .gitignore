@@ -4,3 +4,7 @@ __pycache__/
 build/
 dist/
 *.log
+.scratch/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/

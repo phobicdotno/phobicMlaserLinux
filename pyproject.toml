@@ -11,33 +11,47 @@ requires-python = ">=3.12"
 license = {text = "MIT"}
 dependencies = [
     "numpy>=1.26",
+    "scipy>=1.11",
+    "ezdxf>=1.1",
 ]
 
 [project.optional-dependencies]
+# The viewer (`nexcut`); the daemon, planner and the file readers do not need Qt.
+gui = [
+    "PySide6>=6.6",
+]
 dev = [
     "pytest>=8",
     "ruff>=0.5",
+    # Reference trajectory generator; only tests/test_plan_scurve.py uses it (skips without it).
+    "ruckig>=0.9",
 ]
 
 [project.scripts]
+nexcut = "nexcut.ui.app:main"
 nexcut-mccd = "nexcut.mccd.cli:main"
+nexcut-plan = "nexcut.plan.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-nexcut = ["py.typed", "core/schema.json"]
+nexcut = ["py.typed", "core/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+# ezdxf 1.4 sets ndarray.shape, deprecated in NumPy 2.5 (third-party, not our code).
+filterwarnings = [
+    "ignore:Setting the shape on a NumPy array has been deprecated:DeprecationWarning:ezdxf",
+]
 
 [tool.ruff]
 line-length = 100
 target-version = "py312"
 src = ["src", "tests"]
-# tools/ holds pre-existing standalone scripts (chf_parse.py is validated on all
-# samples and will be promoted into io/chf.py in M0); lint them once they move.
+# tools/ holds standalone scripts (chf_parse.py is superseded by io/chf.py); only
+# tools/m1_session.py is maintained and linted (CI passes it explicitly).
 extend-exclude = [".scratch", ".venv", "tools"]
 
 [tool.ruff.lint]

@@ -29,6 +29,9 @@ What it does:
 * Exception 2 while "not ready" after a (re)boot (08 §3.3, §7) and exception 3 when a
   motion command arrives while the card is busy (08 §4.5).
 * FIFO items are consumed at a configurable tick; opcode 3000 costs one tick.
+* Reg 1016 (FIFO space margin) is reported in *bytes free*, 60000 when the FIFO is empty,
+  because that is how the PC side uses it (11 C2, §4.1 row 16; :mod:`nexcut.mcc.fifo`).
+  ``SimConfig(fifo_space_unit="items")`` restores the older free-item-slot reading (A2 §2).
 * Fault injection: drop N requests, drop N replies, delay replies, stale replies,
   arbitrary reply override, deaf addresses (08 §4.3), reboot (silent + not-ready window).
 
@@ -47,6 +50,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from typing import Literal
 
 from nexcut.mcc.commands import (
     ABSOLUTE_BIT,
@@ -84,6 +88,7 @@ from nexcut.mcc.framing import (
 from nexcut.mcc.registers import (
     AXIS_RO_WORDS,
     AXIS_SLOTS,
+    FIFO_MARGIN_EMPTY,
     Alarm2,
     AxisRO,
     Status,
@@ -154,6 +159,13 @@ class SimConfig:
     """Seconds per interpolation tick. UNVERIFIED (1 ms bus cycle is an estimate, 04 §3.7)."""
     fifo_capacity_items: int = 4000
     """FIFO depth in items. UNVERIFIED."""
+    fifo_space_unit: Literal["bytes", "items"] = "bytes"
+    """Unit of reg 1016: ``"bytes"`` = ``fifo_margin_empty`` minus 4 bytes per queued item word
+    (11 C2: the PC tests ``frame_bytes + 2000 <= margin`` and 60000 = empty); ``"items"`` =
+    ``fifo_capacity_items`` minus queued items (A2 §2 reading). The card-side accounting
+    (whether frame prefixes count, how an item is charged) is UNVERIFIED (11 §7 step 8)."""
+    fifo_margin_empty: int = FIFO_MARGIN_EMPTY
+    """Reg 1016 with an empty FIFO in ``"bytes"`` mode (11 §4.1 row 16)."""
     program_id: int = 100
     """UNVERIFIED placeholder."""
     program_version: int = 20152
@@ -185,6 +197,12 @@ class SimConfig:
     """Refuse motion commands with exception 3 while the FIFO runs. UNVERIFIED."""
     check_crc: bool = True
     """Ignore requests whose CRC is not hi-first CRC-16/MODBUS. UNVERIFIED card behaviour."""
+
+    def __post_init__(self) -> None:
+        if self.fifo_space_unit not in ("bytes", "items"):
+            raise ValueError(
+                f"fifo_space_unit must be 'bytes' or 'items', not {self.fifo_space_unit!r}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -408,9 +426,15 @@ class CardSimulator:
         out = self.registers.get(RO_OUTPUTS, 0)
         self.registers[RO_OUTPUTS] = ((out & ~mask) | (value & mask)) & 0xFFFFFFFF
 
+    def _fifo_space(self) -> int:
+        """Reg 1016 in the configured unit (:attr:`SimConfig.fifo_space_unit`, 11 C2)."""
+        if self.config.fifo_space_unit == "items":
+            return max(0, self.config.fifo_capacity_items - len(self.fifo))
+        queued_bytes = 4 * sum(1 + len(item.args) for item in self.fifo)
+        return max(0, self.config.fifo_margin_empty - queued_bytes)
+
     def _update_status(self, now: float) -> None:
-        cap = self.config.fifo_capacity_items
-        self.registers[RO_FIFO_SPACE] = max(0, cap - len(self.fifo))
+        self.registers[RO_FIFO_SPACE] = self._fifo_space()
         for slot, (end, cmd_type, target) in list(self._axis_motion.items()):
             if now >= end:
                 del self._axis_motion[slot]

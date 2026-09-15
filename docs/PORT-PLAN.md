@@ -172,6 +172,7 @@ Verdict legend: **R** = replicate exactly (behaviour visible to the machine or t
 ## 4. Milestones (order of work)
 
 Each milestone has a gate that must pass on the simulator before hardware, and a hardware sign-off under the safety rules of §8.
+Current state per milestone, with the gate results actually measured, is in `docs/STATUS.md`.
 
 ### M0 — Foundations and passive instrumentation (no machine contact)
 * Repo skeleton, `uv`/pyproject, CI with the golden tests; import `tools/chf_parse.py` as `io/chf.py`.
@@ -350,11 +351,11 @@ It replaces sessions A–D and most of E/F below. The three most consequential c
 
 ## 9. Deliverables per milestone (checklist)
 
-- [ ] M0: dissector + simulator + schema + golden tests (no machine)
-- [ ] M1: `nexcut-mccd --cli` jog/home on the real card; capture sessions A–D dissected; `11-capture-findings.md`
-- [ ] M2: viewer/editor loads DXF/.chf/PLT/G-code, saves `.chf`
-- [ ] M3: parameter/layer/technology editors round-trip vendor files
-- [ ] M4: dry-run job streaming on the machine (laser interlocked)
-- [ ] M5: first CO2 cut; reports; break-point resume
-- [ ] M6: fibre path (after captures G)
-- [ ] M7: nesting, scan engraving, pendant, packaging (`.deb`, AppImage), i18n
+- [x] M0: dissector + simulator + schema + golden tests (no machine) (gate item "dissector decodes the first tcpdump capture" still open: no capture exists yet; pcap/pcapng decoding is tested on synthetic captures only. See docs/STATUS.md §1.1)
+- [ ] M1: `nexcut-mccd --cli` jog/home on the real card; capture sessions A–D dissected; `11-capture-findings.md` (partial: the daemon, CLI/TUI, safety gate, `tools/m1_session.py` and docs/M1-BENCH-SESSION.md are done and pass on the simulator; no hardware session run, no capture, no `11-capture-findings.md`; D9/D11/D12 open)
+- [ ] M2: viewer/editor loads DXF/.chf/PLT/G-code, saves `.chf` (partial: the viewer loads all four formats and saves `.chf` byte-identically. No editing operations exist yet (lead-in, micro-joint). Render gate passes as IoU ≥ 0.9 with chamfer 1.000, pixel-identical on 2 of 8 samples. The ManuContour/SortType=4 gate fails: ManuContour.dat is the array order, so a vendor-sorted reference is needed)
+- [ ] M3: parameter/layer/technology editors round-trip vendor files (partial: file layer only; every vendor XML and technology file round-trips in `io/params.py`; no editors/property grids; the Wine load check has not been run)
+- [ ] M4: dry-run job streaming on the machine (laser interlocked) (partial: offline planner → items → frames (`nexcut-plan`) and a simulator feed test; no streaming in `nexcut-mccd`, no §8.3 jitter test, no machine run; strict xfails X1/X2 for pierce dwell / cut start)
+- [ ] M5: first CO2 cut; reports; break-point resume (not started; laser arming deliberately absent)
+- [ ] M6: fibre path (after captures G) (not started)
+- [ ] M7: nesting, scan engraving, pendant, packaging (`.deb`, AppImage), i18n (partial: `ops/scan.py` scan-fill/fly-line geometry and the 11-language i18n loader exist; no nesting, pendant or packaging)

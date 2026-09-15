@@ -3,7 +3,8 @@
 Each test is one attack from the review: a path from the public API to the transport that
 would write a deny-listed register, assert a laser output / PWM duty while not LASER_ARMED,
 jog without the deadman, leave the soft limits, or keep streaming after comm loss.
-Tests marked ``xfail(strict=True)`` document a gap whose fix needs a design decision.
+F8 and F12 were design gaps; their decisions are in docs/DECISIONS.md (D1, D5) and the
+tests now check the chosen rules.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from nexcut.mcc.safety import (
     SafetyViolation,
     classify_write,
 )
+from nexcut.mccd.gate import MccdGate
 
 LASER_DO_MASK = 0x100 | 0x10 | 0x20  # DO9, DO5, DO6 (SafetyConfig.laser_do_ports)
 
@@ -268,16 +270,39 @@ def test_f7_relative_jog_beyond_soft_limit_refused_when_position_known() -> None
     assert len(fake.writes) == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="design decision: before homing the PC has no position, so a relative jog cannot "
-    "be checked against SoftLimitMaxLen; the vendor allows un-homed jogs (needed to leave a "
-    "limit switch). Options: refuse jogs longer than N mm until homed, or rely on hard limits.",
-)
+def _mccd_gate() -> tuple[MccdGate, FakeClient, Clock]:
+    fake, clock = FakeClient(), Clock()
+    gate = MccdGate(fake, clock=clock, supervise=False)
+    gate.arming.arm_motion()
+    gate.read(1000, 36)
+    return gate, fake, clock
+
+
 def test_f8_unhomed_continuous_jog_is_bounded_by_soft_limits() -> None:
-    gate, fake, _ = make(ArmState.MOTION_ARMED)
-    with pytest.raises(SafetyViolation):
-        gate.send(C.jog_continuous(0, True))  # 4000 mm relative, position unknown
+    """F8 resolved by docs/DECISIONS.md D1 (enforced by ``nexcut.mccd.gate.MccdGate``).
+
+    Before homing the PC has no position, so SoftLimitMaxLen cannot be checked: relative
+    jogs on an un-homed axis are limited to 10 mm per command, or to <= 20 mm/s under the
+    200 ms deadman. After homing (trusted position) the soft limits apply.
+    """
+    gate, fake, clock = _mccd_gate()
+    with pytest.raises(SafetyViolation, match="D1"):
+        gate.send(C.jog_continuous(0, True))  # 4000 mm relative at 200 mm/s, position unknown
+    with pytest.raises(SafetyViolation, match="D1"):
+        gate.send(C.jog_step(1, -10.5))
+    assert fake.writes == []
+    gate.send(C.jog_step(0, 10.0))  # a <= 10 mm step passes
+    gate.send(C.jog_continuous(1, True, C.MachineParams(jog_fast_speed=20.0)))  # slow + deadman
+    clock.t += 0.25
+    gate.read(1000, 36)
+    gate.service()
+    assert fake.writes[-1][1][:2] == (1, 0x2)  # the deadman bounds the un-homed slow jog
+    gate.homed_slots = {0, 1}
+    gate.positions_word = {0: 1_300_000, 1: 10_000}
+    gate.homed = True
+    with pytest.raises(SafetyViolation, match="soft limit"):
+        gate.send(C.jog_step(0, 100.0))  # homed: 1300 + 100 > 1371
+    gate.send(C.jog_continuous(0, True, soft_limit_remaining_mm=71.0))
 
 
 # ---- F9: deadman for continuous jog (PORT-PLAN §8.2: stop when the key event is > 200 ms stale) --------
@@ -421,15 +446,41 @@ def test_f11_follower_flag_alone_is_not_an_alarm_when_idle() -> None:
 # ---- F12: the gate is bypassable in-process -------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="design decision: SafeMccClient.client (and McTransaction.transact, which can send "
-    "func 0x26 or any register) is reachable from the same process; the enforcement boundary "
-    "must be the mccd process owning the socket with the UI talking IPC (PORT-PLAN §2.3).",
-)
 def test_f12_raw_transport_not_reachable_through_the_gate() -> None:
-    gate, fake, _ = make(ArmState.DISARMED)
-    raw = getattr(gate, "client", None)
-    if raw is not None:
-        raw.write(150, [5555])
+    """F12 resolved by docs/DECISIONS.md D5: the enforcement boundary is the mccd process.
+
+    ``SafeMccClient.client`` stays reachable *inside* the daemon, but the daemon is the only
+    owner of the transport; a client process gets the JSON-lines IPC, whose vocabulary has
+    no raw register write, no transact and no func 0x26, and whose ``read_block`` /
+    ``set_do`` are limited to the allow-lists.
+    """
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    from nexcut.mccd.daemon import IPC_COMMANDS, Link, MccDaemon
+    from nexcut.mccd.ipc import IpcError, MccdClient
+
+    raw_like = {"write", "write_register", "transact", "send", "raw", "firmware", "write_block"}
+    assert not raw_like & set(IPC_COMMANDS)
+    fake = FakeClient()
+    fake.status[1] = 20152  # MinHardwareVer (11 §4.1)
+    d = Path(tempfile.mkdtemp(prefix="nxf12"))
+    daemon = MccDaemon(transport=fake, socket_path=d / "mccd.sock").start()
+    try:
+        assert daemon.wait_for_link(Link.CONNECTED, 5.0)
+        with MccdClient(daemon.socket_path) as client:
+            assert not any(hasattr(client, a) for a in ("gate", "client", "transport", "transact"))
+            for cmd, args in [
+                ("write", {"addr": 150, "words": [5555]}),
+                ("transact", {"request": [0x26, 0, 0]}),
+                ("read_block", {"addr": 59500, "n": 12}),
+                ("set_do", {"port": 9, "on": True}),
+            ]:
+                with pytest.raises(IpcError):
+                    client.call(cmd, **args)
+    finally:
+        daemon.close()
+        shutil.rmtree(d, ignore_errors=True)
     assert all(a != 150 for a, _ in fake.writes)
+    assert (0x65, (9999, 5, 0, 0)) in fake.writes  # the daemon did own and use the transport

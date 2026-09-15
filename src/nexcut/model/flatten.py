@@ -58,8 +58,11 @@ def _bulge_pts(p0: Vec2, p1: Vec2, bulge: float, step: float) -> Polyline:
     r = chord / (2.0 * math.sin(abs(theta) / 2.0))
     mx, my = (p0[0] + p1[0]) / 2.0, (p0[1] + p1[1]) / 2.0
     d = math.sqrt(max(r * r - (chord / 2.0) ** 2, 0.0))
-    nx, ny = -dy / chord, dx / chord  # centre left of the chord for CCW (positive bulge)
-    if bulge > 0:
+    nx, ny = -dy / chord, dx / chord
+    # centre left of the chord for a CCW (positive) minor arc; a major arc (|bulge| > 1,
+    # |theta| > pi) has it on the other side, else the span would not end at p1
+    # (import-ui fidelity review; same rule as nexcut.plan.contour_fit)
+    if (bulge > 0) == (abs(theta) < math.pi):
         cx, cy = mx + nx * d, my + ny * d
     else:
         cx, cy = mx - nx * d, my - ny * d

@@ -57,6 +57,7 @@ from nexcut.mcc.registers import (
     Status,
     fifo_program_running,
 )
+from nexcut.mcc.transaction import CardRefused
 
 __all__ = [
     "ArmState",
@@ -1035,7 +1036,9 @@ class SafeMccClient:
                 if now > deadline:
                     log.warning("deadman: axis %d key event stale, stopping", idx)
                     out = self._best_effort([C.jog_release_stop([idx], v, self.params)])
-                    if out.ok:
+                    # An exception reply (e.g. 3 "already stopped", 08 §4.5 INFERENCE) proves the
+                    # card received the stop: re-sending it every period would flood the card.
+                    if out.ok or all(isinstance(e, CardRefused) for _, e in out.failed):
                         self._leases.pop(idx, None)
 
     def _needs_supervision(self) -> bool:

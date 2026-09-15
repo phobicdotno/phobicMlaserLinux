@@ -38,7 +38,7 @@ def frame(frame_id: int, n_ticks: int) -> list[int]:
 
 @pytest.fixture
 def rig() -> Iterator[tuple[CardSimulator, McTransaction]]:
-    cfg = SimConfig(tick_s=0.002, fifo_capacity_items=500)
+    cfg = SimConfig(tick_s=0.002, fifo_capacity_items=500, fifo_space_unit="items")
     with CardSimulator(config=cfg) as sim, McTransaction(sim.address, policy=POLICY) as client:
         yield sim, client
 
@@ -53,6 +53,21 @@ def test_logged_fifo_frame_shape_is_accepted(rig: tuple[CardSimulator, McTransac
     status = client.read(1000, 36)
     assert status[RO_FIFO_FRAME_ID - 1000] == 0x3C
     assert status[RO_FIFO_SPACE - 1000] == 500 - 99
+
+
+def test_fifo_margin_in_bytes_by_default() -> None:
+    """Reg 1016 = bytes free, 60000 when empty (11 C2, §4.1 row 16): default simulator unit."""
+    cfg = SimConfig(tick_s=0.002)
+    assert cfg.fifo_space_unit == "bytes"
+    with CardSimulator(config=cfg) as sim, McTransaction(sim.address, policy=POLICY) as client:
+        client.write(0x67, [1])
+        assert client.read(1000, 36)[RO_FIFO_SPACE - 1000] == 60000
+        client.write(0x66, frame(0x3C, 99))
+        assert client.read(1000, 36)[RO_FIFO_SPACE - 1000] == 60000 - 99 * 12
+        client.write(0x67, [1])
+        assert client.read(1000, 36)[RO_FIFO_SPACE - 1000] == 60000
+    with pytest.raises(ValueError):
+        SimConfig(fifo_space_unit="words")  # type: ignore[arg-type]
 
 
 def test_consumption_at_tick_and_starvation(rig: tuple[CardSimulator, McTransaction]) -> None:

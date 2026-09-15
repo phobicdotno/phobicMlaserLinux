@@ -127,7 +127,15 @@ def test_version_gate_refuses_old_card() -> None:
 
 
 def test_poll_cadence_fast_and_slow_queues() -> None:
-    with running(mccd={"system_rw_period_ms": 300, "fast_combined_period_ms": 400}) as (
+    with running(
+        mccd={
+            "system_rw_period_ms": 300,
+            "fast_combined_period_ms": 400,
+            # The ZF block's default period is seconds long, so shorten it; otherwise a
+            # slow runner (CI) samples a window with no 10000 read in it at all.
+            "zf_status_period_ms": 300,
+        }
+    ) as (
         _daemon,
         sim,
         _,

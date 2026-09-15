@@ -8,9 +8,9 @@ Bottom line:
 
 * The 36 words of block 1000 land verbatim at `VM+0x90 + 4·i` (reader `0x100516b0`), and every consumer reaches them through `VM::getReg(group=0, index=i)` (`0x10038d40`, VM vtable slot 49 / `+0xc4`), so the `lang.txt` order `RORegName_1..32` **is** the address order — **CONFIRMED**, not inferred any more (§1, §2).
 * DI word = bit *port−1* for ports 1–12 (24-bit field), DO word = bit *port−1* for ports 1–10 (16-bit field); expanded ports 13–28 / 11–26 live in words 21/22. NO/NC polarity is applied by the PC per input (`type==1` inverts). **CONFIRMED** (§2.1, §2.2).
-* Alarm status_1 (word 6) is an **EtherCAT-style summary word**: bits 0–23 = "axis *n* has a fault" (details in that axis' status word bits 0–5), bit 24 = the on-board follower axis, bit 25 bus fault, bit 26 output fault, bit 30 emergency stop. Alarm status_2 (word 7) bits 0–5 = illegal command / interpolation-data length / axis command / FTC command / PLC command / **FIFO starvation**. **CONFIRMED** from the decoder (§2.3, §2.4, §5).
+* Alarm status_1 (word 6) is an **EtherCAT-style summary word**: bits 0–23 = "axis *n* has a fault" (details in that axis' status word bits 0–5), bit 24 = the on-board follower axis, bit 25 bus fault, bit 26 output fault, bit 30 emergency stop. Alarm status_2 (word 7) bits 0–5 = illegal command / interpolation-data length / axis command / FTC command / PLC command / **FIFO starvation**. **CONFIRMED as the PC decoder's interpretation** (§2.3, §2.4, §5). *[Verifier]* Only axis slots 0–4 (names X, Y, Y2, 调高轴 height axis, W — table `0x991138`) have status words; for bits 5–24 the decoder's `getReg(3, b·10)` reads **past the 50-word axis block** into unrelated VM fields (bit 5 → `VM+0x1e8`, bits 6–12 → the 50200 RW copy, …), so those per-axis texts are garbage; the physical firmware meaning of bits 5–24 on the MCC100 is unknown (bench). Bits 25/26/30 semantics rest on lang ids only (LIKELY, not firmware-proven).
 * `gp1…gp32` are **not** bit positions of these words. On the MCC100 path the per-axis alarms are the `EtherCATAxisErrorInfo_0..5` ids formatted with the axis name; `gp1–gp32` and `gp13–16` are never raised anywhere in MainApp (they are the MCC3721 legacy set). The full numeric-code → lang-id map is in §5 (**CONFIRMED**).
-* Block 5000 is read as **one word** into `VM+0x1e8` (getReg group 1) and is **never written** by this build; nothing branches on its value. The e-stop reaches the PC only as alarm_1 bit 30 (§4).
+* Block 5000: *[Verifier — REFUTED/CORRECTED]* the one-word reader `0x10051b00` (VM slot 117) exists but has **no caller** (no `[reg+0x1d4]` call in NCModule; neither poll branch `0x1004e167–0x1004e2be` calls it), so this build **never reads** 5000 and `VM+0x1e8` is never refreshed. The block **is written**, however: `5001 ← [9999, 9, 0xFFFF, 0]` (4-word write, NC slots 101/103, invoked from NC slot 18 `0x1002b4b0` and a MainApp page) and `5008 ← value` / `5012 ← SOP.HardwareType+1` from the hardware-parameter page (each followed by `100 ← 9999`). The e-stop reaches the PC only as alarm_1 bit 30 (§4).
 * The Windows app's own "watchdog" is the `CManuPanel` poll routine `0x568a50`: any alarm condition → machine state 5 and `OnPauseBtn` (or `OnStopBtn`). The list of bits a Linux port must react to is in §7.
 
 ---
@@ -46,7 +46,7 @@ Readers (EVIDENCE — vector constants, the reply-length check and the copy loop
 | **1000 / 36** | `updateMCStatusRO` `0x100516b0` (`push 0x1008a630` @`0x1005171d`, count `0x24` @`0x1005173a`, log `false updateMCStatusRO: %d` @`0x1008b3a4`) | `cmp eax,0x9c` @`0x1005177f` = 3 + 36 words | `add esi,0x90` @`0x10051786`, 36-dword loop `0x10051792–0x1005179d` → **`VM+0x90 … +0x11c`** | **0** |
 | 1000 / 2 | `checkMCStatus` `0x1004e3d0` (`cmp ecx,0x14` @`0x1004e4a0`) | 3 + 2 words | word0 → `VM+0x90`, word1 → `VM+0x94` (`0x1004e4a8/b1`) | 0 |
 | **2000 / 50** | `updateMCStatusAxisRO` `0x100518c0` (`0x1008a638`, count `0x32`; log @`0x100519ea`) | `0xd4` = 3 + 50 words | 5 blocks × 10 dwords (reply stride `0x28`) → **`VM+0x120 … +0x1e4`** (`lea ecx,[esi+0x124]` @`0x10051996`) | **3** |
-| **5000 / 1** | `updateMCStatusRW` `0x10051b00` (`0x1008a634`, count 1; log `false updateMCStatusRW` @`0x1008b6e4`) | `0x10` = 3 + 1 word | **`VM+0x1e8`** (`0x10051bd6`) | **1** |
+| **5000 / 1** | `updateMCStatusRW` `0x10051b00` (`0x1008a634`, count 1; log `false updateMCStatusRW` @`0x1008b6e4`) | `0x10` = 3 + 1 word | **`VM+0x1e8`** (`0x10051bd6`) — *verifier: VM slot 117, **no caller**, see §4* | **1** |
 | 50200 / 100 | `updateMCStatusAxisRW` `0x10051d00` (count `0x64`, reply `0x19c`) | 3 + 100 | 5 axes × 14 words kept (reply stride `0x50`), `mov esi,5; mov edx,0xe` @`0x10051de0/7` → `VM+0x1ec … +0x300` | 4 |
 | 50000 / 26 | `updateMCStatusSystemRW` `0x10051f20` (count `0x1a`, reply `0x74`) | 3 + 26 | `add esi,0x304` @`0x10051ff4` → `VM+0x304 … +0x368` | 5 |
 | 10000 / 18 | `updateZFStatus` `0x1004ea50` (count `0x12`, reply `0x54`) | 3 + 18 | `lea ecx,[esi+0x36c]` @`0x1004eb66` → `VM+0x36c … +0x3b0` | 7 |
@@ -74,8 +74,9 @@ So the `READ 60001/120` seen in the logs (`04 §3.5`, `08 §3`) is simply the 20
 |---|---|---|
 | 12 (`0x30`) / 13 (`0x34`) | `0x1002b440` → VM slot 7 (`mov al,[vm+0x38]`) ; `0x1002b450` = `jmp [vtbl+0x30]` (alias) | card connected (slot 13 is used as "ZF connected" — identical because the follower is on-board) |
 | 14 (`0x38`) | `0x1002b460` → VM `[+0x3c]` | laser link connected |
-| 15 (`0x3c`) | `0x1002b470`: `param+0x3fa9 && VM [+0x3d]` | AF connected |
-| 16 (`0x40`) | `0x1002b490` → VM `[+0x3e]` | EC (extension card) connected |
+| 15 (`0x3c`) | `0x1002b490` → VM slot 12 `0x10038a60` = `[+0x3e]` *[verifier-corrected]* | AF connected (`+0x3e` cleared on `false updateAFStatus` @`0x1004f6d6`) |
+| 16 (`0x40`) | `0x1002b4a0` → VM slot 13 `0x10038a70` = `[+0x3f]` *[verifier-corrected]* | EC connected (`+0x3f` cleared on `false updateECStatus` @`0x1004ff84`) |
+| 17 (`0x44`) | `0x1002b470`: `param+0x3fa9 && VM slot 11 [+0x3d]` *[verifier-added]* | `+0x3d` is the `moctUpdateBasicInfo`/`upsertWarnByDevId` link (remote/cloud reporting, INFERENCE) — not AF |
 | 81 (`0x144`) | `0x1002b890`: `getReg(0,5) & 0xffff` | **DO word** |
 | 82 (`0x148`) | `0x1002b810`: port 1–10 → bit *port−1* of slot 81; port 11–26 (if `param+0x4d58`) → bit *port−11* of `getReg(0,22) & 0xffff` | `isDOOn(port)` |
 | 83 (`0x14c`) | `0x1002b8b0`: `getReg(0,4) & 0xffffff` | **DI word** |
@@ -91,7 +92,7 @@ So the `READ 60001/120` seen in the logs (`04 §3.5`, `08 §3`) is simply the 20
 | 143 (`0x23c`) | `0x10007ee0`: `xor eax,eax; ret` | laser alarm word — **stubbed to 0** in this build |
 | 144 (`0x240`) | `0x1002bf80`: `getReg(9,4)` | AF alarm word |
 | 22 (`0x58`) | `0x1002b510` → VM slot 18 = `0x10045e30` (log `send stop manu cmd`) | stop processing |
-| 58 (`0xe8`) | `0x1002c510`: VM slot 32 `writeSingleReg(0x65, 101)` (`push 0x65; push 0x65`) | the single-word `0x65 ← [101]` command; `0x1002c520` is `0x65 ← [102]` (the re-sync seen in the logs) |
+| 58 (`0xe8`) | `0x1002c510`: NC slot 32 (`+0x80`, `0x1002b570`) → **VM slot 27 `0x100494e0` writeReg `[0x40, reg, 1, v]`** (verifier-corrected; `0x10040cb0` is VM slot 32, a guarded `0x65 ← [118,4,flag,g+0x4d28]` ZF command) `(0x65, 101)` (`push 0x65; push 0x65`) | the single-word `0x65 ← [101]` command; `0x1002c520` is `0x65 ← [102]` (the re-sync seen in the logs) |
 
 ---
 
@@ -101,12 +102,12 @@ Address = 1000 + *i*; VM field = `+0x90 + 4·i`; lang id = `RORegName_(i+1)` (EV
 
 | i | addr | `lang.txt` | Chinese / English | Consumer (EVIDENCE) | Decode / notes |
 |---|---|---|---|---|---|
-| 0 | 1000 | RORegName_1 | 程序标识 Program identification | `checkMCStatus` `0x1004e57a`: `(w0 >> 17) & 3` → `[VM+0x1140]` = 3 or 1 (card sub-type) | bits 17–18 = card variant flag; rest opaque |
-| 1 | 1001 | RORegName_2 | 程序版本 Program version | `0x1004e556–0x1004e572`: compared with 6000 (`0x1770`) and 10000 (`0x2710`); MainApp `getReg(0,1)` @`0x4ba84e` | firmware version number (20152 seen live) |
+| 0 | 1000 | RORegName_1 | 程序标识 Program identification | `checkMCStatus` `0x1004e57a`: only if version%10000 < 6000: `(w0 >> 17) & 3` == 0 → `[VM+0x1140]` = 3, else 1 (card sub-type) | bits 17–18 = card variant flag; rest opaque |
+| 1 | 1001 | RORegName_2 | 程序版本 Program version | `0x1004e556–0x1004e572` *[verifier-refined]*: `q = v / 10000`, `r = v % 10000` → `[VM+0x1144] = r`; if `r ≥ 6000` then `[VM+0x1140] = q`; MainApp `getReg(0,1)` @`0x4ba84e` | firmware version = type·10000 + minor (20152 → q 2, r 152 → sub-type taken from word 0) |
 | 2 | 1002 | RORegName_3 | 日期 date | monitor only | |
 | 3 | 1003 | RORegName_4 | 时间 time | monitor only | |
 | **4** | **1004** | RORegName_5 | 输入状态 **Input status (DI)** | NC slot 83/84 | **bit *n* = DI *n+1***, 24 bits used (`and eax,0xffffff`); level as the card sees it, NO/NC applied by the PC (§2.1) |
-| **5** | **1005** | RORegName_6 | 输出状态 **Output status (DO)** | NC slot 81/82; NCModule `0x1005724d–0x100572cf` clears bits `1<<(port-1)` for seven configured DO ports | **bit *n* = DO *n+1***, 16 bits used |
+| **5** | **1005** | RORegName_6 | 输出状态 **Output status (DO)** | NC slot 81/82; NCModule `0x1005724d–0x100572cf` clears bits `1<<(port-1)` for the configured DO ports (≥ 8 fixed offsets plus a vector, verifier) | **bit *n* = DO *n+1***, 16 bits used |
 | **6** | **1006** | RORegName_7 | 报警状态_1 **Alarm status_1** | NC slot 138 → `CManuPanel+0x1e8c` | §2.3 |
 | **7** | **1007** | RORegName_8 | 报警状态_2 **Alarm status_2** | NC slot 139 → `+0x1e90` | §2.4 |
 | 8 | 1008 | RORegName_9 | 运行状态 Operating status | **no consumer** (NCModule only zeroes `[vm+0xb0]` at init `0x100566a3`; MainApp never calls `getReg(0,8)`) | unknown — live capture needed |
@@ -115,10 +116,10 @@ Address = 1000 + *i*; VM field = `+0x90 + 4·i`; lang id = `RORegName_(i+1)` (EV
 | 13 | 1013 | RORegName_14 | PWM频率 PWM frequency | monitor only | Hz |
 | 14 | 1014 | RORegName_15 | PWM占空比 PWM duty | MainApp `getReg(0,14)` ×3 (`0x4eddbe`, `0x56c2fc`, `0x56c37e`) | % |
 | **15** | 1015 | RORegName_16 | FIFO帧标识 FIFO frame id | `fillFifo` `mov eax,[esi+0xcc]; inc eax` @`0x100523cc` | last frame id accepted; next frame = value+1 |
-| **16** | 1016 | RORegName_17 | FIFO空间余量 FIFO space margin | `fillFifo` `[esi+0xd0]` @`0x100523c0`; **`cmp [esi+0xd0],0xea60`** @`0x10057f2d` | free item slots; **60000 = FIFO empty** (capacity); job end detected as `margin == 60000 && processing status == 1` → `stopFifo` (`0x10057f3d–0x10057f8d`) |
+| **16** | 1016 | RORegName_17 | FIFO空间余量 FIFO space margin | `fillFifo` `[esi+0xd0]` @`0x100523c0`; **`cmp [esi+0xd0],0xea60`** @`0x10057f2d` | free item slots; **60000 = FIFO empty** (capacity — *verifier: LIKELY, not CONFIRMED*; only the equality test exists); job end detected as `[vm+0x870] (last-batch flag, set from the append call's 2nd arg @`0x1004790a`) && margin == 60000 && processing status == 1` → `stopFifo` (`0x10057f21–0x10057f8d`) |
 | 17 | 1017 | RORegName_18 | FIFO插补数据配置 FIFO interp. data config | monitor only | |
 | 18 | 1018 | RORegName_19 | 从站设备信息 Slave device info | monitor only | |
-| **19** | 1019 | RORegName_20 | 加工状态 **Processing status** | VM `0x100390d0`: `cmp al,1` → machine state 4 (Process); `0x10053e1a`: `if [vm+0xdc]==1 → stopFifo`; `0x10057f3d` | **1 = FIFO program running**; other values unknown (no other compare exists) |
+| **19** | 1019 | RORegName_20 | 加工状态 **Processing status** | VM `0x100390d0`: `cmp al,1` (**low byte only**, verifier) → machine state 4 (Process); `0x10053e1a`: `if [vm+0xdc]==1 → stopFifo`; `0x10057f3d` | **1 = FIFO program running**; other values unknown (no other compare exists) |
 | 20 | 1020 | RORegName_21 | 加工位置 Processing position | monitor only | |
 | 21 | 1021 | RORegName_22 | 拓展输入状态 Expanded input | NC slot 84 (ports 13–28 → bits 0–15) | bit *n* = DI *n+13* |
 | 22 | 1022 | RORegName_23 | 拓展输出状态 Expanded output | NC slot 82 (ports 11–26 → bits 0–15) | bit *n* = DO *n+11* |
@@ -127,7 +128,7 @@ Address = 1000 + *i*; VM field = `+0x90 + 4·i`; lang id = `RORegName_(i+1)` (EV
 | 25–27 | 1025–1027 | RORegName_26..28 | 通电 / 通讯 / 出光时间 power-on / comm / laser-on time | monitor | counters |
 | 28 | 1028 | RORegName_29 | 双驱反馈偏差 Dual-drive deviation | MainApp `getReg(0,28)` @`0x518a13` | |
 | 29–30 | 1029–1030 | RORegName_30..31 | sampling encoder cfg / length | monitor | |
-| **31** | 1031 | RORegName_32 | 参数状态 **Parameter status** | MainApp `0x56fbbb–0x56fc02`: `getReg(0,31) == 1` → lang `eNewLang100` "hardware parameters changed, restart required" | **1 = card needs restart after parameter write** |
+| **31** | 1031 | RORegName_32 | 参数状态 **Parameter status** | MainApp `0x56fbbb–0x56fc02`: `getReg(0,31) == 1` → lang `eNewLang100` "hardware parameters changed, restart required" (one-shot flag `ds:0x9e81a4`); *[verifier-added]* if the message box returns 1 (`0x56fcb6–0x56fcf0`) MainApp writes **`100 ← 9999`** through NC slot 32 (`0x56fcf2–0x56fd1b`) — meaning of register 100 ← 9999 unproven (restart/apply command, INFERENCE low); the port must not issue it blindly | **1 = card needs restart after parameter write** |
 | 32–35 | 1032–1035 | (no name) | — | word 35 read once at `0x56c33d` (gated by `param+0x4940==2`) | spare |
 
 ### 2.1 DI word (1004) — port ↔ bit, polarity
@@ -135,12 +136,14 @@ Address = 1000 + *i*; VM field = `+0x90 + 4·i`; lang id = `RORegName_(i+1)` (EV
 EVIDENCE `0x1002b8d0` (NC slot 84): `lea eax,[esi-1]; cmp eax,0xb; ja` → ports 1..12 use `getDIWord()` (`getReg(0,4) & 0xffffff`) and test `1 << (port-1)`; ports 13..28 use word 21 bit `port-13` when the extension card flag `param+0x4d58` is set; finally `cmp [ebp+0xc],1; sete al` inverts the result when the *type* argument is 1.
 
 * The type argument is the per-input NO/NC parameter (`WaterWarningType`, `LaserWarningType`, `CO2WaterWarningType`, custom-alarm type field `+0x3b70+i·0x28`; see the calls at `0x568cd2–0x568dd6` and `0x568e19–0x568e67`), i.e. **`type 0` = normally open (bit set ⇒ active), `type 1` = normally closed (bit clear ⇒ active)** — matches `pd164/pd165` "常开/常闭". (INFERENCE on the label, high.)
+* *[Verifier-added]* **Port 0 pitfall** (EVIDENCE `0x1002b8d8–0x1002b947`): port 0 ("unassigned") takes neither branch, so `bit = 0`, and with `type == 1` the function returns **true (active)**. MainApp calls `isDIOn` for the chiller/laser DIs and all 16 custom-alarm slots with no port≠0 guard (`0x568cc7–0x568e67`). A Linux port must treat port 0 as disabled explicitly.
+* *[Verifier-added]* "Raw level, NO/NC applied by the PC" is the **PC-side** convention only. `RWRegName_1` 输入类型 (Input type, register 5000) suggests the card has its own per-input inversion; this build never reads or writes 5000 (§4), so whether 1004 is the electrical level or already card-inverted depends on the firmware default. Bench: read 5000 once and toggle one DI.
 * Only 12 on-board inputs are addressed by the app although the word is masked to 24 bits; `SystemRWRegName_36..47` name filters up to IN24 → bits 12–23 are physically present but unused here (INFERENCE, medium).
 * Limit-switch polarity (O8) is *not* decidable statically: the limits are consumed by the firmware and surface only as axis-status bits 0–3 (§3).
 
 ### 2.2 DO word (1005) — port ↔ bit
 
-EVIDENCE `0x1002b810` (NC slot 82): ports 1..10 → `getDOWord()` bit `port-1`; ports 11..26 → word 22 bit `port-11`. Independent confirmation inside NCModule: at the end of a job `0x1005724d–0x100572cf` takes `[vm+0xa4]` (word 5) and ANDs out `~(1 << (port-1))` for the seven DO port numbers stored at `[param+0x1fc/0x1d4/0x1ac/0x184/0x15c/0x134/0x10c]` — the same 1-based convention as the in-stream `9999[2,mask,value]` DO records of `08 §4.4`.
+EVIDENCE `0x1002b810` (NC slot 82): ports 1..10 → `getDOWord()` bit `port-1`; ports 11..26 → word 22 bit `port-11`. Independent confirmation inside NCModule: at the end of a job `0x1005724d–0x100572cf` takes `[vm+0xa4]` (word 5) and ANDs out `~(1 << (port-1))` for the DO port numbers stored at `[param+0x1fc/0x1d4/0x1ac/0x184/0x15c/0x134/0x10c/0xe4]`, the vector `[param+0x3474..0x3478]` and further ports from `0x1005733b` (`+0x88c` = `LGP.CO2DOLaser`, `+0x7c4`, `+0x79c`, …) *(verifier: not seven)* — the same 1-based convention as the in-stream `9999[2,mask,value]` DO records of `08 §4.4`.
 
 ### 2.3 Alarm status_1 (1006) — bit table
 
@@ -148,9 +151,9 @@ Decoder: `CManuPanel` poll routine `0x568a50`, loop `0x56a82d–0x56aaec` over b
 
 | bit | code raised | lang id (English text) | meaning | polarity |
 |---|---|---|---|---|
-| 0–15 | for each set bit *b*: read `getReg(3, b·10)` (axis *b* status word) and raise `8100 + b·32 + k` for each set bit *k* ∈ 0..5 (`0x56a893–0x56a92a`); clear the six codes when bit *b* is clear (`0x56aa19–0x56aa67`) | `EtherCATAxisErrorInfo_k` formatted with the axis name of slot *b* (`0x52c7bd: 0x516a50(word)`) | **axis *b* has a fault** — summary flag; see §3 for *k* | 1 = fault |
-| 16–23 | same code path (`0x56a931–0x56a9e2`) | same | axes 16–23 (bus axes) | 1 = fault |
-| 24 | same per-axis path (`cmp [ebp-0x9a0],0x18` @`0x56a886`) — but `0x569bc9`: **if word == 0x01000000 exactly, the "alarm present" flag `+0x1e88` is reset to 0** (only when the follower is enabled, `param+0x4688/+0x4690`) | axis "24" | the **on-board Z-follower axis** flag (INFERENCE, medium — its "axis status" read `getReg(3,240)` falls outside the 2000 block) | 1 = fault, but alone it is not treated as an alarm |
+| 0–15 | for each set bit *b*: read `getReg(3, b·10)` (axis *b* status word — *verifier: only b = 0..4 lie inside the 50-word block; `getReg` `0x10038d40` has no index bound, so b ≥ 5 reads unrelated VM memory, b = 5 → `VM+0x1e8`*) and raise `8100 + b·32 + k` for each set bit *k* ∈ 0..5 (`0x56a893–0x56a92a`); clear the six codes when bit *b* is clear (`0x56aa19–0x56aa67`) | `EtherCATAxisErrorInfo_k` formatted with the axis name of slot *b* (`0x52c7bd: 0x516a50(word)`; *verifier:* `0x516a50` uses table `0x991138` for b < 5 = `cp0` X, `cp1` Y, `A250516_2` Y2, `eNewLang4` 调高轴 height axis, `pd41` W; b ≥ 5 → the number b+1) | **axis *b* has a fault** — summary flag; see §3 for *k* | 1 = fault |
+| 16–23 | same code path (`0x56a931–0x56a9e2`) | same | axes 16–23 ("bus axes" — INFERENCE from the EtherCAT naming only; no status word exists for them in this build) | 1 = fault |
+| 24 | same per-axis path (`cmp [ebp-0x9a0],0x18` @`0x56a886`) — but `0x569bc9`: **if word == 0x01000000 exactly, the "alarm present" flag `+0x1e88` is reset to 0** (*verifier:* gated by two **unnamed** param bytes `+0x4688 && +0x4690` inside the "card connected" branch `0x569b80`, which also zeroes the ZF alarm word, clears `gp57` and skips the ZF-state read — "follower enabled" is not established) | axis "24" | the **on-board Z-follower axis** flag (INFERENCE, low-medium — its "axis status" read `getReg(3,240)` = `VM+0x4e0` lies in the AF type-7 area) | 1 = fault, but alone it is not treated as an alarm. *Verifier:* when bit 24 clears, the loop clears code **8024**, not the per-axis codes 8868–8873 it raised (`0x56aace`) → those stay latched |
 | 25 | 8025 | `EtherCATErrorInfo_1_25` 总线故障 **Bus fault** | | 1 = fault |
 | 26 | 8026 | `EtherCATErrorInfo_1_26` 输出保护 **Output fault** (output protection) | | 1 = fault |
 | 27–29, 31 | 8027–8029, 8031 | table entries are empty strings (`0x9a42c0 + n·0x1c` unset) | reserved | — |
@@ -206,8 +209,8 @@ Word *k* of axis slot *a* = address 2000 + 10·a + k, VM `+0x120 + 4·(10a+k)`, 
 | 4 | 伺服输入告警 servo (drive) input alarm (`_4`) | k = 4 |
 | 5 | 双驱告警 dual-drive alarm (`_5`) | k = 5 |
 | 0–3 as nibble | "a limit is active" | VM `0x100391a0` (slot 127): `and eax,0xf` per axis, returns "all zero" |
-| **15** | **homed** (origin found) | VM `0x10039160` (slot 126 → NC slot 137): `sar eax,0xf; and eax,1` collected into a 5-bit mask (INFERENCE on the name: it is the only per-axis flag exported as a mask and the go-origin UI is its consumer, medium-high) |
-| 16–23 | **command executing / busy** | VM `0x100390d0`: `sar eax,0x10; and eax,0xff; test` |
+| **15** | **homed** (origin found) | VM `0x10039160` (slot 126 → NC slot 137): `sar eax,0xf; and eax,1` collected into a 5-bit mask (INFERENCE on the name, **high** — verifier: consumer `0x56914b–0x569186` shows `mp125` 系统回原完成 "System go origin is done" when the previous machine state `[this+0x21c0]` == 1 (Origin) and `mask & axesToHome` ≠ 0) |
+| 16–23 | **command executing / busy** (INFERENCE: only `≠ 0` is tested) | VM `0x100390d0`: `sar eax,0x10; and eax,0xff; test` |
 | 24–31 | **current command type**: 2 = go-origin, 3/4/5 = jog / move variants | `0x100390d0`: `sar esi,0x18; and esi,0xff; cmp esi,2 / 3 / 4 / 5` |
 
 Polarity of bits 0–3 vs. the physical switch is decided in the firmware from the `NegativeLimitInput/ForwardLimitInput` parameters — bench only (O8 stays open).
@@ -229,12 +232,17 @@ State names are the array at `0x9e7f70` (`mp7, mp8, mp9, mp10 "Stop", mp11, [5] 
 
 ## 4. Block 5000 — RW word, e-stop port, safety deceleration
 
-* Reader: `updateMCStatusRW` `0x10051b00` reads **one** word (5000) into `VM+0x1e8` (`getReg(1,0)`). EVIDENCE §1.
-* Writers: **none**. `0x1008a634` (the constant 5000) has exactly one reference (the reader); no `push 0x1388`/`0x1388` immediate exists in NCModule; the three `0x1388` immediates in MainApp are `glDeleteLists/glGenLists(…, 5000)` (`0x4015ef`, `0x401642`, IAT `0x7c0ee0/0x7c0e60`) and a `malloc(5000)` (`0x403dd9`). The generic single-register writer (VM slot 32 `0x10040cb0`) is only called with addresses 0x65 (values 101/102) and 150 (values 5555/9999) — `0x1002c510–0x1002c564`.
-* Readers of the value: only the register-monitor page (`getReg(1, i)` loop at `0x5ea5a5`) and two display sites (`0x5d5bbb`, `0x5d5c57`); nothing branches on it.
-* Names: the static id table contains `RWRegName_1` (输入类型 input type), `RWRegName_4` (安全减速度 safety deceleration) and `RWRegName_5` (安全减减速度 safety jerk) but **not** `RWRegName_2/3` (output mask, e-stop input port) — consistent with a 1-word read whose siblings are unused by this build.
+*[Section rewritten by the verifier; the original claims "read as one word", "never written", "no 0x1388 immediates in NCModule" and "writer = VM slot 32" were wrong.]*
 
-Consequence for the port (INFERENCE, high): on the MCC100 the e-stop input assignment and the safety decel/jerk are **not** configured through block 5000 by this software. The e-stop input is a hardware parameter (`DI.EStop`, descriptor row "输入端口.急停 DI.Emergency Stop" in `01-hardware-config.md §1`, = 0 on this machine) written with the 59600+ parameter area, and its activation is reported to the PC as **alarm_1 bit 30**. The "safe deceleration" the card applies is `AX.SafeStopFactor` (= 3, row "杂项.安全减速系数" in the same table) from the same area. (`RegName72/73` "急停输入端口 / 软急停标志" are the MCC3721 legacy registers.) → The port should read 5000 for parity but must not rely on it; one live read of 5000..5008 will show whether the card even exposes more than one word.
+* **Reader present but dead.** `updateMCStatusRW` `0x10051b00` reads `[0x30, 5000, 1]` (`push 0x1008a634` @`0x10051b6c`, reply check `cmp ecx,0x10` @`0x10051bce`, store `mov [esi+0x1e8],edx` @`0x10051bd6`) and is **VM vtable slot 117** (`0x1008bd98`). There is **no `[reg+0x1d4]` call** anywhere in NCModule (the single `+0x1d4` hit `0x10057264` is a param-object read), the function address occurs once in the file (the vtable), and the status poll `0x1004e167–0x1004e2be` calls slots 115/119/120 (fast mode, `[VM+0x11fc] > 0`) or 115/116/118/119 — never 117. `VM+0x1e8` has no other writer and no explicit initialiser was found. Log cross-check: the 1 049 failure-logged READ vectors in `SRC/Log/*.log` are `2710/12`, `3e8/24`, `3e8/02`, `c350/1a`, `ea61/78`, `41a/03`, `2af8/27` — no `1388`. EVIDENCE high (static), log check medium (only failed reads are logged).
+* **Writers that exist** (EVIDENCE):
+  * `5001 ← [9999, 9, 0xFFFF, 0]` via VM slot 26 writeCmd (`push 0x1389` @`0x1002e2d3` in NC slot 101 `0x1002e1b0`, and @`0x10030c43` in NC slot 103 `0x10030b30`). NC slot 101 is called from NC slot 18 `0x1002b4b0` (`call [eax+0x194]` @`0x1002b4cc`) and from a MainApp page (`0x5d9578`, after an NC-slot-12 connected test). Whether this is a 4-register write 5001..5004 or a command mailbox in the `[9999, sub, mask, value]` family (cf. `0x65 ← [9999,13,0xFFFF,ver]`) is **unknown** — INFERENCE low either way.
+  * Hardware-parameter page (`0x5db116–0x5dbfd6`, row id `[ebp-0x1e8]`): row 0x57/0x58 → `49840+2·row` (= 50014/50016) ← value; row **0x59 → `5008 ← value`** (`push 0x1390` @`0x5db19d`); row **0x66 → `5012 ← SOP.HardwareType + 1`** (`g+0x402c`, descriptor `0x785b90`, label `pd296` 控制卡.硬件版本) (`push 0x1394` @`0x5dbf84`); every one followed by `100 ← 9999` (`push 0x270f; push 0x64`). The same page displays row 0x59 from `getReg(1, 2)` (`0x5d5b9d`, `0x5d5c39`) = `VM+0x1f0`, i.e. a word of the 50200 copy, not block 5000.
+  * NCModule's three `0x1388` immediates are **not** writes: `0x1002268b/0x10022770` are the CMCHalAPI address filters, `0x1004536d` a default duration of 5000 in the in-stream encoder. MainApp's `0x1388` pushes (`glGenLists/glDeleteLists`, `malloc`) remain unrelated.
+* **HAL address filter** (EVIDENCE, verifier-added): `VM+0x10` is a `CMCHalAPI` (`0x10056c24` → factory `0x10017e00` → ctor `0x100178a0`, vtable `0x10086f7c`); its slot 3 `0x100225e0` (read, called as HAL `+0xc`) and slot 4 `0x10022760` (write, HAL `+0x10`) short-circuit addresses in (104,1000)∖{150,151}, (1100,2000), (3000,5000), (5008,6000), (51000,59000) — zero-filled replies / silent success, nothing sent. **5000..5008 is inside the sent window**, so 5001 and 5008 reach the card; **5012 is swallowed** (never sent). This matches `00 §7` "PC-side windows never sent" and implies the card's RW block is 9 words (5000..5008).
+* **Names**: `RWRegName_1..5` = 输入类型 input type, 输出屏蔽配置 output shield/mask configuration, 急停输入端口 e-stop input port, 安全减速度 safety deceleration, 安全减减速度 safety jerk (`lang.txt`). Mapping name *n* → address 4999+*n* is by analogy with block 1000 (INFERENCE medium).
+
+Consequence for the port (INFERENCE, medium): this build does not read the e-stop/input-type/safety-decel registers and does not configure them explicitly (the 5001 vector does not look like a port number/decel value), so their values on this machine are the firmware defaults or whatever an earlier tool wrote. The e-stop assignment the operator sees is the hardware parameter `DI.EStop` (01 §1, = 0 here) and the safe-stop factor `AX.SafeStopFactor` (= 3); *verifier: that these reach the card through the 59600+ parameter area was not re-derived here.* The e-stop is reported to the PC as **alarm_1 bit 30**. **Bench (read-only, safe):** one `READ 5000/9` at idle, one with the e-stop pressed, one after toggling a DI — settles what 5000..5008 hold and whether 1004 is card-inverted. Do **not** replay `5001 ← [9999,9,0xFFFF,0]`, `5008/5012 ← …` or `100 ← 9999` until their meaning is known.
 
 ---
 
@@ -273,8 +281,8 @@ Executed on the panel timer; `this+0x1d8` = NC interface, `this+0x1ec` = alarm s
 | laser locked | NC slot `0x1c4` (`0x56a09c`) | byte `+0x1f28` | → 80 `gp121` (`0x56aec7–0x56aee0`) |
 | AF connected / **AF alarm word** | NC slot 15; word from NC slot 144 (`getReg(9,4)`) masked `0xcfff` (AF type 1/2), full (type 3), or `getReg(13,10)<<16 + getReg(13,26)` (type 7) (`0x56a15f–0x56a33e`) | `+0x1e9c`, `+0x1ea0` (bits 12/13 for type 2 with `param+0x4cf1`) | bit *n* (0–15) → 64+n → **gp100..gp115** (`0x56ad96–0x56ae0f`); `+0x1ea0` bits 12/13 → 76/77 `gp112/gp113`; type 7 nonzero → 79 `gp115`; offline → 61 `gp95` |
 | EC connected / **EC alarm word** | NC slot 16; `getReg(11,4)` (`0x56a4a3`) | `+0x1ea8` | bit *n* (0–15) → 83+n → **gp201..gp216** (`0x56ae0f–0x56ae88`); offline → 82 `gp200` |
-| chiller DI | `isDIOn(param+0x3b00 port, +0x3b04 type)` (`0x568d58–0x568d98`; fibre variant `+0x35b0/+0x35b4` first, then overwritten) | byte `+0x1eac` | → 56 **gp56** 冷水机异常 chiller alarm (`0x56a71b–0x56a754`) |
-| laser DI (fibre) | `isDIOn(param+0x3b28, +0x3b2c)` (`+0x3650/+0x3654` for fibre) | byte `+0x1ead` | → 60 **gp92** laser alarm (`0x56a754–0x56a78d`) |
+| chiller DI | `isDIOn(param+0x3b00 port, +0x3b04 type)` (`0x568d58–0x568d98`) when `SP.m_iEnableLaserType` (`param+0x46d8`) ≠ 0, else `isDIOn(+0x35b0, +0x35b4)` (`0x568cc7–0x568d07`) — *verifier: an if/else on laser type, not "first then overwritten"* | byte `+0x1eac` | → 56 **gp56** 冷水机异常 chiller alarm (`0x56a71b–0x56a754`) |
+| laser DI | `isDIOn(param+0x3b28, +0x3b2c)` (`+0x3650/+0x3654` when laser type == 0, same if/else) | byte `+0x1ead` | → 60 **gp92** laser alarm (`0x56a754–0x56a78d`) |
 | custom DI alarms 0..15 | `isDIOn(param+0x3b6c+i·0x28, +0x3b70+i·0x28)` (`0x568e19–0x568e67`), gated by "only while processing" byte `+0x3b90+i·0x28` and job state | bytes `+0x1eaf+i` | → 1000+i (custom name) (`0x56a78d–0x56a814`); cleared unless `OnlyManualRelieveAlarm` (`param+0x3ea4`) |
 | pulse-equivalent check | `0x589040` | byte `+0x1ebf` | → 63 `gp97` |
 | plan count finished | byte `+0x1f2a` | | → 101 `gp219` |
@@ -289,7 +297,7 @@ VM `0x10038fe0` (EVIDENCE): `s = getReg(7,2)` (ZFReadOnly03 运行状态 running
 
 ## 7. What the safety watchdog must react to
 
-Derived from the Windows app's own reactions (EVIDENCE): the "all clear" test at `0x56a4db–0x56a657` requires `alarm_1 == 0 && alarm_2 == 0 && ZFalarm == 0 && AFalarm == 0 && ECalarm == 0 && ZFstate ≠ 5 && laser/AF/EC not offline && !pulseEquivError && laserAlarm == 0 && !chillerDI && !laserDI && !customDI && NC slot 0x1f0() == 0 && NC slot 0x1f4() == 0 && !laserLocked`. When it fails (`0x56a65d–0x56a6b9`): unless the job state is already 3 or 11 → `OnPauseBtn` (`0x587a30`, log "Sys Pause"), or `OnStopBtn` (`0x5880a0`, log `CManuPanel::OnStopBtn` → NC slot 22 "send stop manu cmd" + NC slot 58 `0x65 ← [101]`) when the plan count is finished during a running job; then machine state 5, alarm lamp DO on / standby+process DO off (`0x56b73a–0x56b8a0`), status LED red (`push 0xff0000`).
+Derived from the Windows app's own reactions (EVIDENCE): the "all clear" test at `0x56a4db–0x56a657` requires `alarmPresent [+0x1e88] == 0` (*verifier:* this is `alarm_1 ≠ 0 || alarm_2 ≠ 0` from `0x5699c7`, **except** that it is forced to 0 when alarm_1 == 0x01000000 under the `+0x4688/+0x4690` gate) `&& ZFalarm == 0 && AFalarm == 0 && ECalarm == 0 && ZFstate ≠ 5 && laser/AF/EC not offline && !pulseEquivError && laserAlarm == 0 && !chillerDI && !laserDI && !customDI && NC slot 0x1f0() == 0 && NC slot 0x1f4() == 0 && !laserLocked && [+0x21c5] ≠ 0 (card-session flag, cleared with gp0 at `0x565cf1`) && ![+0x1f2a] (plan count finished)`. When it fails (`0x56a65d–0x56a6b9`): unless the job state is already 3 or 11 → `OnPauseBtn` (`0x587a30`, log "Sys Pause"), or `OnStopBtn` (`0x5880a0`, log `CManuPanel::OnStopBtn` → NC slot 22 "send stop manu cmd" + NC slot 58 `0x65 ← [101]`) when the plan count is finished during a running job; then machine state 5, alarm lamp DO on / standby+process DO off (`0x56b73a–0x56b8a0`), status LED red (`push 0xff0000`). *Verifier:* `OnPauseBtn` itself sets job state 11 and, if connected, calls **NC slot 22** ("send stop manu cmd", `0x10045e30`, vector `[10, 0x18]`) at `0x587b7a`/`0x587d90` — i.e. the Windows "pause" also stops motion on the card. The state-5 case writes `DO[g+0x224] ← 0` (skipped if `g+0x918`), `DO[g+0x24c] ← 0`, `DO[g+0x274] ← 1`, `DO[g+0x29c] ← 1` via NC slot 79; the lamp/standby/process labels for those four offsets were **not** re-derived.
 
 For the Linux port (priority order):
 
@@ -312,7 +320,7 @@ Polarity summary: alarm bits **1 = active**; DI/DO bits = raw level, NO/NC appli
 
 ## 8. Exception codes 2 / 3 (static status)
 
-The PC side never interprets them: `ErrCode = 500 + code` (`04 §3.3`), the logger prints it, and the jog/home paths just re-send. The only places MainApp materialises 502/503 are two constant stores in a UI routine (`0x47a339: mov [ebp-0x4],0x1f7`, `0x47a355: …,0x1f6`) with no branch on card state. NCModule's offline simulator does not fabricate exception replies (no `func|0x80` builder found). **Still open (live):** one capture of `READ 1000/2` immediately after power-up (expect code 2 until the card's stack is ready) and one jog command sent while an axis is moving (expect code 3) settles both; the 08-doc reading (2 = not ready after reset, 3 = refused in current state) remains the best hypothesis.
+The PC side never interprets them: `ErrCode = 500 + code` (`04 §3.3`), the logger prints it, and the jog/home paths just re-send. ~~The only places MainApp materialises 502/503 are two constant stores in a UI routine (`0x47a339`, `0x47a355`).~~ *Verifier — REFUTED:* `mov DWORD PTR [ebp-0x4], N` is the MSVC C++ EH-state counter of a large function (13 such stores with 0x1f0–0x1ff in MainApp), not the values 502/503; this is no evidence either way about exception handling. NCModule's offline simulator does not fabricate exception replies (no `func|0x80` builder found). **Still open (live):** one capture of `READ 1000/2` immediately after power-up (expect code 2 until the card's stack is ready) and one jog command sent while an axis is moving (expect code 3) settles both; the 08-doc reading (2 = not ready after reset, 3 = refused in current state) remains the best hypothesis.
 
 ---
 
@@ -322,8 +330,8 @@ Closed statically:
 
 * **O2** — block 1000 word map (§2) incl. DI/DO bit convention, alarm_1/alarm_2 bit tables, processing/parameter status values, FIFO margin capacity; axis status word bit fields (§3.1); machine-state derivation (§3.2). Remaining unknown inside O2: word 8 "run status" (no consumer) and the exact meaning of axis-status byte-3 values 3/4/5.
 * **O15** — alarm id ↔ bit: the numeric-code scheme and both lookup tables (§5); `gp1–32` are legacy and never raised.
-* **Block 5000** — one word, never written, no consumer (§4); e-stop/safety-decel live in the hardware-parameter area.
-* Corrections to earlier docs: `0x1004eff0` is `updateAFStatus` (auto-focus, blocks 13000/13200), not the 1000-block reader; `0x10052130` reads **60001** (a combined 2000+50200 read), not 1000; the 1000/36 reader is `0x100516b0`; NC interface slot 143 (laser alarm word) is a stub, so `gp46–55` cannot appear on this build.
+* **Block 5000** — *verifier-corrected:* reader present but never called (not read), yet **written** (5001 vector at init, 5008/5012 from the parameter page, §4); names only; not closed.
+* Corrections to earlier docs: `0x1004eff0` is `updateAFStatus` (auto-focus, blocks 13000/13200), not the 1000-block reader; `0x10052130` reads **60001** (a combined 2000+50200 read), not 1000; the 1000/36 reader is `0x100516b0`; NC interface slot 143 (laser alarm word) is a stub, so `gp46–55` cannot appear on this build. Verifier corrections: NC slots 15/16/17 (§1), writeReg = VM slot 27 `0x100494e0`.
 
 Still open (needs the machine):
 
@@ -340,7 +348,7 @@ Still open (needs the machine):
 | VM offset | content | VM offset | content |
 |---|---|---|---|
 | `+0x38` | card connected (byte) | `+0x120..+0x1e4` | block 2000 (5×10) |
-| `+0x3c/+0x3d/+0x3e` | laser / AF / EC connected | `+0x1e8` | block 5000 word 0 |
+| `+0x3c/+0x3d/+0x3e/+0x3f` | laser / moct(remote) / AF / EC connected (verifier-corrected) | `+0x1e8` | block 5000 word 0 (never refreshed) |
 | `+0x90..+0x11c` | block 1000 words 0–35 | `+0x1ec..+0x300` | block 50200 compacted (5×14) |
 | `+0xa0/+0xa4` | DI / DO words | `+0x304..+0x368` | block 50000 (26) |
 | `+0xa8/+0xac` | alarm_1 / alarm_2 | `+0x36c..+0x3b0` | ZF status 10000 (18) |
@@ -353,3 +361,31 @@ Still open (needs the machine):
 ## Appendix B — direct `getReg` reads issued by MainApp (group, index → sites)
 
 From the scan of all `call [NC+0x1a0]` sites (push order: index first, then group): group 0 → 1, 9, 10, 11, 12, 14, 23, 28, 31, 35 and the monitor loop `i < 36` (`0x5ea3aa`); group 1 → monitor loop (`0x5ea5a5`), 2 (`0x5d5bbb`, `0x5d5c57`); group 3 → `10a+0` (`0x56a8bb` alarm scan), `10a+2` (positions), `10a+7`, monitor loop `0x5ea49d`; group 7 → 0..7, 14, 15, 16, 17 (ZF page and state logic); group 9 → 0, 4, 5, 7, 9, 11 (AF); group 11 → 4 (EC alarm word), 5 (bit 31 = platform flag, `0x569329`), 6, 7, 13; group 13 → 0, 4, 10, 11, 26; groups 5/8/10/12/14 → monitor pages only.
+
+---
+
+## Verification notes
+
+Adversarial re-derivation (verifier, 2026-09-15) from `NCModule.dll` / `MainApp.exe` listings in `.scratch/asm/`, `objdump -s`, and PE-offset string decoding. Edits made in place above are tagged *[verifier]*.
+
+**Re-confirmed (bytes re-read):** constant table `0x1008a630..7c`; block-1000 reader `0x100516b0` (vector, `cmp eax,0x9c`, 36-dword copy to `VM+0x90`, failure clears `[VM+0x38]`); `getReg` `0x10038d40` + jump table `0x10038e14` (no index bound check); NC slots 12/13/14/81/82/83/84/104/118/137–144 thunks; `isDIOn` port/bit/type logic; alarm_1 loop `0x56a82d–0x56aaec` (codes `8100+b·32+k` via `lea [eax+ecx+0x1fa4]`, `8000+b`), alarm_2 loop (`9000+bit`); `addAlarm` ladder `0x52c485–0x52caf8`; alarm tables (`0x9a42c0` idx 25/26/30 = `EtherCATErrorInfo_1_25/_1_26/_1_30`, others empty; `0x9a4640` = `_2_00.._2_05`; `0x9a46e8` = `EtherCATAxisErrorInfo_0..5`; `0x9a2d88[16]` = `gp16`); 29 raise sites and their codes (no 1–32); machine state `0x100390d0` (push order group 0 / index 19, loop 5 axes) and state names `0x9e7f70` = mp7..mp11; homed mask `0x10039160`; `0x100391a0` nibble; FIFO `cmp [esi+0xd0],0xea60` / `cmp [esi+0xdc],1` / `call 0x10050dc0`; parameter-status consumer `0x56fbbb–0x56fc02`; fast read `0x10052130` destinations; `updateAFStatus`/`updateMCStatusFast` log strings; slot 143 `xor eax,eax; ret`; all-clear ladder and Pause/Stop branch; state-5 assignments `0x56af39`/`0x56b0ee` and jump table `0x56fd7c[5]` = `0x56b73a`.
+
+**Refuted / corrected:**
+1. *Block 5000 "read as one word … never written … no 0x1388 immediates in NCModule".* Reader `0x10051b00` = VM slot 117 has no caller (never read). Register 5001 is written (`[9999,9,0xFFFF,0]`, `0x1002e2d3`, `0x10030c43`), 5008 and 5012 are written by the parameter page (`0x5db19d`, `0x5dbf84`, then `100 ← 9999`). NCModule does contain three `0x1388` immediates (HAL filters + a default duration). The earlier enumeration missed these because it looked only at the `+0x1d8` NC pointer, at VM slot 32 instead of slot 27/26, and at the exact value 5000.
+2. *Single-register writer "VM slot 32 `0x10040cb0`".* The generic writeReg is VM slot 27 `0x100494e0` (`[0x40, reg, 1, v]`); `0x10040cb0` is a guarded ZF command writer (`0x65 ← [0x76, 4, flag, g+0x4d28]`).
+3. *NC slots 15/16.* Slot 15 = `0x1002b490` → `[VM+0x3e]` (AF), slot 16 = `0x1002b4a0` → `[VM+0x3f]` (EC), `0x1002b470` is slot 17 (`[VM+0x3d]`, moct/remote link). The labels AF/EC were right, the thunks and VM offsets wrong (Appendix A fixed).
+4. *§8 "MainApp materialises 502/503 at `0x47a339/0x47a355`".* These are C++ EH-state stores `[ebp-0x4]`, not error codes.
+5. *Bit-24 special case "only when the follower is enabled".* The gate is two unnamed param bytes `+0x4688/+0x4690`; label not established.
+6. *Chiller/laser DI "fibre variant first, then overwritten".* It is an if/else on `SP.m_iEnableLaserType` (`param+0x46d8`).
+7. *"seven configured DO ports"* at job end — more than seven (fixed offsets, a vector and a second group).
+
+**Downgraded:** FIFO capacity 60000 (CONFIRMED → LIKELY; plus the `[vm+0x870]` last-batch gate was missing); bits 16–23 "bus axes" and bit 24 "follower" (INFERENCE only); per-axis decode for alarm_1 bits 5–24 (reads out of the block — not a valid decode); `word19 == 1` is a low-byte compare; `checkMCStatus` word 0/1 logic refined (version = type·10000 + minor, word 0 bits 17–18 used only if minor < 6000).
+
+**Upgraded:** axis status bit 15 = homed (consumer shows `mp125` "System go origin is done", `0x56914b–0x569186`).
+
+**Added:** port-0 `isDIOn` pitfall (`type 1` + unassigned port → reported active); `100 ← 9999` after the parameter-status prompt; `OnPauseBtn` also sends NC slot 22 stop (`[10, 0x18]`); axis-slot names X/Y/Y2/height/W; CMCHalAPI send windows (5000..5008 sent, 5012 swallowed); per-axis alarm codes for bit 24 are never cleared (clear path clears 8024).
+
+**Not re-derived (left as the analyst wrote, confidence unchanged):** block-1000 rows 9–14, 20–30 consumers; ZF/AF/EC word tables in §6; §6.1 ZF state; the DO-port labels for the state-5 outputs; `DI.EStop`/`AX.SafeStopFactor` transport to the card; exception codes 2/3 semantics.
+
+**Bench steps that settle what remains (all read-only):** `READ 5000/9` idle / e-stop pressed / one DI toggled (block-5000 contents, card-side input inversion); press each limit switch and read 2000+10n (bits 0/1 polarity, O8); capture idle / homing / jog / running and diff 1008, 2000+10n byte 3 (run status, command-type values); trigger an e-stop and a bus/output fault if safely possible and log 1006/1007 (bits 25/26/30 on the MCC100).
+

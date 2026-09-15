@@ -14,15 +14,15 @@ Conventions as in `00`: **EVIDENCE** = observed bytes/instructions (file, VA, st
 |---|---|---|
 | `.enc` layout | plain concatenation of 5 files, each immediately followed by an ASCII marker, **no length fields, no encryption**: `olpi` `NEXCUT_OLPI_END` `olpf` `NEXCUT_OLPF_END` `jpg` `NEXCUT_JPG_END` `xml` `NEXCUT_LAYER_XML_END` `chf` `NEXCUT_CHF_END` | EVIDENCE §1 |
 | `.aut` layout | same scheme, 4–6 sections: `chf` `TASK_GRAPH` `xml` `TASK_LAYER` `manu` `TASK_MANU` [`param1` `TASK_PARAM_ONE` `param2` `TASK_PARAM_TWO`] `isbreak` `TASK_IS_BREAK` | EVIDENCE §2 |
-| readers | `.aut`: byte-by-byte accumulate, flush whenever the buffer *ends with* a marker (§2.3). `.enc`: **never read by MainApp** — it is uploaded to the NexCut HTTP service (`POST /NexCut/File/LoadFile`) | EVIDENCE §1.4 |
-| `NormalExit` | `=0` written at **start-up** (`0x568365`, in the init routine `0x566ee0`); `=1` written by the **main-window destructor** (`0x459aa8`, `0x459820`) and by a **network-triggered exit** (`0x48f338`, only if `IsNetworkAlive()==NETWORK_ALIVE_LAN`). Axis positions (`XAxis…WAxis`, 0.001 mm) are written by `0x45cf80`, called right after the `=1` write | EVIDENCE §3 |
-| `AutosaveParam1/2.ini` | written every **100 ms** by a `timeSetEvent` callback while `G+0x47cc == 2` (running); even counter → file 1, odd → file 2 | EVIDENCE §4.2 |
+| readers | `.aut`: byte-by-byte accumulate, flush whenever the buffer *ends with* a marker (§2.3). `.enc`: **never read by MainApp** — it is uploaded to the NexCut HTTP service (multipart `POST /NexCut/File/UploadGCode`, then `POST /NexCut/File/LoadFile` with the name — *[verifier]*) | EVIDENCE §1.4 |
+| `NormalExit` | `=0` written by the card-(re)connect init routine `0x566ee0` (`0x568365`), which the poll handler runs whenever `G+0x4310 != 0`; `=1` written by the **main-window destructor** (`0x459aa8`, `0x459820`) and by the **"Reconnect" (mf130 硬件重连) handler** `0x48f260` (`0x48f338`, only if `IsNetworkAlive()==NETWORK_ALIVE_LAN`; it then sets `G+0x4310=1`, so the next poll re-runs init and writes `=0` again) — *[verifier: was "network-triggered exit", refuted]*. Axis positions (`XAxis…WAxis`, 0.001 mm) are written by `0x45cf80`, called right after the destructor's `=1` write | EVIDENCE §3 |
+| `AutosaveParam1/2.ini` | written every **100 ms** by a `timeSetEvent` callback while `G+0x47cc == 2` (running); even counter → file 1, odd → file 2; X/Y µm **rounded half away from zero** *[verifier]* | EVIDENCE §4.2 |
 | `ManuContour.dat` | written by "SaveIndex" (`0x4368e0`) at job **start** (`CManuPanel::OnStartBtn` / `OnSimBtn` / resume chain) | EVIDENCE §4.1 |
-| `TotalReport.txt` row | appended by the control-panel **poll handler** `0x568a50` on the stop transition; 10 fields in this order: name, `,%.2f×%.2f mm`, `,%Y-%m-%d %H:%M:%S`, `,%.2f m` cut, `,%.2f m` idle, `,%d` pierces, `,` + `gp146` duration, `,%.2f Sec`×3 | EVIDENCE §5 |
-| `.pmf` | `scFlie` text container: `count`, then per step `type` + 6 ints; **writer only**, no reader in the binary; recommend **drop** | EVIDENCE §6 |
+| `TotalReport.txt` row | appended by the control-panel **poll handler** `0x568a50` when `G+0x47cc==2` and the card reports state `0x17` (then `G+0x47cc:=0`); 10 fields in this order: name, `,%.2f×%.2f mm`, `,%Y-%m-%d %H:%M:%S`, `,%.2f m` cut, `,%.2f m` idle, `,%d` pierces, `,` + `gp146` duration, `,%.2f Sec`×3; file bytes UTF-8, CRLF *[verifier]* | EVIDENCE §5 |
+| `.pmf` | `scFlie` text container: `count`, then per step `type` + 6 ints (in-memory step is 0x24 bytes; 2 trailing ints not written *[verifier]*); **writer only**, no file reader in the binary (the flow survives only in memory, `G+0x4384[0]`); recommend **drop** | EVIDENCE §6 |
 | `calib.csv` | `"%d, %d\n"` rows of the FTC (signal, height) table = A5 §2.3; viewer-only | EVIDENCE §7 |
-| `pwmCompensation.txt` | **not referenced by any binary** (ASCII/UTF-16, all modules) → only the human source of `GRP.FiberScanFlyCompensateStr` | EVIDENCE §8 |
-| `logo.bmp` | OEM logo overlay on the **splash screen** (`CBCGPDialog::OnInitDialog` `0x5a84e0`), 150×150 static next to `res\splash.bmp`; optional (`PathFileExistsW`) | EVIDENCE §9 |
+| `pwmCompensation.txt` | **file name not referenced by any binary** (ASCII/UTF-16, all modules); the tables match `1390backup.xml`'s `GRP.{Fiber,CO2}ScanFlyCompensateStr` (keys bound in MainApp, UTF-16 `0x882ea4`/`0x882e38`), **not** the live `BkManuPara.xml` values *[verifier]* | EVIDENCE §8 |
+| `logo.bmp` | OEM logo overlay on the **splash screen** (`CBCGPDialog::OnInitDialog` `0x5a84e0`), 150×150 static next to `res\splash.bmp`; optional (`PathFileExistsW`); splash uses colour key RGB(128,128,128) *[verifier]* | EVIDENCE §9 |
 
 ---
 
@@ -38,8 +38,9 @@ Conventions as in `00`: **EVIDENCE** = observed bytes/instructions (file, VA, st
 | `0x4693d0` | append-one-section helper (ifstream → `ofs << ifs.rdbuf()` → `ofs << marker` → `remove(tempfile)`) | |
 | `0x462c40` | **Export handler** (save dialog `L"enc文件(*.enc)\|*.enc\|\|"` at `0x462c7d`, default ext `L"enc"`, title `mf152` 保存加工文件 "Save File") | |
 | `0x466c90` | **Open handler** for `L"Select file(*.nc;*.enc)\|*.nc;*.enc\|All Files (*.*)\|*.*\|\|"` (`0x466ccc`) — uploads, does not parse (§1.4) | |
+| `0x406430` / `0x407430` / `0x406940` | *[verifier]* uploader: `0x406430` checks size, starts worker `AfxBeginThread(0x407f60)` (`0x406896` → `0x407f8a call 0x407430`) = multipart `POST /NexCut/File/UploadGCode` (`0x407466` L"/NexCut/File/UploadGCode", boundary `0x7c4b00`, `name="file"`, `application/octet-stream`, 4096-byte `ReadFile`/`WinHttpWriteData`); `0x406fb0` = cancel (`ds:0x93acd4 = 1`); `0x406940` = `POST /NexCut/File/LoadFile` `{"fileName":"…"}` | |
 | `0x49b8f0` | writes `_tempProcessInfo.olpi` + renders `_tempthumbnail.jpg` (§1.3) | |
-| `NC:0x100349b0` | CNCModule slot 26 (A3 §1): when `G+0x46e0 != 0` writes `_tempManuItem.olpf` instead of queuing to the card | |
+| `NC:0x100349b0` | CNCModule slot 26 (A3 §1): when `G+0x46e0 != 0` writes `_tempManuItem.olpf` instead of queuing to the card (opens on arg1≠0, closes + sets `G+0x4701=1` on arg2≠0 — *[verifier]*) | |
 
 ### 1.2 Writer `0x468fe0` — container layout (EVIDENCE)
 
@@ -67,7 +68,7 @@ Helper `0x4693d0` (identical twin of the `.aut` helper `0x4689e0`, read in full)
 <olpi bytes>NEXCUT_OLPI_END<olpf bytes>NEXCUT_OLPF_END<jpg bytes>NEXCUT_JPG_END<LayerPara.xml bytes>NEXCUT_LAYER_XML_END<chf bytes>NEXCUT_CHF_END
 ```
 
-— no header, no lengths, no CRC, no encryption; markers are the bare ASCII strings without terminator. A section whose temp file is missing is silently dropped together with its marker (INFERENCE high: a consumer must therefore search markers, not assume all five).
+— no header, no lengths, no CRC, no encryption; markers are the bare ASCII strings without terminator. A section whose temp file is missing is silently dropped together with its marker (INFERENCE high: a consumer must therefore search markers, not assume all five). *[verifier]* Additional caveat (INFERENCE medium, MSVC10 `<ostream>` semantics, msvcp100 not disassembled): `ostream << streambuf*` sets `failbit` when it copies zero characters, after which every later `<<` on the same `ofstream` is a no-op — an *empty* existing temp file would truncate the container at that point (remaining sections and markers missing). None of the five inputs is normally empty.
 
 ### 1.3 The five sections and where they come from (EVIDENCE, handler `0x462c40`)
 
@@ -75,15 +76,15 @@ Sequence in the export handler after the save dialog:
 
 1. `0x462dbf–0x462ea5`: full path split at the last `\` (`CString::ReverseFind(0x5c)` `0x462e45`): `G+0x4704` ← file name, `G+0x46e4` ← directory.
 2. `0x462ed9`: `G+0x46e0 = 1` ("export mode"), `0x462ee5`: `G+0x47c1 = 0`.
-3. `0x462ef2–0x462f21`: CAD virtual `[+0x1c4]` then `0x59ee50` — the pre-start routine (range check `mp120` 图形超出加工范围 "Graphics are out of range, continue?", then `0x596530` → **`0x4368e0` "SaveIndex"** → `ManuContour.dat`, then the planner). Because `G+0x46e0 != 0`, CNCModule slot 26 `NC:0x100349b0` (`cmp BYTE PTR [eax+0x46e0],0` at `NC:0x100349e9`) writes the FIFO record vector to **`_tempManuItem.olpf`** and returns without starting the card.
-4. `0x462fbb`: modal dialog `0x530f50(0xa)`; `IDNO (7)` aborts.
+3. `0x462ef2–0x462f21`: CAD virtual `[+0x1c4]` then `0x59ee50` — a pre-start routine *[verifier: its only caller is `0x462f21`; no pointer to it exists in the image, so it is **not** shared with Start; it ends by calling NC slot 28 (`+0x70` → VM `0x100392e0`: `VM+0x76c = 0`, no I/O) and setting **`G+0x47cc = 2` (running)** at `0x59f074`]* (range check `mp120` 图形超出加工范围 "Graphics are out of range, continue?", then `0x596530` → **`0x4368e0` "SaveIndex"** → `ManuContour.dat`, then the planner). Because `G+0x46e0 != 0`, CNCModule slot 26 `NC:0x100349b0` (`cmp BYTE PTR [eax+0x46e0],0` at `NC:0x100349e9`) writes the FIFO record vector to **`_tempManuItem.olpf`** and returns without starting the card.
+4. `0x462fbb`: modal dialog `0x530f50(0xa)`; `IDNO (7)` aborts. *[verifier]* This is a progress dialog: its handler `0x531c80` adds progress when `G+0x4700` (set by the planner statistics only in export mode, `0x4469e0`) and `G+0x4701` (set by NC slot 26 after closing the `.olpf`, `NC:0x10034bd5`) are set, and when both are set clears **`G+0x46e0 = 0`** (`0x531d46`, the only write of 0 in MainApp) and `EndDialog(2)`. On the abort path `G+0x46e0` is not cleared (INFERENCE medium: a cancelled export leaves export mode on, so the next Start would be diverted into `_tempManuItem.olpf` instead of the card; the dialog's `EndDialog(7)` site `0x531c3b` was not tied to type 0xa). Also in export mode the plan start point is forced to (0,0) (`0x437d31–0x437d43`, `fldz`).
 5. `0x463014 call 0x49b8f0(statsRecord)`: writes **`_tempProcessInfo.olpi`** (`_wfopen_s` `L"wt+"`, `0x49ba69`) and renders the drawing into a bitmap → **`_tempthumbnail.jpg`** (`CreateCompatibleBitmap`/`BitBlt` `0x49bc34–0x49be53`, encoder `0x4a20d0`, path `0x49be79`).
 6. `0x463019–0x4630a0`: `ICADModule::Save(dir + "\_tempSource.chf", 0, …)` via `[CAD+0xed88]` (`0x4abbb0`) → **`_tempSource.chf`** (native job, format in 03).
 7. `0x4630a7–0x4630f7`: `CopyFileW(G+0x4104, dir + L"\_tempLayer.xml", FALSE)`. `G+0x4104` is assigned once, in "--- Init System param ---" (`0x4aff60`) right after `push L"\LayerPara.xml"` (`0x4b0031`) → **`_tempLayer.xml` = a verbatim copy of `File\LayerPara.xml`** (the current layer-parameter file, 02).
-8. `0x46310f call 0x468fe0` (container), `0x46311a call 0x5880a0` = `CManuPanel::OnStopBtn` (log string `0x5880d5`) → resets the run state.
-9. `0x463125–0x4632b0`: if the HTTP client object `G+0xf53c` (`0x488180`) exists and `0x406f90()` (connected) → `0x406430` (opens the file with `CreateFileW`/`GetFileSize`; prompts `A250606_0` 文件错误 "File Error!" / `A250606_1` "Only files smaller than 500MB are supported for transfer!") → dialog `0x530f50(0xc)` → `0x406fb0`/`0x406940`: WinHTTP `POST` to **`/NexCut/File/LoadFile`** (`0x406971`) with body `{"fileName":"<name>"}` (`0x7c4910`), answer parsed for `"state"` `true/false` (`0x406deb–0x406ec4`).
+8. `0x46310f call 0x468fe0` (container), `0x46311a call 0x5880a0` = `CManuPanel::OnStopBtn` (log string `0x5880d5`) → resets the run state. *[verifier]* Per A1 row 4/§ribbon, `OnStopBtn` with state ≠0/5 and card connected sends **NC slot 22 stop-manu** (and slot 89 when LaserGateIsAutoInManu) — i.e. exporting an `.enc` while connected emits a Stop to the controller; since step 3 set `G+0x47cc=2`, the 100 ms AutosaveParam timer (§4.2) is also live during the export window. A port must not copy these side effects.
+9. `0x463125–0x4632b0`: if the HTTP client object `G+0xf53c` (`0x488180`) exists and `0x406f90()` (connected) → `0x406430` (opens the file with `CreateFileW`/`GetFileSize`; prompts `A250606_0` 文件错误 "File Error!" / `A250606_1` "Only files smaller than 500MB are supported for transfer!"; *[verifier]* then starts the upload worker thread `0x407f60`→`0x407430` = multipart **`POST /NexCut/File/UploadGCode`** carrying the file bytes) → progress dialog `0x530f50(0xc)` → `IDNO` → `0x406fb0` (sets cancel flag `ds:0x93acd4`), otherwise `0x406940`: WinHTTP `POST` to **`/NexCut/File/LoadFile`** (`0x406971`) with body `{"fileName":"<name>"}` (`0x7c4910`), answer parsed for `"state"` `true/false` (`0x406deb–0x406ec4`).
 
-**`_tempProcessInfo.olpi` — text, 7 lines (EVIDENCE `0x49ba91–0x49bb97`, format strings at `0x7de464…0x7de490`):**
+**`_tempProcessInfo.olpi` — text, 7 lines, `_wfopen_s("wt+")` text mode → CRLF on Windows (EVIDENCE `0x49ba91–0x49bb97`, format strings at `0x7de464…0x7de490`; lines 1–2 are one call with `'%.2f\n%.2f\n'`):**
 
 | line | `fprintf_s` format | value |
 |---|---|---|
@@ -100,18 +101,20 @@ Sequence in the export handler after the save dialog:
 **`_tempManuItem.olpf` — text (EVIDENCE `NC:0x10034a95–0x10034b78`, formats at `NC:0x10089cc0…`):**
 
 ```
+[ per call of slot 26 (one per record chunk):
 Manu_Begin %d %d\n            ← (arg1!=0, arg2!=0) = the two bool args of slot 26 (A3: "bool,bool")
 %d %d %d %d %d %d %d %d %d\n  ← one line per 28-byte Record (A3 §2), arg order = +0x18, u8 +0x16 (type), u16 +0x14 (freq), u8 +0x12 (duty), u16 +0x10, +0, +4, +8, +0xc
 …
-Manu_End\n
+Manu_End\n ] ×N
+Size %d                       ← no newline; total records over all chunks (global NC:0x100b3bc8)
 ```
-(`"Size %d"` at `NC:0x10089ccc` is written by another branch, `NC:0x10034b9f`, when `arg2 != 0` — not on the export path.) Record field meanings are in A3 §2. INFERENCE (high): the `.olpf` is the fully planned, card-ready motion/IO stream — the server side needs no planner.
+*[verifier — corrects the earlier note that "Size %d" is "not on the export path"]*: the file is opened (`_wfopen_s(L"wt+")`, text mode → CRLF) only when **arg1 ≠ 0** (`NC:0x100349f9–0x10034a77`, FILE* in `NC:0x100b3bcc`); every call with the file open writes one `Manu_Begin … Manu_End` block; when **arg2 ≠ 0** (`NC:0x10034b84`) it writes `Size %d` with the cumulative record counter, `fclose`s, resets the counter and sets **`G+0x4701 = 1`** (`NC:0x10034bd5`) — the flag the export progress dialog waits for, so this branch *is* the export path's terminator. A single-chunk export gives `Manu_Begin 1 1 … Manu_End Size N`. Record field meanings are in A3 §2. INFERENCE (high): the `.olpf` is the fully planned, card-ready motion/IO stream — the server side needs no planner.
 
 **`_tempthumbnail.jpg`**: rendered by MainApp's own GDI drawing (`0x4a12c0`, `0x4a1380`), JPEG via `0x4a20d0` (`0x88c5f4` = encoder CLSID/format blob). Matches `Report/*.chf.jpg` (03).
 
 ### 1.4 There is no `.enc` reader in MainApp (EVIDENCE)
 
-The five `NEXCUT_*` markers have exactly one xref each (all in the writer), no other module contains them (`strings -a`/`-e l` over every DLL: only `MainApp.exe` hits; `NCModule.dll` holds only `L"\_tempManuItem.olpf"`). The "Open .nc/.enc" handler `0x466c90` logs the directory and name (`0x466dee`, `0x466e22`) and hands the file to the same HTTP uploader (`0x466e2d…0x466f40`: `0x406f90` → `0x406430` → dialog `0x530f50(0xc)` → `0x406fb0`/`0x406940`). INFERENCE (high): `.enc` is an outbound package consumed by the NexCut server/HMI (07 §HTTP); the port does not need to parse one, only to write one if it wants to feed such a server.
+The five `NEXCUT_*` markers have exactly one xref each (all in the writer; re-verified: ASCII file offsets `0x3da528…0x3da610`, no other hit), no other module contains them (`strings -a`/`-e l` over every DLL: only `MainApp.exe` hits; `NCModule.dll` holds only `L"\_tempManuItem.olpf"`). The "Open .nc/.enc" handler `0x466c90` logs the directory and name (`0x466dee`, `0x466e22`) and hands the file to the same HTTP uploader (`0x466e2d…0x466f40`: `0x406f90` → `0x406430` (starts the multipart `UploadGCode` worker) → dialog `0x530f50(0xc)` → `0x406fb0` cancel / `0x406940` `LoadFile`). INFERENCE (high): `.enc` is an outbound package consumed by the NexCut server/HMI (07 §HTTP); the port does not need to parse one, only to write one if it wants to feed such a server.
 
 ---
 
@@ -137,8 +140,8 @@ Functions: writer/export handler **`0x467c80`** (save dialog `L"aut file(*.aut)|
 Preparation (all paths = `<exe dir>\File\` + name, `0x467f39`):
 * `0x467f8b DeleteFileW(tempGraph.chf)`; `0x467fbc` `ICADModule::Save(tempGraph.chf)` (`0x4abbb0`).
 * `0x467fec DeleteFileW(tempLayer.xml)`; `0x467ff7 cmp G+0x46d8,0` selects the layer list for the current laser type (`0x5ff760`/`0x5ff2d0` when 0, `0x5ffb50`/`0x5ff780` otherwise) and writes `tempLayer.xml` layer by layer.
-* `0x468179–0x4682a4`: `tempIsBreak.ini` = `scFlie` container (§4.0) with **two ints**: `isBreak` (computed `0x468198–0x468227`: 0 only when `G+0x4380 == 0` and CAD `+0x148 == 0` and `G+0x47cc == 0` and (CAD `+0x13c == 0` or a CAD query is 0); else 1) and **`G+0x46d8` = laser type**.
-* `0x4682a9–0x468520`: `tempManu.ini` = `scFlie` with `count` then the manual cut-order indices (vector `[ebp-0x62c]`, elements via `0x42a4e0`, loop `0x4684b0–0x4684ed`) and finally `G+0x47c1` as an extra int (`0x4684ef–0x468508`).
+* `0x468179–0x4682a4`: `tempIsBreak.ini` = `scFlie` container (§4.0) with **two ints**: `isBreak` and **`G+0x46d8` = laser type**. *[verifier — the earlier condition was inverted]* `isBreak` (`0x468198–0x468227`) is **1 only when all hold**: `G+0x4380 == 0`, `state+0x148 == 0`, `G+0x47cc == 0` (idle), `state+0x13c != 0`, and `[frame+0x478]->vt+0x1b4() == 0`; otherwise 0. `state` = `0x59fe80()` = `view+0x1f58`, the break-point state object of §4.0 (its `+0x13c` is set to 1 by the break-point logic `0x43673c`/`0x43c4e5`/`0x43d5e3` and cleared by the reader `0x43c64c`). INFERENCE (medium-high): isBreak = "idle with a resumable break point".
+* `0x4682a9–0x468520`: `tempManu.ini` = `scFlie` with `count` then the manual cut-order indices (vector `[ebp-0x62c]`, elements via `0x42a4e0`, loop `0x4684b0–0x4684ed`) and finally `G+0x47c1` as an extra int (`0x4684ef–0x468508`, written as 0/1). *[verifier]* The written `count` is **`size + 1`** (`0x46848f–0x46849f`: `add ecx,1`), i.e. it counts the trailing flag. The vector comes from `[frame+0x478]->vt+0x198(&v1,&v2,&v3,G+0x47c1)` (`0x468357`); if that returns `< 1` the whole export aborts before any container is written (`0x46835f jge`, else cleanup `→0x4689b5`).
 
 Container (`0x468518`): `std::ofstream(path, binary)`; on failure logs `"Error opening output file!"` (`0x7db5e8`). Then, via `0x4689e0(ofs, sourcepath, marker)` (same body as §1.2's helper, including `remove(source)` afterwards):
 
@@ -168,7 +171,7 @@ Note the writer deletes `AutosaveParam1/2.ini` after appending (the helper's `re
 469cbf                 buf.clear()                                   (0x49c890)
 ```
 
-INFERENCE (high): sections are therefore delimited purely by the marker text; a marker string must not occur inside a payload (it cannot: payloads are `.chf`/XML/`scFlie` text). Order of sections in the file does not matter to the reader; missing optional sections (`TASK_PARAM_*`) are simply never flushed. The streams are `wchar_t`-based in binary mode (MSVC widens byte→wchar 1:1 in the "C" locale and narrows back), so bytes survive; the port should just treat the file as bytes.
+INFERENCE (high): sections are therefore delimited purely by the marker text; a marker string must not occur inside a payload (it cannot: payloads are `.chf`/XML/`scFlie` text). Order of sections in the file does not matter to the reader; missing optional sections (`TASK_PARAM_*`) are simply never flushed. The streams are `wchar_t`-based in binary mode (MSVC widens byte→wchar 1:1 in the "C" locale and narrows back), so bytes survive; the port should just treat the file as bytes. *[verifier]* Downgrade to INFERENCE medium: MainApp never calls `imbue`/`locale::global` on these streams, but `BCGCBPRO2210u100.dll` and `Dxf2Grp.dll` import `setlocale`, so the shared msvcr100 C locale at run time may be a DBCS code page, in which case the `wifstream`/`wofstream` pair performs a GBK→UTF-16→GBK round-trip (lossless for valid GBK text, not guaranteed for arbitrary bytes). The marker comparison works either way (markers are widened char-by-char, `0x4085f0`). Also: a failure to create an output file aborts the whole import (`0x469bba–0x469c5a`), and the matched pair's path is at entry `+0x1c` (`0x469b5c`).
 
 ### 2.4 Import handler `0x466f90` after extraction (EVIDENCE)
 
@@ -182,12 +185,12 @@ INFERENCE (high): sections are therefore delimited purely by the marker text; a 
 
 | VA (write) | value | function | when |
 |---|---|---|---|
-| `0x568365` | `NormalExit=0` | `0x566ee0` (the big init routine, 07 §start-up; called from `0x568b42` inside the poll handler `0x568a50` on first card connection) — preceded by the reads `XAxis`/`YAxis`/`ZAxis` (`0x567b7b/bc0/c05`, default 0) and `NormalExit` (`0x567c4a`, **default 1**) into `G+0x3ff8…` | **start-up**: marks "running / not yet cleanly closed" |
+| `0x568365` | `NormalExit=0` | `0x566ee0` (the big card-connect init routine: dongle state `dogState_*`, recovery prompts `mp18/mp19/mp21/mp119/mp151`; its only caller is `0x568b42` inside the poll handler `0x568a50`, taken when **`G+0x4310 != 0`** (`0x568b31`); `0x566ee0` clears `G+0x4310` at `0x566f22` — *[verifier]*: `G+0x4310` is also set to 1 by the Reconnect handler `0x48f2d0` and by `0x45a8e0`; its initial value was not traced) — preceded by the reads `XAxis`/`YAxis`/`ZAxis` (`0x567b7b/bc0/c05`, default 0) and `NormalExit` (`0x567c4a`, **default 1**) into `G+0x3ff8…` | **start-up**: marks "running / not yet cleanly closed" |
 | `0x459aa8` | `NormalExit=1` | `0x459820` = the main window's **destructor body** (logs `L"--- Exit Sys ---"` `0x7da348`; deleting-dtor wrapper `0x4594f0` calls it then `delete`); then `0x459ab4 call 0x45cf80` (axes), then `TerminateThread` ×3 on `G+0xf32c/f330/f334` | **normal close** |
-| `0x48f338` | `NormalExit=1`, then `Sleep(500)` | `0x48f260`, guarded by `IsNetworkAlive(&f) && f == 1 (NETWORK_ALIVE_LAN)` (`0x605e0a` thunk → IAT `IsNetworkAlive`); sets `G+0x4310 = 1` and `[this+0xf401] = 0`; callers `0x493316` (a ribbon command, `0x493300`) and `0x52df60` (state dispatcher `0x52df10`, when `[+0x1898] ∈ {0,0x3a,0x3d,0x3e,0x52}`) | **network-side exit** (INFERENCE medium: remote/HMI shutdown or app restart) |
+| `0x48f338` | `NormalExit=1`, then `Sleep(500)` | `0x48f260`, guarded by `IsNetworkAlive(&f) && f == 1 (NETWORK_ALIVE_LAN)` (`0x605e0a` thunk → IAT `IsNetworkAlive`); calls `[frame+0x46c]->vt+0x18` (CNCModule slot 6 `0x1002b3e0` → VM vt+4), sets `G+0x4310 = 1` and `[this+0xf401] = 0`; callers `0x493316` (`0x493300`, `ON_COMMAND(0x426a)`, sets `G+0x4356=1` first) and `0x52df60` (state dispatcher `0x52df10`, when `[+0x1898] ∈ {0,0x3a,0x3d,0x3e,0x52}`) | ~~network-side exit~~ **REFUTED [verifier]**: this is the **"硬件重连 Reconnect" (mf130, command 0xcf0b) handler** (A1 §`g+0x4356`). It does not exit; setting `G+0x4310` makes the next poll re-run `0x566ee0`, which writes `NormalExit=0` again. Side effect: while `G+0x4310 != 0`, `0x45cf80` skips the axis write. |
 | `0x45d183 / 1a5 / 1ca / 1ec` | `XAxis`, `YAxis`, `ZAxis`, `WAxis` | `0x45cf80`: skipped when `G+0x4310 != 0` (`0x45cfb6`); for each axis slot `G+0xba5c…` reads the card register `slot*10+2` through NC virtual `[+0x1a0](3, idx)` (`0x45d015–0x45d046`) and writes it as an integer string (`0x44a7e0`) — units 0.001 mm (01 §4, 08 §6.6 values 1020277/175510) | called from the destructor (`0x459ab4`), from `0x4e92c0` and `0x565640` (both = the "MCC <Offline>" / `mp22` connection-lost handlers, strings `0x4e9333`, `0x5656b3`) |
 
-INFERENCE (high) on 08 §9.14: the file captured on 2025-07-18 shows `NormalExit=0` because the poll handler wrote `0` at start-up and the last write (axes at 15:49:27.575, 145 ms after the last log line) came through `0x4e92c0/0x565640` (card connection lost) — a path that writes the axes **without** writing `NormalExit=1`. So `NormalExit=0` on disk means "the session ended by a card-disconnect/crash path, not through the destructor", exactly what 08 suspected; the port should write `0` at start and `1` only in its clean-exit path, and read it at start for the `mp18/mp19/mp21` recovery prompts (07 §12).
+INFERENCE (*[verifier] downgraded high → medium*: a process kill after a card-disconnect event produces the same file; nothing distinguishes the two statically) on 08 §9.14: the file captured on 2025-07-18 shows `NormalExit=0` because the poll handler wrote `0` at start-up and the last write (axes at 15:49:27.575, 145 ms after the last log line) came through `0x4e92c0/0x565640` (card connection lost) — a path that writes the axes **without** writing `NormalExit=1`. So `NormalExit=0` on disk means "the session ended by a card-disconnect/crash path, not through the destructor", exactly what 08 suspected; the port should write `0` at start and `1` only in its clean-exit path, and read it at start for the `mp18/mp19/mp21` recovery prompts (07 §12). *[verifier]* Precise semantics in the original: `NormalExit` is read with default **1** into `G+0x3ff8` (`0x567c4a/0x567c57`); `≠1` → `mp18` prompt path (`0x567c62`). It reads `1` on disk only after a destructor run, or after a Reconnect that never re-connected.
 
 ---
 
@@ -210,7 +213,7 @@ The four live paths are stored in the control-panel view (`CBCGPFormView` ctor `
 
 Log tags in the function: `L"GetCtGly"`, `L"InitCtData"`, `L"DeleteFile"`, `L"SaveIndex"` (`0x4369d5–0x436a11`). `0x436bd2 DeleteFileW([this+0x158])`, `0x436c1d open(mode 1)`, `0x436c61 writeInt(vector.size())` (`0x42f6c0`), loop `0x436c72–0x436cbb` `writeInt(vector[i])` (`0x42a4e0`), `0x436cc3 close()`. → `count` followed by `count` contour indices (sample: `24`, `0…23` — 03 §).
 
-Callers: `0x596530` (`0x596558`, guarded by `0x435e60`) ← `0x57ed75` in **`CManuPanel::OnStartBtn`** (`0x57eb40`, log string `0x57ef99`), `0x589e93` in **`CManuPanel::OnSimBtn`** (`0x589d20`, `0x589d58`), `0x59f001` in the pre-start routine `0x59ee50` (used by Start and by the `.enc` export); and `0x4368d3` (`0x436820` ← `0x4a7e8a`, the resume/restore path). So the file is (re)written at every **job start / simulation start / resume**, matching the 08 timing (`ManuContour.dat` 15:35:10.13, `autosave.chf` 15:35:10.17 = the same Start event; `autosave.chf` is written through `ICADModule::Save` with the path stored at `0x45907a`, 03 §).
+Callers: `0x596530` (`0x596558`, guarded by `0x435e60`) ← `0x57ed75` in **`CManuPanel::OnStartBtn`** (`0x57eb40`, log string `0x57ef99`), `0x589e93` in **`CManuPanel::OnSimBtn`** (`0x589d20`, `0x589d58`), `0x59f001` in the pre-start routine `0x59ee50` (*[verifier]*: called only by the `.enc` export, `0x462f21`); and `0x4368d3` (`0x436820` ← `0x4a7e8a`, the resume/restore path). So the file is (re)written at every **job start / simulation start / resume**, matching the 08 timing (`ManuContour.dat` 15:35:10.13, `autosave.chf` 15:35:10.17 = the same Start event; `autosave.chf` is written through `ICADModule::Save` with the path stored at `0x45907a`, 03 §).
 
 ### 4.2 `AutosaveParam1/2.ini` — writer `0x446c50`, a 100 ms timer (EVIDENCE)
 
@@ -223,15 +226,17 @@ Callers: `0x596530` (`0x596558`, guarded by `0x435e60`) ← `0x57ed75` in **`CMa
 446cd4  n = ds:0x9495ac ; (n & 1) == 0 ? path = [this+0x174] (AutosaveParam1.ini) : [this+0x190] (AutosaveParam2.ini)
 446d1e  open(mode 1)
 446d34  writeInt(n)                      ← global sequence number (0x9495ac)
-446d55  writeInt((int)(X * 1000.0))      ← 0x7d0ec8 = 1000.0 → µm (0.001 mm)
-446d76  writeInt((int)(Y * 1000.0))
+446d55  writeInt(round(X * 1000.0))      ← 0x7d0ec8 = 1000.0 → µm (0.001 mm); round = 0x4511d0
+446d76  writeInt(round(Y * 1000.0))
 446d82  writeInt(graphIdx)
 446d8e  writeInt(pointIdx)
 446d96  close()
 446da4  ds:0x9495ac += 1
 ```
 
-This settles 00 §7.2 disagreement 11 and 08 §9.8: field 1 is a **running sample counter**, not an index into `ManuContour.dat`; the two files alternate every 100 ms (even → 1, odd → 2), which is why the samples are 100 ms apart and one apart in value (`38`/`37`); the counter only resets with the process (static init), so values exceed the contour count. Fields: `n, X_µm, Y_µm, graphIdx, pointIdx` (03/01 readings confirmed). The reader `0x43c530` (used by resume and by `.aut` import) reads `Temp\` copies: `ManuContour.dat` (`0x43c668`), `AutosaveParam1.ini` (`0x43c95c`), `AutosaveParam2.ini` (`0x43cac5`).
+*[verifier]* `0x4511d0` is **round half away from zero**, not truncation: `x + sign(x)·0.5` (`sign` = `0x451210`, constant `0x7c4708` = 0.5) then `_ftol2` (`0x606c10`). The counter `ds:0x9495ac` has exactly three references (all in this function) and is incremented even when `open` fails (`0x446d28 je` skips the writes but not `0x446da4`); the timer is `timeSetEvent(100, [view+0x1ecc], 0x59ce00, view, TIME_PERIODIC)`.
+
+This settles 00 §7.2 disagreement 11 and 08 §9.8: field 1 is a **running sample counter**, not an index into `ManuContour.dat`; the two files alternate every 100 ms (even → 1, odd → 2), which is why the samples are 100 ms apart and one apart in value (`38`/`37`); the counter only resets with the process (static init), so values exceed the contour count. Fields: `n, X_µm, Y_µm, graphIdx, pointIdx` (03/01 readings confirmed). The reader `0x43c530` (used by resume and by `.aut` import) reads `ManuContour.dat` (`0x43c668`), `AutosaveParam1.ini` (`0x43c95c`), `AutosaveParam2.ini` (`0x43cac5`) — *[verifier]* from the `Temp\` copies **only when its argument ≠ 0** (`.aut` import via `0x45bca0`); with argument 0 it opens the live paths stored in the state object (`[this+0x158]`, …; `0x43c67b–0x43c6a5`).
 
 ### 4.3 `tempIsBreak.ini`, `tempManu.ini` — see §2.2 (writer) / §2.4 (reader). `File/Temp/tempIsBreak.ini` in the package is the last import's copy.
 
@@ -253,9 +258,9 @@ Writer **`0x49bfa0`** (single caller `0x56d0fe`):
   6. `L",%d"` `rec+0x38` (pierces);
   7. `L","` + `gp146` (`%d分%02d秒` / `%02dMin%02dSec`) with `t = rec+0x3c/10; t/60, t%60` (`0x49c479–0x49c4a6`);
   8. `L",%.2f Sec"` `rec+0x68`; 9. `L",%.2f Sec"` `rec+0x70`; 10. `L",%.2f Sec"` `rec+0x78` (cut / idle / pierce seconds, 08 §6.1 format B);
-* converted to a narrow string (`0x4a3cf0`) and written `ofs << row << std::endl` (`0x49c78e`, `0x49c798`).
+* converted to a narrow string (`0x4a3cf0`, via the LangModule `语言包` object vt+0x20) and written `ofs << row << std::endl` (`0x49c78e`, `0x49c798`). *[verifier]* The stream has no `ios::binary` (mode `0xa`), so `endl` → CRLF; the shipped `Report/TotalReport.txt` bytes are **UTF-8** (`e6 9c aa e5 91 bd e5 90 8d` = 未命名, `c3 97` = ×, `e5 88 86`/`e7 a7 92` = 分/秒) with CRLF — the converter emits UTF-8. `gp146` = `%d分%02d秒` (zh) / `%02dMin%02dSec` (en) from `Lang/lang.txt` (UTF-16LE), so the duration field is UI-language dependent.
 
-**Trigger (EVIDENCE):** `0x568a50` is the control panel's periodic **poll handler** (`GetTickCount` `0x568abb`; connection check → `0x565640` "MCC <Offline>"; first-connect init `0x566ee0` at `0x568b42`; `mf1001` "MCC hardware has changed" check). Inside its stop branch (`0x56cf02 cmp G+0xb320,0 ; jg skip` → the block that shows `mp26` 实际加工时间 "Actual processing time" and the `%d / %d` progress gauge) it does, when `G+0x4394` is non-empty (`0x414270` = size in 0x98 units, `0x56d08a jbe skip`): `rec+0x40 ← now`, `rec+0x48 += 1` (`0x56d0d6`), `0x5b3e80([this+0x1ec])`, then `0x49bfa0([this+0x1fc])`. INFERENCE (high): the row is appended once per **running→stopped transition** seen by the poll timer, whatever the reason (finished, Stop button, alarm) — consistent with 08 §6.2's "rows for 1-s runs". The numbers are the planner's estimates stored in the record at Start (the `.olpi` in §1.3 dumps the same record before any cutting).
+**Trigger (EVIDENCE):** `0x568a50` is the control panel's periodic **poll handler** (`GetTickCount` `0x568abb`; connection check → `0x565640` "MCC <Offline>"; first-connect init `0x566ee0` at `0x568b42`; `mf1001` "MCC hardware has changed" check). Inside its stop branch (`0x56cf02 cmp G+0xb320,0 ; jg skip` → the block that shows `mp26` 实际加工时间 "Actual processing time" and the `%d / %d` progress gauge) it does, when `G+0x4394` is non-empty (`0x414270` = size in 0x98 units, `0x56d08a jbe skip`): `rec+0x40 ← now`, `rec+0x48 += 1` (`0x56d0d6`), `0x5b3e80([this+0x1ec])`, then `0x49bfa0([this+0x1fc])`. *[verifier]* Full static guard of that branch: `G+0x47cc ∈ {2,4,6,0x13,0x14}` (`0x56cbcf–0x56cc0e`) **and** `view+0x1e74 == 0` **and** card `[view+0x1d8]->vt+0x6c() == 0x17` (`0x56cc48`) **and** `G+0x47cc == 2` (`0x56cc56`; others go to `0x56d1bd`) … **and** `G+0xb320 <= 0` (`0x56cf02`) **and** stats vector non-empty; afterwards `G+0x47cc := 0` unconditionally (`0x56d24b`), which makes it single-shot. INFERENCE (high): the row is appended once per **running→stopped transition** seen by the poll timer (card state 0x17 while software state is 2), whatever the reason (finished, Stop button, alarm) — consistent with 08 §6.2's "rows for 1-s runs". The numbers are the planner's estimates stored in the record at Start (the `.olpi` in §1.3 dumps the same record before any cutting).
 
 `LogReport.txt` (`0x490773`), `report.txt` (`0x490860`), `lang.txt` (`0x491704`) are written by the "Work Report [New]" viewer launcher (07 §11), not by this path.
 
@@ -264,8 +269,8 @@ Writer **`0x49bfa0`** (single caller `0x56d0fe`):
 ## 6. `\File\PM\p0.pmf` — SimplePLC flow (EVIDENCE) and recommendation
 
 * Path string `L"\File\PM\p0.pmf"` `0x8473b0` (pushed at `0x5a6605` in **`0x5a65b0`**); a second copy `0x7e5fb8` is unreferenced.
-* `0x5a65b0` = **the only writer**: `scFlie` `open(mode 1)` (`0x5a665b`), `writeInt(steps.size())` (`0x5a6686`, vector at `[this+0x1ac4]`, `0x448600`), then per step (`0x4b7430` = element i, stride 0x1c): `writeInt(step.type)` (`[eax]`, `0x5a66c4`) and `writeInt(step.param[k])` for k = 0..5 (`[eax+4+k*4]`, loop `0x5a66d5–0x5a6715`), `close()` (`0x5a67c2`). When `type == 4` (`0x5a672c`) it additionally bookkeeps a DO-port list in memory (`0x4b9ab0`/`0x4b99b0`) — nothing extra is written.
-* Step types: two static label arrays are built at start-up in `0x73bd20`: `[slp4, slp5, slp6, slp7, slp8, slp9, slp10, slp11, slp18]` and `[slp12, slp13, slp14, slp19]`. INFERENCE (high, index = type code):
+* `0x5a65b0` = **the only writer**: `scFlie` `open(mode 1)` (`0x5a665b`), `writeInt(steps.size())` (`0x5a6686`, vector at `[this+0x1ac4]`, `0x448600`), then per step (`0x4b7430` = element i, *[verifier: stride **0x24**, `imul eax,eax,0x24` @`0x4b743a`; size helper `0x448600` divides by 0x24]*): `writeInt(step.type)` (`[eax]`, `0x5a66c4`) and `writeInt(step.param[k])` for k = 0..5 (`[eax+4+k*4]`, loop `0x5a66d5–0x5a6715`), `close()` (`0x5a67c2`). When `type == 4` (`0x5a672c`) it additionally bookkeeps a DO-port list in memory (`G+0x3474`, `0x4b9ab0`/`0x4b99b0`) — nothing extra is written. *[verifier]* After `close()` the step vector is copied into **`G+0x4384[0]`** (16-byte elements, `0x601040`) and the dialog ends (`EndDialog(1)`); the dialog's init `0x5a6180` reloads the grid from `G+0x4384[0]`, so the flow persists for the session only. No other code references `G+0x4384` or `G+0x3474` (only these two functions plus ctor/dtor unwind thunks). Labels are indexed by `step.type` (`0x5a6276`, `imul edx,edx,0x1c` over the 28-byte CString array `0x9edf30`), event names by `step.p0` (`0x5a63cd`, array `0x9ee030`); switch on `type-2` via jump table `0x5a658c`.
+* Step types: two static label arrays are built at start-up in `0x73bd20`: `[slp4, slp5, slp6, slp7, slp8, slp9, slp10, slp11, slp18]` and `[slp12, slp13, slp14, slp19]`. EVIDENCE (index = type code, *[verifier]* confirmed at `0x5a6276–0x5a62d2`):
 
 | type | label (`lang.txt`) | params used |
 |---|---|---|
@@ -294,13 +299,13 @@ Writer **`0x49bfa0`** (single caller `0x56d0fe`):
 
 ## 8. `pwmCompensation.txt` / `Co2_pwmCompensation.txt` (EVIDENCE)
 
-`grep -rl -a -i pwmCompensation` over the whole package directory and the Wine prefix returns nothing except the two files themselves; `strings -a` and `strings -a -e l` of `MainApp.exe`, all `Module/*.dll` and every top-level DLL contain neither `pwmCompensation` nor any `*Compensation*.txt` name (the only `.txt` paths in MainApp are `\JumpAddTime.txt`, `\Report\LogReport.txt`, `\report.txt`, `\lang.txt`, `\Report\TotalReport.txt`, `//LanFormatEStr.txt`, `D:\seekEdge.txt`, `TestReport.txt`). `FiberScanFlyCompensateStr` appears only in `File/BkManuPara.xml`, `File/SecondBkManuPara.xml` and `1390backup.xml`. → **Not read at runtime.** INFERENCE (high): the vendor's hand-off tables from which `GRP.FiberScanFlyCompensateStr="100#0.35,…"` was typed (values differ slightly from the txt: 0.364 vs 0.35 — the XML is authoritative). Ship the two `.txt` files as reference/golden data only.
+`grep -rl -a -i pwmCompensation` over the whole package directory and the Wine prefix returns nothing except the two files themselves; `strings -a` and `strings -a -e l` of `MainApp.exe`, all `Module/*.dll` and every top-level DLL contain neither `pwmCompensation` nor any `*Compensation*.txt` name (the only `.txt` paths in MainApp are `\JumpAddTime.txt`, `\Report\LogReport.txt`, `\report.txt`, `\lang.txt`, `\Report\TotalReport.txt`, `//LanFormatEStr.txt`, `D:\seekEdge.txt`, `TestReport.txt`). ~~`FiberScanFlyCompensateStr` appears only in `File/BkManuPara.xml`, `File/SecondBkManuPara.xml` and `1390backup.xml`.~~ *[verifier — refuted]*: `MainApp.exe` contains UTF-16 `L"GRP.FiberScanFlyCompensateStr"` (file off `0x481ca4`, VA `0x882ea4`, pushed `0x79f7c9`) and `L"GRP.CO2ScanFlyCompensateStr"` (`0x882e38`, `0x79f882`), each registered under group `L"GraphParam"` with UI label `pd719_4` — the parameter is a normal UI-editable XML string, parsed by MainApp. (The `.txt` path list above also misses ASCII `\Log\Code.txt`.) → the **`.txt` files are not read at runtime** (EVIDENCE stands). *[verifier]* Value comparison: the txt tables equal `1390backup.xml` (CO2: all 6 pairs identical; fibre: 5/6 identical, `100,0.364` vs `100#0.34`), whereas the live `File/BkManuPara.xml` has different values in 5/6 fibre pairs (`0.35,0.59,0.82,1.02,1.26,1.48`) and 6/6 CO2 pairs (`0.22,0.3,0.57,0.71,0.85,0.94`). INFERENCE (medium): the txt files are the vendor's measured tables that were typed into the machine's XML (`1390backup.xml`) and later re-tuned in the UI; the live `BkManuPara.xml` is authoritative for the port, the txt files are reference data only.
 
 ---
 
 ## 9. `\File\logo.bmp` (EVIDENCE)
 
-`0x5a84e0` = `OnInitDialog` of the **splash dialog** (`CBCGPDialog::OnInitDialog` `0x5a8517`, layered window alpha 0x80 `0x5a87ea`): creates a static control and `LoadImageW(NULL, L"res\splash.bmp", IMAGE_BITMAP, 0,0, LR_LOADFROMFILE)` (`0x5a86bf–0x5a86c6`); then builds `<exe>\File\logo.bmp` (`0x5a86e4`), `PathFileExistsW` (`0x5a8738`) and, if present, creates a second static at rect (0x244,0x118)–(0x2da,0x1ae) = **(580,280)–(730,430), 150×150 px** and `LoadImageW(… logo.bmp …)` into it (`0x5a87a8`). Shipped `File/logo_1.bmp` (200×200 1-bit) is not that file name; the feature is an optional OEM logo on the splash. Port: optional; if the splash is reproduced, overlay `File/logo.bmp` when present.
+`0x5a84e0` = `OnInitDialog` of the **splash dialog** (`CBCGPDialog::OnInitDialog` `0x5a8517`, layered window `SetLayeredWindowAttributes(hwnd, crKey=0x808080, alpha=0x80, LWA_COLORKEY=1)` `0x5a87ea` — *[verifier]*: flag 1 = colour key only, so grey RGB(128,128,128) pixels are transparent and the 0x80 alpha is ignored): creates a static control and `LoadImageW(NULL, L"res\splash.bmp", IMAGE_BITMAP, 0,0, LR_LOADFROMFILE)` (`0x5a86bf–0x5a86c6`); then builds `<exe>\File\logo.bmp` (`0x5a86e4`), `PathFileExistsW` (`0x5a8738`) and, if present, creates a second static at rect (0x244,0x118)–(0x2da,0x1ae) = **(580,280)–(730,430), 150×150 px** and `LoadImageW(… logo.bmp …)` into it (`0x5a87a8`). Shipped `File/logo_1.bmp` (200×200 1-bit) is not that file name; the feature is an optional OEM logo on the splash. Port: optional; if the splash is reproduced, overlay `File/logo.bmp` when present.
 
 ---
 
@@ -333,4 +338,47 @@ Still needing the live machine (one step each):
 1. **`.enc` server acceptance** — capture the WinHTTP `POST /NexCut/File/LoadFile` exchange (07 §HTTP) with a real `.enc` to learn whether the server expects exactly these five sections; static analysis cannot see the consumer.
 2. **`G+0x48f4`** (7th `.olpi` line): change the suspected dialog field (the enum 0..9 at `0x4aaf4c…`) in the Windows UI, export an `.enc`, diff line 7.
 3. **`isBreak` semantics of `TASK_PARAM_*`**: export a `.aut` once while a job is paused and once idle; confirm the two extra sections appear only in the first (§2.2 flag logic).
-4. **`NormalExit`**: close MainApp normally once and compare `softPara.ini` (`=1` expected, §3) — confirms the destructor path on the real build.
+4. **`NormalExit`**: close MainApp normally once and compare `softPara.ini` (`=1` expected, §3) — confirms the destructor path on the real build. *[verifier]* Also press ribbon "硬件重连 Reconnect" once with the card attached: `NormalExit` should go `1` then back to `0` within one poll period.
+5. *[verifier]* **`.enc` export side effects**: with the card connected, export an `.enc` while logging the UDP link (08 capture setup); expect a stop-manu frame (NC slot 22) at the end and no FIFO frames; check `Report/TotalReport.txt` for a spurious row and `AutosaveParam*.ini` mtimes. Then press Start on a trivial job and confirm the head moves (rules out a stuck `G+0x46e0`).
+
+---
+
+## Verification notes
+
+Adversarial re-derivation, independent of the author's helper scripts: own annotator over `.scratch/asm/{MainApp,NCModule}.asm` resolving `.rdata` literals (ASCII/UTF-16) and the IAT parsed directly from the PE import directory; doubles decoded from file bytes (`0x7d0eb8`=0.001, `0x7d0ec8`=1000.0, `0x7c4708`=0.5); function boundaries recomputed by prologue scan; CNCModule vtable `0x1008a1c4` and VM vtable `0x1008bbc4` slots read from file bytes. 16 key facts / 9 closure claims checked.
+
+**Confirmed as written (bytes/instructions re-read):**
+* `.enc` writer `0x468fe0`: ofstream mode `0x20|2` (ctor `0x49cfd0` ORs `out`, `_Fiopen` wide path), five marker pushes `0x469129/46919a/46921a/46929a/46931a` in the stated order with their source names; helper `0x4693d0`: `operator!` → log `L"Error opening output file!"` (`0x7df450`) and skip (no marker), else `ostream<<streambuf*` (`0x46949a`), `<<string` (`0x4a07e0`), close, `remove()` (`0x469549`, path narrowed via the LangModule converter). `.aut` helper `0x4689e0` identical (`remove` `0x468b61`).
+* `.aut` writer order and the `[ebp-0x681]` gate at `0x46873f/0x468748`; reader `0x469590` pair table order, `get` loop, suffix compare `0x469b3d`, `write` `0x469ca8`, `clear` `0x469cbf`, break back to the read loop after a flush.
+* `_tempProcessInfo.olpi` fields and formats (`0x49ba91–0x49bb97`), `rec = G+0x4394.back()` (`0x463001–0x463014`), thumbnail path `0x49be79`.
+* `.olpf` record line arg order `+0x18,+0x16,+0x14,+0x12,+0x10,+0,+4,+8,+0xc` (`NC:0x10034afb–0x10034b31`); `G+0x46e0=1` at `0x462ed9`.
+* `CopyFileW(G+0x4104 → dir\_tempLayer.xml)` argument order (`0x4630d9–0x4630f7`); `G+0x4104 ← …\LayerPara.xml` (`0x4b0031`, `0x4b008c–0x4b0093`); other `G+0x4104` uses are reads.
+* NormalExit strings: `0x841dd0` = L"0", `0x7da3c8` = L"1", `0x7dd6a8` = L"1"; read with default 1 at `0x567c4a`; destructor `0x459820` (deleting dtor `0x4594f0`, vtable slot at `0x7de660`), axis writer `0x45cf80` (`slot*10+2`, `push 3`, `[frame+0x46c]->vt+0x1a0`, keys X/Y/Z/WAxis), callers `0x459ab4/0x4e9942/0x565cc2`.
+* Timer `timeSetEvent(0x64, …, 0x59ce00, view, 1)` at `0x56535e`; callback → `0x446c50(view+0x1f58)`; `cmp G+0x47cc,2`; parity select `0x446cda`; field order n, X, Y, graphIdx, pointIdx.
+* SaveIndex `0x4368e0` (DeleteFileW, open mode 1, size, loop, close) and callers `0x57ed75`, `0x589e93`, `0x59f001` via `0x596530` (guard `0x435e60`), `0x4368d3`.
+* `scFlie` class: `CreateFileW(GENERIC_WRITE, CREATE_ALWAYS)` / `_wfopen_s(L"wb")`, `"scFlie"`, `"%d\r\n"` via `sprintf_s`/`fprintf`, `"eof"`, flush/close.
+* TotalReport: `push 0x40; push 0xa; path` (`0x49bfe5–0x49bfe9`), field literals and offsets `+0x20,+0x28,+0x30·0.001,+0x34·0.001,+0x38,+0x3c/10/60,+0x68,+0x70,+0x78`, U+00D7 in `0x7de4ec`, `size/0x98` guard, single caller `0x56d0fe`.
+* `.pmf` writer (only xref of `L"\File\PM\p0.pmf"` 0x8473b0), 6-param loop; label arrays `slp4…slp11,slp18` / `slp12,13,14,19`; no `.pmf` anywhere on disk.
+* `calib.csv`: `[+0x1b8]` pair vector, `fopen_s("w+")`, `fprintf("%d, %d\n", e[0], e[1])` stride 8, `CreateProcessA("explorer.exe …\Help\")`.
+* `pwmCompensation` / `Co2_pwmCompensation`: byte search (ASCII and UTF-16LE, case-folded) over every file of the package and the NexCut Wine dir → 0 hits; not in `Pc_Software.zip` either.
+* `logo.bmp`: `PathFileExistsW` gate, rect (580,280)–(730,430), `SS_BITMAP|SS_CENTERIMAGE`, `LR_LOADFROMFILE`; `File/logo_1.bmp` 200×200 1-bpp, `res/splash.bmp` 1000×700 24-bpp.
+
+**Refuted / corrected (edited in place, marked *[verifier]*):**
+1. `.olpf` "`Size %d` … not on the export path" — **refuted**: on the last chunk (arg2≠0) slot 26 writes `Size N`, `fclose`s and sets `G+0x4701=1`, which the export progress dialog waits for; the file can hold several `Manu_Begin…Manu_End` blocks and is opened only when arg1≠0.
+2. `.aut` `isBreak` condition — **inverted** in the original text; it is 1 only when idle with a break point present (§2.2).
+3. `tempManu.ini` count is `size+1` (includes the trailing `G+0x47c1` flag); export aborts silently when the order query returns < 1.
+4. `0x48f260` "network-side exit" — **refuted**: it is the Reconnect (mf130) handler; `NormalExit=1` there is followed by re-init writing `0` again. `0x566ee0` runs whenever `G+0x4310≠0`, not only "on first connection".
+5. `.enc` uploader — incomplete: the bytes go by multipart `POST /NexCut/File/UploadGCode` in worker `0x407430`; `LoadFile` only names the file; IDNO = cancel flag.
+6. `0x59ee50` "used by Start and by the `.enc` export" — **refuted**: sole caller `0x462f21`. It sets `G+0x47cc=2`; the export then calls `OnStopBtn`, which (A1) sends stop-manu to a connected card. Export mode also zeroes the plan start XY; a cancelled export may leave `G+0x46e0=1` (INFERENCE medium).
+7. AutosaveParam X/Y are rounded half away from zero (`0x4511d0`), not `(int)` truncated.
+8. `0x43c530` reads `Temp\` copies only for arg≠0; resume uses live `File\` paths.
+9. `.pmf` step stride is 0x24 (not 0x1c); flow persists in `G+0x4384[0]` for the session. Recommendation "drop" unchanged.
+10. "`FiberScanFlyCompensateStr` appears only in XML" — **refuted**: both `GRP.*ScanFlyCompensateStr` keys are UTF-16 literals bound in MainApp (`pd719_4`, `GraphParam`). The txt tables match `1390backup.xml`, not the live `BkManuPara.xml` (differs in 11 of 12 pairs); the old "0.364 vs 0.35" remark compared the wrong file.
+11. Splash layered window uses `LWA_COLORKEY` (grey key), not alpha 0x80.
+12. `NormalExit=0` on the 2025-07-18 capture: downgraded to medium (a kill after disconnect is indistinguishable).
+13. `.aut` "bytes survive" downgraded to medium (DLLs import `setlocale`); new medium caveat on empty sections truncating `.enc`/`.aut` via `failbit`.
+14. TotalReport: added exact guard and on-disk encoding (UTF-8, CRLF; language-dependent `gp146`).
+
+**Not verified (left as the author stated):** `G+0x48f4` meaning (low); `.zpf` (§4.4); the `.aut` import layer-list path after `0x467746`; the post-container bookkeeping in the `.aut` writer (`0x46888f–0x4688ca`: `G+0x4394.back()` name ← chosen path, `0x45b2a0(...)`); card state `0x17` meaning; initial value of `G+0x4310`.
+
+**Verdict:** O14 and 99-gaps §4.1/4.2/4.8/4.9 remain **closed for file layout purposes** (a port can read/write every format from this document), but the report was **mostly solid with material errors** in behaviour descriptions (items 1, 2, 4, 6, 10 above). None of the formats drives motion directly; the safety-relevant finding is that the original `.enc` export is not side-effect-free (run-state 2, Stop to the card, possible stuck export mode) — the port should implement export as a pure file operation.

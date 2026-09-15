@@ -26,7 +26,7 @@ nexcut-mccd = "nexcut.mccd.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-nexcut = ["py.typed"]
+nexcut = ["py.typed", "core/schema.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

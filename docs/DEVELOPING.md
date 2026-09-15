@@ -21,10 +21,20 @@ curl -sSL https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
 
 ## Running the tests and linter
 
+Run from the repository root (`/home/karstein/phobicMlaserLinux`):
+
 ```sh
-.venv/bin/pytest
-.venv/bin/ruff check .
+.venv/bin/pip install -e '.[dev]'        # after pulling changes to pyproject.toml
+.venv/bin/ruff check src tests           # lint (CI runs `ruff check .`, tools/ is excluded)
+.venv/bin/ruff format --check src tests  # formatting (not enforced in CI yet)
+NEXCUT_SRC=/home/karstein/Documents/CF1390-250715-1084-0973/Mlaser-v0.0.0.52 \
+    .venv/bin/pytest -q                  # full suite incl. golden tests against SRC
+.venv/bin/pytest -q tests/test_mcc_simulator.py   # one file
 ```
+
+Expected on the owner's machine (2026-09-15): `325 passed` with `NEXCUT_SRC` set;
+without the vendor package (e.g. `NEXCUT_SRC=/nonexistent`, or CI) the SRC-dependent
+tests skip: `281 passed, 44 skipped`.
 
 Tests that compare against the original Windows package use the `src_dir`
 fixture from `tests/conftest.py`. It reads the environment variable
@@ -33,6 +43,38 @@ and skips the test when the directory does not exist, so CI stays green
 without the proprietary files. The package is read-only: never write into it,
 and never read it at import time. Golden numbers derived from it must be copied
 into the test source, never recomputed from the package at test time.
+
+## Command-line tools
+
+```sh
+.venv/bin/python -m nexcut.io.chf FILE.chf --json out.json --svg out.svg --check
+.venv/bin/python -m nexcut.io.chf FILE.chf --rewrite out.chf       # reader -> writer round trip
+.venv/bin/python -m nexcut.mcc.dissector Log/*.log --summary-only  # decode vendor logs / pcaps
+.venv/bin/nexcut-mccd                                              # driver daemon stub (M0)
+```
+
+## Module dependencies (mcc)
+
+The card-protocol layers are stacked; keep constants in the lowest layer that owns them
+and import upwards, never redefine:
+
+```
+crc -> framing -> registers -> commands -> safety
+                     \-> dissector ----------/
+framing + registers + commands + dissector -> simulator
+framing -> transaction
+model (glyph, graph, flatten) -> io.chf
+core.schema -> io.params
+```
+
+* Wire encoding/decoding (`encode_vector`, `read_reply`, CRC order) lives only in
+  `mcc/framing.py`; `transaction`, `simulator`, `safety` and `dissector` call it.
+* Register addresses, word maps and axis-slot/DO-bit tables live in `mcc/registers.py`;
+  `commands` takes `AXIS_SLOTS`, `do_bit`, `Status`, `SystemRW.K` from there.
+* Sub-command numbers (`CMD_*`, `MISC_*`, `FIFO_*`, `ABSOLUTE_BIT`) live in
+  `mcc/commands.py`; the simulator and the safety layer import them.
+* `io/chf.py` reads and writes the `nexcut.model` dataclasses; it has no private model.
+* `tests/test_integration_consistency.py` pins these relations.
 
 ## Layout
 

@@ -182,12 +182,18 @@ Each milestone has a gate that must pass on the simulator before hardware, and a
 
 ### M1 — "Hello machine": prove end-to-end control (smallest real-hardware step)
 Scope: connect over UDP, read version/status, decode positions, **jog one axis a few millimetres**, home. No laser, no job.
-1. Capture session first (§7 sessions A–C) so the jog/home vectors and units are confirmed, not inferred.
+1. Capture session first: the **M1-confirmation session** (`docs/analysis/11-static-findings.md` §7; replaces §6 sessions A–C). The jog/home/stop vectors and units are already recovered statically (§6.0); the capture confirms K, bit 31, the stop profile, firmware licence gating and limit polarity before the port drives an axis on its own.
 2. `mccd` v0: open socket, `READ 1000 n=2` (version ≥ `MinHardwareVer`), status poll, `READ 2000` positions, show alarm/DI/DO words raw.
-3. Jog: `0x65 ← [3, axis, 50000, 5999, 59990, target]` with `target = current + 5 000` (5 mm) at 50 mm/s; continuous jog `±4 000 000` with key-release stop; swallow exception 3 while moving (08 §4.5). Then home `[1, mask, 2, …]` with the captured speeds, X then Y, and verify the axis lands at the negative limit and backs off 22/15 mm.
-4. Minimal CLI/TUI (`nexcut-mccd --cli`): status line, jog keys, home, E-stop key = `stopFifo` + zero-velocity command (whatever the capture shows the Windows "Stop" sends).
+3. Jog / stop / home with the statically recovered vectors (`docs/analysis/11-static-findings.md` §2; A1). Units: speed and distance × K (K = reg 50017, expected 1000 → µm/s, µm), acceleration plain mm/s², jerk = 10·a. After connect, send `0x65 ← [9999, 5, 0, 0]` as the vendor does.
+   * **Step jog** X +5 mm at 50 mm/s: `0x65 ← [3, 0, 50000, 5999, 59990, 5000]`. Word 1 = axis-list index (0 X, 1 Y). The last word is a **relative** distance, not a target; bit 31 of word 1 would make it absolute.
+   * **Continuous jog**: `[3, i, 200000 | 50000, 5999, 59990, ±4 000 000]`, one command per key press (the vendor does not repeat it). On key release send the **stop** `[1, 1<<slot, 2, 2000, 20000]` (vd = clamp(JogStopDccFactor·100000/(v/K), 2000, 0.4·FCP.MaxAcc)).
+   * **Stop all** (E-stop key, watchdog): `0x67 ← [3]` while the FIFO runs, otherwise `[1, 0x1F, 2, 2000, 20000]`, then `[101]` (ZF stop, ZFType=1). Then explicitly switch DO9/PWM/gas off: the vendor's idle stop branch does not.
+   * **Home** one axis at a time: `[2, 1<<slot, 0]` (X `[2,1,0]`, then Y `[2,2,0]`). Speeds and back-off are card parameters (50200 block), so none are sent. Verify the axis reaches the negative limit, backs off 22/15 mm, and axis-status bit 15 (homed) sets.
+   * Expect exception 3 on commands sent while an axis moves. The card's jog/move builders act only when runStatus == 0.
+   * *(Superseded: the earlier `target = current + 5 000` and `home [1, mask, 2, …]`. Sub-command 1 is STOP, 2 is HOME.)*
+4. Minimal CLI/TUI (`nexcut-mccd --cli`): status line decoded per 11-static-findings §4 (DI/DO bits, alarm_1 bit 30 E-stop, alarm_2 bit 5 FIFO starvation, axis status bits 0–5/15), jog keys, home, E-stop key = the stop-all sequence of step 3.
 * Gate: repeatable 100 mm X move measured with a ruler within 0.1 mm; homing repeatable; no exception other than 3-while-moving; position registers match `softPara.ini` semantics (0.001 mm).
-* Resolves: O1 (unit of position), O3, part of O2 (DI word vs limit switches, O8).
+* Resolves (confirms): O3, O6 firmware half (jog without licence exchange), part of O2 (DI word vs limit switches, O8); the M1-confirmation capture of 11-static-findings §7 replaces sessions A–C.
 
 ### M2 — File load and render
 * DXF via ezdxf, `.chf` v4/v5, PLT, G-code → model; canvas with layers, start points, direction arrows, index numbers; measurement tool; open/save `.chf` (byte-identical re-save).
@@ -237,20 +243,46 @@ Scope: connect over UDP, read version/status, decode positions, **jog one axis a
 
 ## 6. Exact next investigative steps (ordered)
 
+### 6.0 Static sprint result (2026-09-15)
+
+The static sprint (`docs/analysis/11-static/A1..A8`, consolidated in `docs/analysis/11-static-findings.md`) recovered from the binaries alone:
+* the full 0x65 command vocabulary (stop / home / jog / go-to / DO / DA / ZF, with units);
+* the block-1000 / axis-status / alarm bit maps and the alarm-code → text scheme;
+* the complete FIFO item grammar (pulse ticks, X low half, ZF records, DO bit rule, frame id = reg 1015 + 1, 300-word flush);
+* the licence block (59500–59511, disjoint from everything the port writes);
+* the planner parameter map;
+* every file container (`.enc`, `.aut`, `scFlie`, NormalExit, TotalReport);
+* the PHB02 pendant protocol.
+
+Status: O2, O3, O4, O7, O10, O12–O15, O18 and the Stop/Pause/E-stop vectors are CLOSED (static). O1, O5, O6, O8, O9, O11, O16 and block 5000 are NARROWED to named live steps. Resume-after-pause and `[9999,16]` are OPEN. O17 is a non-goal.
+
+For the CO2 path, captures change from *discovery* to *confirmation*. One combined **M1-confirmation session** (11-static-findings §7, 10 steps) settles:
+* K and the bus cycle (reg 50017/50005);
+* block 5000;
+* firmware licence gating;
+* bit 31 = absolute;
+* the stop profile and the home vector;
+* limit polarity;
+* the card tick period and reg-1016 units;
+* the Continue path;
+* exception 2/3.
+
+It replaces sessions A–D and most of E/F below. The three most consequential corrections to 00/04/08: sub-cmd 1 = STOP, 2 = HOME, jog distances relative; 103/109 are ZF moves, not dwells, and ticks are motor pulses; register 150 is an FTC key register, not the licence switch (DENY either way).
+
 1. **Prepare the capture rig.** Linux laptop NIC on `10.1.1.10/24` (`nmcli con add type ethernet ifname <nic> ipv4.method manual ipv4.addresses 10.1.1.10/24 ipv4.never-default yes`). Run the Windows tool under Wine from `~/.wine/drive_c/Mlaser` (works: `winetricks mfc42`, 10) **or** on the machine's Windows PC with a mirrored switch port / `tcpdump` on a bridge. Set `EnableLog=1` in `File/ipAdd.ini [Soft]` so `%LOCALAPPDATA%\NexCut\Log\<date>.log` also records `Send Cmd:/Recv Cmd:` with timestamps (04 §9).
 2. **Capture filter:** `tcpdump -i <nic> -s 0 -w mlaser-<session>.pcap 'host 10.1.1.168 or host 10.1.1.169 or host 10.1.1.170'` (UDP and TCP; ports 502, 999, 888, 666, 10001). Block `47.104.17.21` and any `:8080` at the firewall.
 3. **Sessions to record** (each with a written note of what was clicked and the parameter values in force):
-   * A. Idle start-up with the card on → handshake `9999,13`, version, licence exchange, 59600+ parameter reads, poll cadences (closes O5 cadence, O6 addresses).
-   * B. Jog each axis, step 1/10/100 mm and continuous, slow and fast; the W lifting-table up/down; "go to point" → O3, O7 (which 2000-slot moves), units.
-   * C. Home X only, Y only, all; press each limit switch by hand with the machine stopped and read DI → O8, O2 bits.
-   * D. Toggle every output from the hardware-test page (gas valves, laser enable, red light, alarm lamp), set DA2 pressure → `9999,2/4` channel/mask encoding (O4).
-   * E. Dry run, then a real cut of a 100 mm line at 100 mm/s and 20 mm/s, one square with two layers (different duty/frequency), one with a cool point and a micro-joint → tick/unit (O1), opcode semantics (O4), PWM records, prologue/epilogue.
-   * F. Trigger a soft-limit stop, an E-stop, pause/resume, stop mid-cut → stop commands, alarm bits, break-point files.
-   * G. (fibre selected) FTC calibration, follow, one pierce → port 999 (O9); laser IO (O10).
-   * H. Save parameters, export technology, save `.chf` with lead-in/compensation/reverse toggled → O11, O13, O14 diffs.
+   * A. **[confirmation-only]** Idle start-up with the card on → connect prologue `[9999,5,0,0]` (the "handshake `9999,13`" was an extended-DO write, 11-static-findings §2.1), version, 50000/26 (K word 17, bus cycle word 5), 59600+ parameter reads, poll cadences (O5 cadence; O6 addresses are already known statically: 59500–59511).
+   * B. **[confirmation-only]** Jog each axis, step 1/10/100 mm and continuous, slow and fast; the W lifting-table up/down; "go to point" → confirms O3 vectors/units and O7 (slot 4 = lift). Only discovery left here: Y2 dual-drive tracking (reg 2022).
+   * C. **[confirmation + one bench discovery]** Home X only, Y only (all-axis home is not needed); press each limit switch by hand with the machine stopped and read DI + axis status → **O8 polarity (still discovery)**, O2 bits (confirmation).
+   * D. **[confirmation-only]** Toggle every output from the hardware-test page (gas valves, laser enable, red light, alarm lamp), set DA2 pressure → confirms `9999,2` mask/value and `9999,4` channel−1/mV encoding (O4).
+   * E. **[still required, reduced]** Dry run, then a real cut of a 100 mm line at 100 mm/s and 20 mm/s, one square with two layers (different duty/frequency), one with a cool point and a micro-joint → **card tick period and reg-1016 units (O1, discovery)**. Unit = pulses, packing, frame id, prologue/epilogue and opcode encoding are confirmation-only.
+   * F. **[still required for Continue]** Trigger a soft-limit stop, an E-stop, pause/resume, stop mid-cut → stop vectors, E-stop bit 30, break-point files are confirmation-only; **how Continue resumes a paused job (N2) is discovery**.
+   * G. **[still discovery, fibre only]** (fibre selected) FTC calibration, follow, one pierce → in-stream fibre pierce/ZF records, ZF status units and 10000+2i addressing (O9); DO5/DA1 timing (O10). Port 999 is no longer a target (EC endpoint, never opened).
+   * H. **[mostly confirmation, Wine only]** Save parameters, export technology, save `.chf` with lead-in/compensation/reverse toggled → O13/O14 and most of O11 confirmation; text/spline/type-12 craft flags are still discovery.
 4. **Dissect** with `mcc/dissector.py`; write findings into `docs/analysis/11-capture-findings.md`, update `mcc/registers.py` and the simulator.
 5. **Bench-check without the Windows tool** (after A–C are dissected): run M1's script against the real card with the gantry mid-bed.
-6. **Static follow-ups** in parallel: MainApp caller of the `CCADModule` planner wrapper (O12); alarm decoder for `gp1–32` (O15); `.enc` writer (O14).
+6. **Static follow-ups**: done in the static sprint (O12 A6, O15 A2, O14 A7). Remaining static leads: the MainApp Continue path after Pause (N2), the gating of `[9999,16]` (A3), the `CAD slot 21` tool selector for PWM/cool-point tools (A6 V11).
 
 ---
 
@@ -283,10 +315,29 @@ Scope: connect over UDP, read version/status, decode positions, **jog one axis a
 * **Dry-run mode** = the original's 空走: same planner, same stream, duty 0, laser-enable never asserted — this is what M4 runs on the machine.
 * **Simulate mode** = stream to `mcc/simulator.py` only; the UI shows the same status.
 * **PC-side soft limits always enforced** from `SoftLimitMaxLen` regardless of `MS.EnableSoftLimit`, on every jog target and on the planned path (`mv31 graphic larger than machine range`); refuse to stream until homed.
-* **Watchdog:** if the status poll of block 1000 fails for > 1 s during a job → `stopFifo` (0x67 ← 3) + disarm; on any card alarm word ≠ 0 → stop + disarm.
-* **Register write allow-list:** 0x65, 0x66, 0x67 only until the RW blocks are capture-verified; never 150/151, 59600+ licence-adjacent areas, or anything unnamed. Every write is logged with the frame bytes.
-* **Deadman for continuous jog:** repeat the jog command only while the key event is fresh (< 200 ms); otherwise send the stop form observed in capture F.
-* **E-stop:** the machine's hard-wired E-stop is the primary; the UI E-stop sends stop + disarm and stays latched until acknowledged (`mp124`).
+* **Watchdog:** if the status poll of block 1000 fails for > 1 s during a job → `stopFifo` (0x67 ← 3) + disarm; on any card alarm word ≠ 0 → stop + disarm. Priority and bit meanings are in 11-static-findings §4.7 (1006 bit 30 E-stop, bits 25/26 bus/output fault, bits 0–23 axis faults with 2000+10·slot bits 0–5, 1007 bits 0–5 incl. FIFO starvation, 1031 == 1 restart required, DI alarms via NO/NC with port 0 = disabled).
+* **Register write allow-list** (full table: `docs/analysis/11-static-findings.md` §3; A4 §3, A2 §4). Every write is checked before framing and logged with its bytes.
+  * **ALLOW:**
+    * `0x65` sub-cmd **1** stop (always, the safety primitive), **2** single-axis home, **3** jog on slots 0/1, **5** go-to (after homing);
+    * `[9999,5,0,0]` connect prologue;
+    * `[9999,2,mask,val]` DO per arming state (DO9 / laser gate only in `LASER_ARMED`);
+    * `[101]` ZF stop;
+    * `0x66` FIFO frames (dry run: duty 0, no DO9 / PWM-set records);
+    * `0x67` 1/2/3.
+  * **DENY:**
+    * **150** (5555 = FTC factory reset, 9999 = FTC commit) and **151**;
+    * **59500–59599** (licence data area and card RTC; reads too);
+    * 59600+ hardware-parameter writes (read-compare only);
+    * 11000+2k FTC property writes;
+    * `100 ← 9999`;
+    * 5000–5012 writes;
+    * 200/201;
+    * `0x65` `[102]`, `[107]`, `[117…]`, `[118…]`, out-of-FIFO `[103/104/109…]`, `[9999,13…]`, `[9999,16]`, `[9999,1…]`, `[7]`, `[4…]`, system home, lift-table and roll-feeder moves (until M3/M5);
+    * func 0x26;
+    * anything unnamed.
+  * Reads of 1000/2000/60001/50000/50200/1050/10000/11000/59600+ are allowed. `READ 5000/9` is a diagnostic only.
+* **Deadman for continuous jog:** the card jog is a single relative command (±4 000 000 µm). The port sends the per-axis stop `[1, 1<<slot, 2, vd, 10·vd]` when the key event goes stale (> 200 ms), on key release, on pendant read error / hidraw removal / 1.04 s pendant silence (the vendor has no key-up there, A8), and on focus loss (the vendor stops jogs on `WM_ACTIVATE` inactive).
+* **E-stop:** the machine's hard-wired E-stop is the primary. The card reports it as alarm word 1006 bit 30. The UI E-stop sends the stop-all sequence (`0x67←3` or `[1,0x1F,2,vd,10·vd]`, `[101]`, DO9/PWM/gas off), disarms, and stays latched until acknowledged (`mp124`). Read block 5000 once (diagnostic) to see whether the card has its own e-stop input configured.
 
 ### 8.3 Performance gates (Python risk R8)
 * Streaming jitter test against the simulator with a tick of 250 µs and 1 ms: 10-minute job, the queue depth must never fall below `FifoAlarmNum=30` items while the UI is stress-rendering a 50 k-entity drawing; p99 frame interval < 100 ms, max < 500 ms. Fail → move `mccd` to Rust/C++.

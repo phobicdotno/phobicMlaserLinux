@@ -24,11 +24,16 @@ Structure (everything except :class:`CursesKeys` / :class:`CursesScreen` runs he
     stops the axis;
   - *status* - ``subscribe`` stream (11 §4 decoded snapshot of :mod:`nexcut.mccd.status`).
 
-* **Controller** - :class:`TuiController` maps keys to requests and runs the
+* **Controller** - :class:`TuiController` maps keys to requests through the data-driven
+  :data:`KEY_BINDINGS` table (``?`` shows it as an overlay, :func:`help_lines`) and runs the
   continuous-jog deadman (below). :func:`format_status` renders a snapshot as text lines
   (shared with ``nexcut-mccd status``).
 
-Continuous jog (Shift+arrow or H/J/K/L): a terminal delivers no key-release event, only
+Key safety (docs/DECISIONS.md D11): curses cannot see Caps Lock, so every printable key is
+bound in both cases and **no letter key starts motion** - jogs are arrow keys and
+Shift+arrow only. Homing is a two-key confirmation (``h`` then ``x`` / ``y``).
+
+Continuous jog (Shift+arrow only, docs/DECISIONS.md D11): a terminal delivers no key-release event, only
 auto-repeat. The jog is started on the first key (V1 ``[3, i, v, a, 10a, ±d]``, 11 §2) and
 kept alive while repeats arrive. Before the first repeat the window is
 :attr:`TuiOptions.initial_hold_s` (must exceed the terminal auto-repeat delay), after it
@@ -62,12 +67,15 @@ from nexcut.mccd.ipc import IpcError, MccdClient
 
 __all__ = [
     "AXIS_BY_NAME",
+    "BINDINGS_BY_MODE",
     "DISPLAY_AXES",
+    "KEY_BINDINGS",
     "KEY_NAMES",
     "STEP_SIZES_MM",
     "CursesKeys",
     "CursesScreen",
     "IpcBackend",
+    "KeyBinding",
     "KeySource",
     "Lane",
     "RecordingScreen",
@@ -76,7 +84,9 @@ __all__ = [
     "ScriptedKeys",
     "TuiController",
     "TuiOptions",
+    "binding_for",
     "format_status",
+    "help_lines",
     "parse_axis",
     "run_curses",
     "run_loop",
@@ -102,33 +112,125 @@ KEY_NAMES: frozenset[str] = frozenset(
      FOCUS_IN, FOCUS_OUT, RESIZE, UNKNOWN}
 )  # fmt: skip
 
-_STEP_KEYS: dict[str, tuple[int, bool]] = {
-    LEFT: (0, False),
-    RIGHT: (0, True),
-    UP: (1, True),
-    DOWN: (1, False),
-    PGUP: (4, True),
-    PGDN: (4, False),
-}
-"""Step jog keys -> (slot, positive). Up = Y+ and PgUp = W+ are UNVERIFIED physical
-directions (the V9 lift sign is not tied to "up" by evidence, 11 §2 V9)."""
-_CONT_KEYS: dict[str, tuple[int, bool]] = {
-    S_LEFT: (0, False),
-    S_RIGHT: (0, True),
-    S_UP: (1, True),
-    S_DOWN: (1, False),
-    "H": (0, False),
-    "L": (0, True),
-    "K": (1, True),
-    "J": (1, False),
-}
-"""Continuous jog keys (Shift+arrows; vi-style H/J/K/L for terminals without them)."""
+# ------------------------------------------------------------------------------ key table
+#
+# docs/DECISIONS.md D11: **no single letter key may start motion.** Curses cannot see the
+# Caps Lock state, so a letter binding is really a binding of both cases; the vi-style
+# H/J/K/L continuous-jog keys therefore turned the lowercase menu key 'h' into a 20 mm/s
+# jog X- (safety review R7). Motion in normal mode is bound to arrow keys and Shift+arrow
+# only. The home menu keeps letter keys, but they are reachable only after the explicit
+# 'h' that opens the menu and they are shown in the prompt - a two-key confirmation, not a
+# single keystroke. The invariants are asserted by
+# tests/test_mccd_cli_tui.py::test_key_table_has_no_case_or_motion_trap.
 
-_ESTOP_KEYS = frozenset({ESC, "e", "E"})
-_STOP_KEYS = frozenset({" ", "s", "S"})
-_DISARM_KEYS = frozenset({"d", "D"})
-"""Stop, E-stop and disarm keys accept both cases: with Caps Lock on, a lowercase stop key
-arrives uppercase and must still stop (PORT-PLAN §8.2 "stop keys win")."""
+MODE_NORMAL, MODE_HOME, MODE_READ, MODE_HELP = "normal", "home", "read", "help"
+GLOBAL = "global"
+"""Pseudo-mode of the keys that win in every mode (PORT-PLAN §8.2: stop keys)."""
+
+
+@dataclass(frozen=True, slots=True)
+class KeyBinding:
+    """One row of :data:`KEY_BINDINGS`: which keys, in which mode, do what."""
+
+    keys: tuple[str, ...]
+    """Key names as :func:`tokenize` delivers them. A printable key must be listed in both
+    cases, so Caps Lock cannot change what a key does."""
+    action: str
+    """Stable identifier dispatched by :meth:`TuiController.handle_key`."""
+    label: str
+    """Key spelling shown in the help overlay."""
+    what: str
+    """One-line description shown in the help overlay."""
+    mode: str = MODE_NORMAL
+    motion: bool = False
+    """True if this binding can put an axis in motion."""
+    arg: Any = None
+    """``(slot, positive)`` for jogs, the slot list for homing, ±1 for the step size."""
+
+
+KEY_BINDINGS: tuple[KeyBinding, ...] = (
+    # -- stop keys win in every mode (PORT-PLAN §8.2), in both cases (safety review R7)
+    KeyBinding((ESC, "e", "E"), "estop", "Esc / e", "E-STOP (latches until a)", mode=GLOBAL),
+    KeyBinding((" ", "s", "S"), "stop", "space / s", "STOP", mode=GLOBAL),
+    # -- normal mode, no motion
+    KeyBinding(("m", "M"), "arm", "m", "arm motion (needed before any move)"),
+    KeyBinding(("d", "D"), "disarm", "d", "disarm (stops first)"),
+    KeyBinding(("a", "A"), "ack_estop", "a", "acknowledge the E-stop latch"),
+    KeyBinding(("h", "H"), "home_menu", "h", "home menu: then x / y (never a jog, D11)"),
+    KeyBinding(("r", "R"), "read_block", "r", "read a register block ADDR/N"),
+    KeyBinding(("?",), "help", "?", "this key list"),
+    KeyBinding(("q", "Q"), "quit", "q", "quit (the daemon keeps running)"),
+    KeyBinding(("[",), "step_size", "[", "smaller step size", arg=-1),
+    KeyBinding(("]",), "step_size", "]", "larger step size", arg=+1),
+    # -- normal mode, motion: arrow keys only (D11). Up = Y+ and PgUp = W+ are UNVERIFIED
+    #    physical directions (the V9 lift sign is not tied to "up" by evidence, 11 §2 V9).
+    KeyBinding((LEFT,), "step_jog", "left", "step X-", motion=True, arg=(0, False)),
+    KeyBinding((RIGHT,), "step_jog", "right", "step X+", motion=True, arg=(0, True)),
+    KeyBinding((UP,), "step_jog", "up", "step Y+", motion=True, arg=(1, True)),
+    KeyBinding((DOWN,), "step_jog", "down", "step Y-", motion=True, arg=(1, False)),
+    KeyBinding((PGUP,), "step_jog", "PgUp", "step W+ (lift table)", motion=True, arg=(4, True)),
+    KeyBinding((PGDN,), "step_jog", "PgDn", "step W- (lift table)", motion=True, arg=(4, False)),
+    KeyBinding((S_LEFT,), "cont_jog", "Shift+left", "hold: jog X-", motion=True, arg=(0, False)),
+    KeyBinding((S_RIGHT,), "cont_jog", "Shift+right", "hold: jog X+", motion=True, arg=(0, True)),
+    KeyBinding((S_UP,), "cont_jog", "Shift+up", "hold: jog Y+", motion=True, arg=(1, True)),
+    KeyBinding((S_DOWN,), "cont_jog", "Shift+down", "hold: jog Y-", motion=True, arg=(1, False)),
+    # -- home menu (entered with 'h'; every other key cancels it)
+    KeyBinding(("x", "X"), "home_axis", "x", "home X", mode=MODE_HOME, motion=True, arg=(0,)),
+    KeyBinding(("y", "Y"), "home_axis", "y", "home Y", mode=MODE_HOME, motion=True, arg=(1,)),
+    KeyBinding(
+        ("b", "B"), "home_axis", "b", "home X then Y (only with --allow-home-all)",
+        mode=MODE_HOME, motion=True, arg=(0, 1),
+    ),  # fmt: skip
+)
+"""The complete key table. ``nexcut-mccd tui`` binds nothing that is not listed here."""
+
+
+def _bindings_by_mode() -> dict[str, dict[str, KeyBinding]]:
+    out: dict[str, dict[str, KeyBinding]] = {}
+    for b in KEY_BINDINGS:
+        table = out.setdefault(b.mode, {})
+        for k in b.keys:
+            if k in table:  # pragma: no cover - a coding error, caught at import
+                raise AssertionError(f"key {k!r} bound twice in mode {b.mode}")
+            table[k] = b
+    return out
+
+
+BINDINGS_BY_MODE: dict[str, dict[str, KeyBinding]] = _bindings_by_mode()
+"""``mode -> key -> binding``; ``GLOBAL`` holds the keys that win in every mode."""
+
+
+def binding_for(key: str, mode: str) -> KeyBinding | None:
+    """The binding of ``key`` in ``mode``, global keys first (None if unbound)."""
+    b = BINDINGS_BY_MODE[GLOBAL].get(key)
+    return b if b is not None else BINDINGS_BY_MODE.get(mode, {}).get(key)
+
+
+def help_lines(*, allow_home_all: bool = False) -> list[str]:
+    """The key table as text (help overlay and ``?``)."""
+    out = ["KEYS (docs/DECISIONS.md D11: only arrow keys and Shift+arrow start a jog)"]
+    groups = (
+        (GLOBAL, "always"),
+        (MODE_NORMAL, "normal"),
+        (MODE_HOME, "home menu (press h first)"),
+    )
+    for mode, title in groups:
+        out.append(f"-- {title} --")
+        for b in KEY_BINDINGS:
+            if b.mode != mode:
+                continue
+            if b.action == "home_axis" and b.arg == (0, 1) and not allow_home_all:
+                continue
+            out.append(f"  {b.label:<12} {b.what}")
+    out.append("-- read prompt (press r first) --")
+    out.append("  digits / ,  address and count, Enter reads, q cancels")
+    return out
+
+
+_STEP_KEYS: dict[str, tuple[int, bool]] = {
+    k: b.arg for b in KEY_BINDINGS if b.action == "step_jog" for k in b.keys
+}
+"""Step jog keys -> (slot, positive), derived from :data:`KEY_BINDINGS`."""
 
 
 def parse_axis(text: str) -> int:
@@ -690,21 +792,21 @@ class TuiController:
     # -- keys
 
     def handle_key(self, key: str, now: float | None = None) -> None:
-        """Process one key (see the help lines of :meth:`lines`)."""
+        """Process one key through :data:`KEY_BINDINGS` (press ``?`` for the overlay)."""
         now = self.clock() if now is None else now
-        # Stop keys win in every mode (PORT-PLAN §8.2).
-        if key in _ESTOP_KEYS:
+        b = binding_for(key, self.mode)
+        # 1. Stop keys win in every mode (PORT-PLAN §8.2), in both cases (D11).
+        if b is not None and b.mode == GLOBAL:
             self._cancel_motion_tracking()
-            self.mode = "normal"
-            self._urgent("estop")
-            self._say("E-STOP sent (latched; press A to acknowledge)", error=True)
+            self.mode = MODE_NORMAL
+            if b.action == "estop":
+                self._urgent("estop")
+                self._say("E-STOP sent (latched; press a to acknowledge)", error=True)
+            else:
+                self._urgent("stop")
+                self._say("stop sent")
             return
-        if key in _STOP_KEYS:
-            self._cancel_motion_tracking()
-            self.mode = "normal"
-            self._urgent("stop")
-            self._say("stop sent")
-            return
+        # 2. Terminal events.
         if key == FOCUS_OUT:
             self.step_refresh = None
             if self.cont is not None:
@@ -714,50 +816,56 @@ class TuiController:
             return
         if key in (FOCUS_IN, RESIZE):
             return
+        # 3. The help overlay swallows the next key.
+        if self.mode == MODE_HELP:
+            self.mode = MODE_NORMAL
+            return
+        # 4. A running continuous jog: its own key keeps it alive, any other releases it.
         if self.cont is not None:
             if key == self.cont.key:
                 self.cont.last_key_t = now
                 self.cont.repeats = True
                 return
             self._release_cont("other key")
-            if key in _CONT_KEYS:
+            if b is not None and b.action == "cont_jog":
                 return  # direction change: the new jog needs a fresh READY state (D8)
-        if key == "A":
-            self._urgent("ack_estop")
-            self._say("E-stop acknowledge sent")
+        # 5. Modes.
+        if self.mode == MODE_HOME:
+            self._home_menu_key(key, b)
             return
-        if self.mode == "home":
-            self._home_menu_key(key)
-            return
-        if self.mode == "read":
+        if self.mode == MODE_READ:
             self._read_prompt_key(key)
             return
-        self._normal_key(key, now)
+        self._normal_key(key, b, now)
 
-    def _normal_key(self, key: str, now: float) -> None:
+    def _normal_key(self, key: str, b: KeyBinding | None, now: float) -> None:
         o = self.options
-        if key == "q":
+        if b is None:
+            if key not in (ENTER, UNKNOWN):
+                self._say(f"key {key!r} not bound (? = key list)")
+            return
+        if b.action == "quit":
             self.quit = True
-        elif key == "m":
+        elif b.action == "arm":
             if self._command("arm_motion"):
                 self._say("arm motion requested")
-        elif key in _DISARM_KEYS:
+        elif b.action == "disarm":
             self.step_refresh = None
             self._urgent("disarm")
             self._say("disarm sent")
-        elif key in _STEP_KEYS:
-            slot, positive = _STEP_KEYS[key]
+        elif b.action == "ack_estop":
+            self._urgent("ack_estop")
+            self._say("E-stop acknowledge sent")
+        elif b.action == "step_size":
+            self.step_index = max(0, min(len(STEP_SIZES_MM) - 1, self.step_index + int(b.arg)))
+            self._say(f"step size {self.step_mm:g} mm")
+        elif b.action == "step_jog":
+            slot, positive = b.arg
             mm = self.step_mm if positive else -self.step_mm
             if self._command("jog_step", slot=slot, mm=mm, speed=o.step_speed_mm_s):
                 self._say(f"step {_axis_name(slot)} {mm:+g} mm @ {o.step_speed_mm_s:g} mm/s")
-        elif key == "[":
-            self.step_index = max(0, self.step_index - 1)
-            self._say(f"step size {self.step_mm:g} mm")
-        elif key == "]":
-            self.step_index = min(len(STEP_SIZES_MM) - 1, self.step_index + 1)
-            self._say(f"step size {self.step_mm:g} mm")
-        elif key in _CONT_KEYS:
-            slot, positive = _CONT_KEYS[key]
+        elif b.action == "cont_jog":
+            slot, positive = b.arg
             token = next(self._tokens)
             if self._command(
                 "jog_continuous_start", tag=f"cont:{token}", slot=slot, positive=positive,
@@ -769,26 +877,26 @@ class TuiController:
                     f"continuous jog {_axis_label(slot, positive)} @ {o.jog_speed_mm_s:g} mm/s "
                     "(hold the key)"
                 )
-        elif key == "h":
-            self.mode = "home"
-            self._say("home: x = X axis, y = Y axis" + (", a = X then Y" if o.allow_home_all
+        elif b.action == "home_menu":
+            self.mode = MODE_HOME
+            self._say("home: x = X axis, y = Y axis" + (", b = X then Y" if o.allow_home_all
                                                          else "") + ", other key = cancel")  # fmt: skip
-        elif key == "r":
-            self.mode = "read"
+        elif b.action == "read_block":
+            self.mode = MODE_READ
             self.read_buffer = ""
             self._say("read block: type ADDR/N (e.g. 1000/36), Enter = read, q = cancel")
-        elif key == ENTER or key == UNKNOWN:
-            pass
-        else:
-            self._say(f"key {key!r} not bound")
+        elif b.action == "help":
+            self.mode = MODE_HELP
+            self._say("key list; any key returns")
 
-    def _home_menu_key(self, key: str) -> None:
-        self.mode = "normal"
-        slots = {"x": [0], "y": [1]}.get(key)
-        if key == "a" and self.options.allow_home_all:
-            slots = [0, 1]  # the daemon homes them one after the other (11 §2 V6)
-        if slots is None:
+    def _home_menu_key(self, key: str, b: KeyBinding | None) -> None:
+        self.mode = MODE_NORMAL
+        if b is None or b.action != "home_axis":
             self._say("home cancelled")
+            return
+        slots = list(b.arg)
+        if len(slots) > 1 and not self.options.allow_home_all:
+            self._say("home cancelled")  # X then Y needs --allow-home-all (11 §2 V6)
             return
         if self._command("home", slots=slots):
             self._say("home " + " then ".join(_axis_name(s) for s in slots) + " requested")
@@ -919,20 +1027,23 @@ class TuiController:
         if self.backend_busy():
             jog += "   (waiting for daemon)"
         out.append(jog)
-        if self.mode == "home":
-            keys = "x = X, y = Y" + (", a = X then Y" if o.allow_home_all else "")
+        if self.mode == MODE_HOME:
+            keys = "x = X, y = Y" + (", b = X then Y" if o.allow_home_all else "")
             out.append(f"HOME (one axis at a time): {keys}; any other key cancels")
-        elif self.mode == "read":
+        elif self.mode == MODE_READ:
             out.append(f"READ BLOCK ADDR/N: {self.read_buffer}_")
         out.append(("! " if self.msg.error else "> ") + self.msg.text)
         out.extend(self.read_result)
+        if self.mode == MODE_HELP:
+            out.extend(help_lines(allow_home_all=o.allow_home_all))
+            return out
         out.append(
-            "m arm  d disarm  arrows X/Y step  PgUp/PgDn W step  [ ] step size  "
-            "Shift+arrows or H J K L continuous"
+            "arrows X/Y step  PgUp/PgDn W step  Shift+arrows hold = continuous jog  "
+            "[ ] step size"
         )
         out.append(
-            "h home  r read block  space/s STOP  Esc/e E-STOP  A ack E-stop  "
-            "q quit (daemon keeps running)"
+            "m arm  d disarm  h home  r read block  a ack E-stop  space/s STOP  "
+            "Esc/e E-STOP  ? keys  q quit"
         )
         return out
 

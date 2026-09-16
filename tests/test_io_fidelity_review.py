@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from nexcut.core.schema import format_double, parse_double
+from nexcut.core.schema import format_double, parse_double, parse_int
 from nexcut.io import chf, cp936
 from nexcut.io.params import (
     default_document,
@@ -205,25 +205,41 @@ def test_unknown_attribute_survives_rewrite() -> None:
     assert b'Future="7"' in serialize_params(parse_params(raw, "hard"))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="core/schema.py (not io): ParaModule formats doubles via boost::lexical_cast - "
-    "0x1000ade0 writes 'nan'/'-nan'/'inf'/'-inf' (strings 0x1001af24/0x1001af2c, 3 wchars "
-    "copied) before swprintf('%.*g', 17) at 0x1000ed37; schema writes '1.#QNAN'/'1.#INF'",
-)
 def test_non_finite_doubles_use_boost_spelling() -> None:
+    """core/schema.py (not io): ParaModule formats doubles via ``boost::lexical_cast``.
+
+    ``put_inf_nan`` at ``0x1000ade0`` copies 3 wide characters from ``L"nan"``
+    (``0x1001af24``) or ``L"infinity"`` (``0x1001af2c``) after an optional ``-``,
+    before the ``swprintf("%.*g", 17)`` at ``0x1000ed37``; it never reaches the
+    MSVCR100 ``1.#QNAN``/``1.#INF`` spellings this used to write (STATUS X8).
+    """
     assert format_double(math.nan) == "nan"
+    assert format_double(-math.nan) == "-nan"
+    assert format_double(math.inf) == "inf"
     assert format_double(-math.inf) == "-inf"
+    # and they read back, because parse_inf_nan accepts exactly these spellings
+    for text in ("nan", "-nan", "inf", "-inf", "INFINITY", "+Inf", "nan(ind)"):
+        assert parse_double(text)[1] is True, text
+    assert math.isnan(parse_double("nan")[0]) and parse_double("-inf")[0] == -math.inf
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="core/schema.py: Python float()/int() accept '1_0', ' 5', 'infinity'; the vendor "
-    "reader is boost::lexical_cast (parse_inf_nan 0x1000d2c0) which rejects '1_0' - "
-    "exact=True is wrong for such text (handling of bad_lexical_cast UNVERIFIED)",
-)
 def test_underscore_number_is_not_exact() -> None:
+    """core/schema.py: only whole C++ float literals are ``exact`` (STATUS X9).
+
+    Python ``float``/``int`` also accept ``1_0``, ``" 5"`` and a trailing NBSP;
+    ``boost::lexical_cast`` (``0x1000d2c0``) extracts with ``skipws`` cleared and
+    then demands WEOF (``0x1000bee3``), so any leftover character makes it throw.
+    """
     assert parse_double("1_0")[1] is False
+    assert parse_double("1_0")[0] == 1.0  # UNVERIFIED: the vendor throws bad_lexical_cast
+    assert parse_int("1_0") == (1, False)
+    for text in (" 5", "5 ", "5\u00a0", "0x10", "1.0E", "", "12abc"):
+        assert parse_double(text)[1] is False, text
+    for text in ("5", "-5", "+5", "0.5", ".5", "5.", "1e-020", "-1.5e+300"):
+        assert parse_double(text)[1] is True, text
+    # 'infinity' IS accepted here: parse_inf_nan_impl (0x1000af70) takes the
+    # 8-character branch when exactly 8 characters remain after the sign.
+    assert parse_double("infinity") == (math.inf, True)
 
 
 def test_every_vendor_xml_round_trips(src_dir: Path) -> None:

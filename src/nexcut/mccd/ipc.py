@@ -4,6 +4,11 @@ The daemon process is the only owner of the card socket; clients (UI, CLI, tests
 IPC and nothing else, so the safety gate cannot be bypassed from a client process
 (tests/test_mcc_safety_adversarial.py F12, docs/DECISIONS.md D5).
 
+One daemon per socket (docs/DECISIONS.md D12): :meth:`IpcServer.start` refuses a path that
+another daemon already answers on, and removes a stale socket left by a dead one. The card
+address has its own lock (:class:`nexcut.mccd.daemon.CardLock`), because two daemons with
+different socket paths would otherwise drive the same card.
+
 Socket: ``$XDG_RUNTIME_DIR/nexcut/mccd.sock`` (:func:`nexcut.core.config.default_socket_path`),
 directory mode 0700, socket mode 0600, and the peer uid (``SO_PEERCRED``) must equal the
 daemon's uid (docs/DECISIONS.md D5). The daemon refuses a socket directory that is a
@@ -48,6 +53,7 @@ __all__ = [
     "IpcError",
     "IpcServer",
     "MccdClient",
+    "ensure_private_dir",
 ]
 
 log = logging.getLogger("nexcut.mccd.ipc")
@@ -58,6 +64,23 @@ PROTOCOL_VERSION = 1
 _SEND_TIMEOUT_S = 1.0
 """A client that does not drain its socket for this long is disconnected (it cannot stall
 the daemon's publisher)."""
+
+
+def ensure_private_dir(d: Path, what: str = "directory") -> None:
+    """Create ``d`` mode 0700 and refuse it unless this uid owns a plain directory there.
+
+    Shared by the IPC socket (docs/DECISIONS.md D5 socket-directory amendment) and the card
+    lock (D12): without ``XDG_RUNTIME_DIR`` both live under ``/tmp/nexcut-<uid>``, which any
+    local user can create first - and then replace what we put in it.
+    """
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    st = os.lstat(d)
+    if not stat.S_ISDIR(st.st_mode):
+        raise RuntimeError(f"{what} {d} is not a plain directory (symlink?)")
+    if st.st_uid != os.getuid():
+        raise RuntimeError(f"{what} {d} belongs to uid {st.st_uid}, not {os.getuid()}")
+    if stat.S_IMODE(st.st_mode) & 0o077:
+        os.chmod(d, 0o700)
 
 
 class IpcError(Exception):
@@ -151,17 +174,7 @@ class IpcServer:
     # -- lifecycle ---------------------------------------------------------------------------
 
     def _prepare_path(self) -> None:
-        d = self.path.parent
-        d.mkdir(parents=True, exist_ok=True, mode=0o700)
-        st = os.lstat(d)
-        if not stat.S_ISDIR(st.st_mode):
-            raise RuntimeError(f"IPC socket directory {d} is not a plain directory (symlink?)")
-        if st.st_uid != os.getuid():
-            raise RuntimeError(
-                f"IPC socket directory {d} belongs to uid {st.st_uid}, not {os.getuid()}"
-            )
-        if stat.S_IMODE(st.st_mode) & 0o077:
-            os.chmod(d, 0o700)
+        ensure_private_dir(self.path.parent, "IPC socket directory")
         if self.path.exists() or self.path.is_symlink():
             probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
@@ -170,7 +183,10 @@ class IpcServer:
             except OSError:
                 self.path.unlink()  # stale socket of a dead daemon
             else:
-                raise RuntimeError(f"another nexcut-mccd already listens on {self.path}")
+                raise RuntimeError(
+                    f"another nexcut-mccd already listens on {self.path} "
+                    "(one daemon per socket, docs/DECISIONS.md D12)"
+                )
             finally:
                 probe.close()
 

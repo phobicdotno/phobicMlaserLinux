@@ -2,12 +2,13 @@
 
 Usage::
 
-    nexcut [FILE] [--lang-txt PATH] [--lang en|zh] [--manu XML] [--hard XML]
+    nexcut [FILE] [--lang-txt PATH] [--lang en|zh] [--manu XML] [--hard XML] [--layer XML]
     nexcut render FILE -o OUT.png [--start] [--arrows] [--index] [--bed] ...
 
 ``--manu`` / ``--hard`` read vendor ``ManuPara``/``HardPara`` XML (01 §0.1) for
-the view toggles, import gates and bed size; without them descriptor
-defaults / 1300 x 900 are used.  ``lang.txt`` is found via ``--lang-txt``,
+the view toggles, import gates and bed size; ``--layer`` reads ``LayerPara`` XML
+for the layer-parameter dock (02).  Without them descriptor defaults /
+1300 x 900 are used.  ``lang.txt`` is found via ``--lang-txt``,
 ``$NEXCUT_LANG_TXT`` or ``$NEXCUT_SRC/Lang/lang.txt`` (:mod:`nexcut.ui.i18n`).
 
 SAFETY (PORT-PLAN §8): the application never contacts the controller in this
@@ -46,6 +47,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--manu", type=Path, default=None, help="ManuPara XML (view toggles, import gates)"
     )
     p.add_argument("--hard", type=Path, default=None, help="HardPara XML (bed size)")
+    p.add_argument(
+        "--layer", type=Path, default=None, help="LayerPara XML (layer-parameter dock, 02)"
+    )
     return p
 
 
@@ -80,10 +84,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         manu = read_params(args.manu, "manu") if args.manu else None
         hard = read_params(args.hard, "hard") if args.hard else None
+        layer = read_params(args.layer, "layer") if args.layer else None
     except ParamFileError as exc:
         print(f"nexcut: {exc}", file=sys.stderr)
         return 2
-    win = MainWindow(translator=translator, manu=manu, hard=hard)
+    win = MainWindow(translator=translator, manu=manu, hard=hard, layer=layer)
     win.show()
     if args.file is not None:
         win.open_path(args.file)

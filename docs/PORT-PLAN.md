@@ -183,17 +183,19 @@ Current state per milestone, with the gate results actually measured, is in `doc
 
 ### M1 — "Hello machine": prove end-to-end control (smallest real-hardware step)
 Scope: connect over UDP, read version/status, decode positions, **jog one axis a few millimetres**, home. No laser, no job.
+
+*State (2026-09-16): every item below exists in software and passes against the card simulator; nothing has been run on the machine. See `docs/STATUS.md` §1.2 for the evidence and for the two adversarial safety reviews this code has been through.*
 1. Capture session first: the **M1-confirmation session** (`docs/analysis/11-static-findings.md` §7; replaces §6 sessions A–C). The jog/home/stop vectors and units are already recovered statically (§6.0); the capture confirms K, bit 31, the stop profile, firmware licence gating and limit polarity before the port drives an axis on its own.
 2. `mccd` v0: open socket, `READ 1000 n=2` (version ≥ `MinHardwareVer`), status poll, `READ 2000` positions, show alarm/DI/DO words raw.
 3. Jog / stop / home with the statically recovered vectors (`docs/analysis/11-static-findings.md` §2; A1). Units: speed and distance × K (K = reg 50017, expected 1000 → µm/s, µm), acceleration plain mm/s², jerk = 10·a. After connect, send `0x65 ← [9999, 5, 0, 0]` as the vendor does.
-   * **Step jog** X +5 mm at 50 mm/s: `0x65 ← [3, 0, 50000, 5999, 59990, 5000]`. Word 1 = axis-list index (0 X, 1 Y). The last word is a **relative** distance, not a target; bit 31 of word 1 would make it absolute.
+   * **Step jog** X +5 mm at 50 mm/s: `0x65 ← [3, 0, 50000, 5999, 59990, 5000]`. Word 1 = axis-list index (0 X, 1 Y). The last word is a **relative** distance, not a target; bit 31 of word 1 would make it absolute. *The port's own step jog on an un-homed axis is capped at 10 mm, or 20 mm/s with a token bucket (D1), so the bench session runs this vector at 20 mm/s; 50 mm/s is the vendor's value.*
    * **Continuous jog**: `[3, i, 200000 | 50000, 5999, 59990, ±4 000 000]`, one command per key press (the vendor does not repeat it). On key release send the **stop** `[1, 1<<slot, 2, 2000, 20000]` (vd = clamp(JogStopDccFactor·100000/(v/K), 2000, 0.4·FCP.MaxAcc)).
    * **Stop all** (E-stop key, watchdog): `0x67 ← [3]` while the FIFO runs, otherwise `[1, 0x1F, 2, 2000, 20000]`, then `[101]` (ZF stop, ZFType=1). Then explicitly switch DO9/PWM/gas off: the vendor's idle stop branch does not.
    * **Home** one axis at a time: `[2, 1<<slot, 0]` (X `[2,1,0]`, then Y `[2,2,0]`). Speeds and back-off are card parameters (50200 block), so none are sent. Verify the axis reaches the negative limit, backs off 22/15 mm, and axis-status bit 15 (homed) sets.
    * Expect exception 3 on commands sent while an axis moves. The card's jog/move builders act only when runStatus == 0.
    * *(Superseded: the earlier `target = current + 5 000` and `home [1, mask, 2, …]`. Sub-command 1 is STOP, 2 is HOME.)*
-4. Minimal CLI/TUI (`nexcut-mccd --cli`): status line decoded per 11-static-findings §4 (DI/DO bits, alarm_1 bit 30 E-stop, alarm_2 bit 5 FIFO starvation, axis status bits 0–5/15), jog keys, home, E-stop key = the stop-all sequence of step 3.
-* Gate: repeatable 100 mm X move measured with a ruler within 0.1 mm; homing repeatable; no exception other than 3-while-moving; position registers match `softPara.ini` semantics (0.001 mm).
+4. Minimal CLI/TUI — built as `nexcut-mccd tui` (curses console) plus `nexcut-mccd status` and the one-shot subcommands; the daemon itself is `nexcut-mccd serve`. Status line decoded per 11-static-findings §4 (DI/DO bits, alarm_1 bit 30 E-stop, alarm_2 bit 5 FIFO starvation, axis status bits 0–5/15), jog keys, home, E-stop key = the stop-all sequence of step 3. Motion keys are named keys only and arming belongs to one IPC connection (D11, D9).
+* Gate: repeatable 100 mm X move measured with a ruler within 0.1 mm; homing repeatable; no exception other than 3-while-moving; the position-register semantics established — axis RO word 2 is assumed to be **motor pulses** (~258 p/mm), not the 0.001 mm of `softPara.ini`, and until it is measured the port refuses to use read-back positions for soft limits (D2).
 * Resolves (confirms): O3, O6 firmware half (jog without licence exchange), part of O2 (DI word vs limit switches, O8); the M1-confirmation capture of 11-static-findings §7 replaces sessions A–C.
 
 ### M2 — File load and render
@@ -209,8 +211,10 @@ Scope: connect over UDP, read version/status, decode positions, **jog one axis a
 
 ### M4 — Full job streaming in dry run
 * Planner (`plan/*`) producing ticks; `mcc/fifo.py` producing frames; `mccd` streaming with flow control; contour prologue/epilogue per 08 §4.4; break-point files; report rows; estimate dialog (`gp2000/2001`).
+
+*State (2026-09-16): the planner, the frame packer, `nexcut-plan` and `nexcut-mccd run-job` exist and stream a planned job into the simulator end to end under reg 1015/1016 flow control; break-point files, report rows, the estimate dialog and any UI job control do not. Two limits are open and both are in `docs/STATUS.md`: the §8.3 planner throughput gate fails by ~16x (X13, and a job that size cannot be held in memory as frames), and no vendor item stream of the same drawing exists to diff against.*
 * **Dry-run semantics (as the original's 空走):** every tick carries duty 0, no `9999[2,0x100,·]` laser-enable record, gas records optional; the hardware laser interlock (§8.2) is additionally open.
-* Gate 1 (simulator): identical item stream for the 24-segment raster as decoded in 05 §5–6 (1506.62 mm, 46 toggles); jitter test §8.3 passes.
+* Gate 1 (simulator), in two halves: **(a)** identical item stream for the 24-segment raster as decoded in 05 §5–6 (1506.62 mm, 46 toggles) — the geometry and the toggle ratios match, but "identical item stream" cannot be judged until a vendor capture of that raster exists (11 §7 step 9), so this half is **partial**; **(b)** the jitter test of §8.3 — **passes, against the simulator only**, with the measured numbers recorded in `docs/STATUS.md` §0. The throughput half of §8.3 (100 k contours in < 30 s) **fails** and is tracked as X13.
 * Gate 2 (machine, laser interlocked): the 200 × 200 mm test square of 08 runs at 50 mm/s without FIFO starvation; measured time ≈ planner estimate; frame-id / space-margin behaviour logged.
 * Resolves: O1 (tick), O4 (opcodes, by A/B captures of the Windows tool vs the port on the same drawing).
 
@@ -351,11 +355,67 @@ It replaces sessions A–D and most of E/F below. The three most consequential c
 
 ## 9. Deliverables per milestone (checklist)
 
-- [x] M0: dissector + simulator + schema + golden tests (no machine) (gate item "dissector decodes the first tcpdump capture" still open: no capture exists yet; pcap/pcapng decoding is tested on synthetic captures only. See docs/STATUS.md §1.1)
-- [ ] M1: `nexcut-mccd --cli` jog/home on the real card; capture sessions A–D dissected; `11-capture-findings.md` (partial: the daemon, CLI/TUI, safety gate, `tools/m1_session.py` and docs/M1-BENCH-SESSION.md are done and pass on the simulator; no hardware session run, no capture, no `11-capture-findings.md`; D9/D11/D12 open)
-- [ ] M2: viewer/editor loads DXF/.chf/PLT/G-code, saves `.chf` (partial: the viewer loads all four formats and saves `.chf` byte-identically. No editing operations exist yet (lead-in, micro-joint). Render gate passes as IoU ≥ 0.9 with chamfer 1.000, pixel-identical on 2 of 8 samples. The ManuContour/SortType=4 gate fails: ManuContour.dat is the array order, so a vendor-sorted reference is needed)
-- [ ] M3: parameter/layer/technology editors round-trip vendor files (partial: file layer only; every vendor XML and technology file round-trips in `io/params.py`; no editors/property grids; the Wine load check has not been run)
-- [ ] M4: dry-run job streaming on the machine (laser interlocked) (partial: offline planner → items → frames (`nexcut-plan`) and a simulator feed test; no streaming in `nexcut-mccd`, no §8.3 jitter test, no machine run; strict xfails X1/X2 for pierce dwell / cut start)
-- [ ] M5: first CO2 cut; reports; break-point resume (not started; laser arming deliberately absent)
-- [ ] M6: fibre path (after captures G) (not started)
-- [ ] M7: nesting, scan engraving, pendant, packaging (`.deb`, AppImage), i18n (partial: `ops/scan.py` scan-fill/fly-line geometry and the 11-language i18n loader exist; no nesting, pendant or packaging)
+State as of 2026-09-16, measured — `docs/STATUS.md` holds the evidence for every line. A box is
+ticked only when the deliverable *and* its gate were actually run and passed.
+
+- [x] **M0: dissector + simulator + schema + golden tests (no machine).** Golden tests green; the
+      dissector reproduces every number of 08 §2–4 from the package logs (805 transactions, 22 FIFO
+      frames, 0 remainder). **One gate item is still open**: "the dissector decodes the first tcpdump
+      capture" — no capture of this machine exists, so the pcap/pcapng paths are tested on synthetic
+      captures only. That item is produced by the M1 bench session and nothing else.
+- [ ] **M1: `nexcut-mccd` jog/home on the real card; the M1-confirmation capture dissected into
+      `11-capture-findings.md`.** Software side **complete**: daemon, priority bus, safety gate,
+      watchdog, arming state machine, CLI, curses TUI, `tools/m1_session.py` and
+      `docs/M1-BENCH-SESSION.md`, all green on the simulator, and the design decisions the reviews
+      raised are closed (D9 arming ownership, D11 key table, D12 one master per card — plus the R12–R21
+      review that found five further defects, three of them able to move the machine). **Not done**:
+      any hardware run, any capture, and therefore `11-capture-findings.md`, the ruler/homing gate and
+      the position scale (D2).
+  - [x] daemon, safety gate, watchdog, arming state machine, deadman (simulator-verified)
+  - [x] operator console (`nexcut-mccd tui`) and one-shot CLI with per-command arming (`--arm`)
+  - [x] guided bench session tool and runbook, rehearsable against the simulator
+  - [ ] hardware session run, pcap captured, `docs/analysis/11-capture-findings.md` written
+  - [ ] 100 mm ruler gate, homing repeatability, `position_counts_per_mm` measured (D2)
+- [ ] **M2: viewer loads DXF/`.chf`/PLT/G-code and saves `.chf`.** Loading and byte-identical
+      re-saving work for all four formats; the render gate passes on the *relaxed* metric (IoU ≥ 0.9
+      with chamfer 1.000 against an asymmetric control; pixel-identical on 2 of 8 samples). **Not
+      done**: any editing operation (lead-in, micro-joint, edit-then-save). The `ManuContour` /
+      `SortType=4` half of the gate is **unmeetable as written** — `ManuContour.dat` is the array
+      order, not a sort result — and needs a vendor-sorted reference produced under Wine.
+  - [x] import DXF, `.chf` v1–v5, PLT, G-code; canvas, layers, markers, measurement tool
+  - [x] byte-identical `.chf` re-save on every sample
+  - [ ] render gate on the strict metric, or an agreed relaxed one (open decision, STATUS §4.2)
+  - [ ] a valid sort reference, and any editing operation at all
+- [ ] **M3: parameter/layer/technology editors round-trip vendor files.** The file layer is
+      complete — every vendor XML and technology file round-trips byte for byte, with the preset
+      wrapper, the fallback chain and atomic writes. The **first property editors exist**: a
+      schema-driven property grid (`ui/property_grid.py`) and the CO2 layer page
+      (`ui/pages/layer_co2.py`, 21 editable attributes with the `lp19` cross-check and preset
+      exchange). **Not done**: the hardware/machining/software/graph-rule pages, the fibre layer
+      page, the PWM/frequency curve editor, the crafts editor, writing `BkLayerPara.xml` back from
+      the dock, and the Wine load check that is the gate.
+  - [x] byte-for-byte round-trip of every `Bk*.xml` and technology file
+  - [x] schema-driven property grid + CO2 layer page
+  - [ ] the remaining five pages and the curve/crafts editors
+  - [ ] gate: the Windows tool under Wine loads files written by the port
+- [ ] **M4: dry-run job streaming on the machine (laser interlocked).** The whole chain exists and
+      runs **into the simulator**: planner → items → frames (`nexcut-plan`), then
+      `nexcut-mccd run-job` / the five `*_job` IPC commands streaming under reg 1015/1016 flow
+      control with clear/start/stop, re-send and drain. The pierce-dwell and cut-start fidelity gaps
+      (X1/X2) are closed by the A9 re-trace, and a third adversarial review fixed four defects in the
+      streaming path (a re-send window that never fired, an empty-FIFO start, a premature RUNNING and
+      a wrong ZF speed source). **Not done**: any machine run; break-point files, report rows,
+      estimate dialog, UI job controls; and the two open limits below.
+  - [x] planner, frame packer, offline `nexcut-plan` (never opens a socket — enforced by an audit hook)
+  - [x] streaming feeder with flow control, re-send, clean stop and arming/token rules
+  - [x] §8.3 **jitter** gate — passed, **simulator only**, numbers in STATUS §0
+  - [ ] §8.3 **throughput** gate — fails by ~16x (X13); needs a streaming, vectorised item path
+  - [ ] gate 1(a): item-stream diff against a vendor capture of the same drawing (needs 11 §7 step 9)
+  - [ ] gate 2: the 200 × 200 mm dry run on the machine
+- [ ] **M5: first CO2 cut; reports; break-point resume.** Not started, deliberately: `LASER_ARMED`
+      is unreachable from any client and the decision that would define it (D13) is not written yet.
+- [ ] **M6: fibre path (after capture G).** Not started; fibre cutting is refused outright in
+      `mcc/safety.py`.
+- [ ] **M7: nesting, scan engraving, pendant, packaging (`.deb`, AppImage), i18n.** Two pieces
+      exist: `ops/scan.py` (hatch, serpentine, fly-line link builder) and the i18n loader for the 11
+      vendor language files. No nesting, no pendant, no packaging.

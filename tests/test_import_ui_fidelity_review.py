@@ -25,6 +25,7 @@ import pytest
 from scipy.interpolate import BSpline as SciBSpline
 from scipy.spatial import cKDTree
 
+from conftest import speed_factor
 from nexcut.io import chf
 from nexcut.io.dxf import DxfImportError, import_dxf, read_dxf
 from nexcut.io.gcode import ERR_FORMAT, GCodeError, read_gcode
@@ -275,8 +276,11 @@ def test_vendor_dxf_import_facts(src_dir: Path) -> None:
     doc = load_document(path).document
     contours = [c for g in doc.graphs for c, _ in iter_contours(g)]
     assert len(contours) == 3 and all(is_closed(c) for c in contours)
+    # The two spline contours grew by 0.005/0.007 mm when model/flatten started to
+    # honour the chord step (STATUS X10): the lengths below are the converged ones
+    # (identical at step 0.002, 0.0005 and 0.0001), the old ones were under-sampled.
     assert sorted(c.length for c in contours) == pytest.approx(
-        [19.2031, 69.2444, 220.3435], abs=2e-4
+        [19.2031, 69.2492, 220.3503], abs=2e-4
     )
 
 
@@ -714,16 +718,26 @@ def _max_chord_error(poly: np.ndarray, g: SplineGlyph) -> float:
 
 
 def test_canvas_spline_flattening_honours_display_step() -> None:
-    """Finding (fixed in ui/scene): spline display samples ignored the 0.2 mm chord step.
+    """Finding (fixed in ui/scene, then in model/flatten): spline samples ignored the step.
 
-    ``model.flatten._bspline_pts`` uses ``max(24, 8 * n_ctrl)`` samples: a 1 m,
-    4-point spline was drawn with 0.51 mm chord error (visible when zoomed).
+    Both used ``max(24, 8 * n_ctrl)`` samples, which drew a 1 m, 4-point spline
+    with 0.51 mm chord error at the 0.2 mm display step (visible when zoomed).
+    The evidence for that rule is ``tools/chf_parse.py``, the reference tool, which
+    still carries it; ``model.flatten`` now scales the count with the
+    control-polygon length over the step (STATUS X10), as ``ui.scene`` already did.
     """
     from nexcut.ui.scene import flatten_glyph_np
 
     g = _long_spline()
+    tool = _chf_parse_module()
+    fixed = np.asarray(
+        tool._bspline_pts([list(p) for p in g.control_points], list(g.knots)),  # type: ignore[attr-defined]
+        dtype=float,
+    )
+    assert len(fixed) == 8 * len(g.control_points) + 1  # the max(24, 8 * n_ctrl) rule
+    assert _max_chord_error(fixed, g) > 0.4  # the sampling this replaced (evidence)
     coarse = np.asarray(flatten_glyph(g)[0])
-    assert _max_chord_error(coarse, g) > 0.4  # the model sampling (evidence)
+    assert _max_chord_error(coarse, g) < 0.01
     (dense,) = flatten_glyph_np(g)
     assert _max_chord_error(dense, g) < 0.01
     assert tuple(dense[0]) == (0.0, 0.0) and tuple(dense[-1]) == pytest.approx((900.0, 400.0))
@@ -731,12 +745,12 @@ def test_canvas_spline_flattening_honours_display_step() -> None:
     np.testing.assert_array_equal(flatten_glyph_np(small)[0], np.asarray(flatten_glyph(small)[0]))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="model/flatten (not owned here): _bspline_pts ignores the step, so the cached "
-    "contour length of a 1 m spline is 0.36 mm short even at CHECK_STEP 0.002",
-)
 def test_cached_spline_length_is_accurate() -> None:
+    """model/flatten: the cached length of a 1 m spline is within 0.05 mm (STATUS X10).
+
+    It was 0.36 mm short, because ``_bspline_pts`` ignored the chord step even at
+    ``CHECK_STEP`` 0.002.
+    """
     g = _long_spline()
     u = np.linspace(0.0, 1.0, 400_001)
     exact = SciBSpline(np.asarray(g.knots), np.asarray(g.control_points), 3)(u)
@@ -921,6 +935,20 @@ def test_canvas_and_render_are_y_up(qapp: object) -> None:
 # ============================================================================ canvas performance
 
 BUDGET_S = 3.0
+"""PORT-PLAN §8.3: a 50 000-segment file opens, fits and paints in < 3 s."""
+
+
+def budget_s(budget: float = BUDGET_S) -> float:
+    """``budget`` scaled to how fast this machine is running right now.
+
+    The 3 s came from the review laptop. A CI runner is slower and usually shares its cores,
+    and the project's CI-stability rule is that a timing assertion must hold on a machine 3x
+    slower; an unscaled wall-clock budget there measures the runner, not the port. See
+    :func:`tests.conftest.speed_factor` - the factor is never below 1.0, so the gate stays
+    exact on a machine of the review machine's speed. Every test below also prints the raw
+    seconds, and ``docs/STATUS.md`` records the unscaled laptop numbers.
+    """
+    return budget * speed_factor()
 
 
 def _wave(i: int) -> tuple[float, float]:
@@ -1004,8 +1032,8 @@ def test_open_and_fit_50k_segment_path(qapp: object, tmp_path: Path, kind: str) 
     path = _write_big(kind, 50_000, tmp_path)
     elapsed, segs = _open_fit_paint(qapp, path, tmp_path)
     assert segs >= 50_000
-    assert elapsed < BUDGET_S, f"{kind}: {elapsed:.2f} s"
-    print(f"{kind}: open+fit+paint {elapsed:.2f} s")
+    print(f"{kind}: open+fit+paint {elapsed:.2f} s (budget {budget_s():.2f} s)")
+    assert elapsed < budget_s(), f"{kind}: {elapsed:.2f} s"
 
 
 def test_canvas_50k_separate_segments(qapp: object) -> None:
@@ -1033,7 +1061,8 @@ def test_canvas_50k_separate_segments(qapp: object) -> None:
     painter.end()
     elapsed = time.perf_counter() - t
     assert data is not None and len(data.seg_start) == 50_000
-    assert elapsed < BUDGET_S, elapsed
+    print(f"canvas 50k separate segments: {elapsed:.2f} s (budget {budget_s():.2f} s)")
+    assert elapsed < budget_s(), elapsed
     view.close()
 
 
@@ -1045,18 +1074,21 @@ def test_canvas_50k_separate_segments(qapp: object) -> None:
 def test_open_50k_separate_dxf_lines(qapp: object, tmp_path: Path) -> None:
     path = _write_big("dxf-lines", 50_000, tmp_path)
     elapsed, _ = _open_fit_paint(qapp, path, tmp_path)
-    assert elapsed < BUDGET_S, elapsed
+    print(f"50k separate DXF LINEs: {elapsed:.2f} s (budget {budget_s():.2f} s)")
+    assert elapsed < budget_s(), elapsed
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="io/chf.py (not owned here): the token reader needs ~7 s for 50 000 contours "
-    "(1.95 M tok() calls); the canvas part is < 1 s",
-)
 def test_open_50k_contour_chf(qapp: object, tmp_path: Path) -> None:
+    """50 000 one-segment contours open, fit and paint in < 3 s (STATUS X12).
+
+    The token reader needed ~7 s of that alone (1.95 M per-byte ``tok()`` calls);
+    it now tokenises the buffer in one pass and memoises decoded values, which
+    brings the read to ~0.9 s and the whole path to ~1.9 s on the review machine.
+    """
     path = _write_big("chf-contours", 50_000, tmp_path)
     elapsed, _ = _open_fit_paint(qapp, path, tmp_path)
-    assert elapsed < BUDGET_S, elapsed
+    print(f"50k-contour .chf: {elapsed:.2f} s (budget {budget_s():.2f} s)")
+    assert elapsed < budget_s(), elapsed
 
 
 # ============================================================================ i18n (06 §1.5)

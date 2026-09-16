@@ -92,15 +92,23 @@ def test_all_frames_reencode_through_item() -> None:
 
 @pytest.mark.parametrize("fid", [504, 57])
 def test_prologue_frames_504_and_57(fid: int) -> None:
+    """The CO2 prologue emits **no** dwell at all on this machine (A9 §2): ``LaserOnDelay = 0``
+    and the gas delay of the contour that does not re-open the gas are both ``2001[ms, 3000]``
+    wait records that NCModule drops when the value is 0, so the stationary ticks that follow
+    ``DO9 on`` in the frame are the cut ramp's own zero-displacement ticks and are supplied here
+    from the frame (the vendor's ramp depends on the job geometry, which is not recorded)."""
     text, items = FRAMES[fid]
     first_ctrl = next(i for i, it in enumerate(items) if it.opcode != 3000)
+    last_ctrl = max(i for i, it in enumerate(items) if it.opcode != 3000)
     b = JobStreamBuilder(laser_records=True)
     b.records.extend(tick_records(items[:first_ctrl]))
-    # CO2 layer 2: 5000 Hz / 4 %, HighAir DO3, CO2DOLaser DO9; dwell long enough to fill the frame
-    b.prologue(ContourLaser(gas_port=3, laser_port=9, pierce_dwell_ms=100.0), 5000, 4)
+    # CO2 layer 2: 5000 Hz / 4 %, HighAir DO3, CO2DOLaser DO9, LaserOnDelay 0, gas already on
+    b.prologue(ContourLaser(gas_port=3, laser_port=9), 5000, 4)
+    b.records.extend(tick_records(items[last_ctrl + 1 :]))
+    b.records.extend([Record.tick(0, 0, 5000, 4)] * 120)  # carry on past the frame boundary
     data = pack(b)[0]
     expected = [w for it in items for w in Item(it.opcode, it.args).words()]
-    assert data[: len(expected)] == expected
+    assert data == expected  # the whole 297-word frame, word for word
     assert b.frames()[0].count == 0x12A
 
 

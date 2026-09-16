@@ -66,6 +66,8 @@ __all__ = [
     "FifoParseError",
     "LogRecord",
     "Transaction",
+    "describe_command",
+    "describe_misc",
     "describe_vector",
     "dissect_capture",
     "dissect_file",
@@ -87,62 +89,91 @@ __all__ = [
 # ================================================================================================
 
 READ_BLOCKS: dict[int, str] = {
-    1000: "status RO",  # 04 §3.5 RORegName_*
-    1050: "RO 1050",
-    2000: "axis RO",
-    5000: "RW",
-    10000: "ZF status",
+    150: "FTC command - DENY",  # 150 <- 5555 factory reset / 9999 commit (11 §3.3, A4 §1)
+    151: "edge-seek buffer - DENY",  # 11 §3.3, A4 §1
+    1000: "status RO",  # 04 §3.5 RORegName_*; x2 version gate, x36 the 30 ms poll (11 §3.2)
+    1050: "version/time triple",  # 11 §3.2 (3 words)
+    2000: "axis RO",  # 5 x 10 words (11 §4.4)
+    5000: "safety / DI config",  # diagnostic only; the vendor never reads it (11 §3.2, A2 §4)
+    10000: "ZF status",  # only if ZFType != 0; a failure is not link loss (A5 V4)
     11000: "ZF props",
     13000: "RO 13000",
     13200: "RO 13200",
-    50000: "system RW",
-    50200: "axis RW",
-    60001: "param block",
+    50000: "system RW",  # card-authoritative K / bus cycle / ZFType (11 §3.2)
+    50200: "axis RW",  # 5 x 20, axis-0 words 9/10 = lead / command pulses
+    59500: "card licence - DENY",  # 59500-59511 (11 §3.3, A4 §2-3)
+    59600: "hardware params",  # 59600 + 0xD0*i, read-compare only (11 §3.2/§3.3)
+    60001: "fast combined 2000+50200",  # vendor "fast mode" (11 §3.2)
 }
-"""Register block labels from 04 §3.5 (addresses EVIDENCE, names INFERENCE)."""
+"""Register block labels (11 §3.2 allow-list and §3.3 deny-list; addresses EVIDENCE, names
+INFERENCE). Blocks the port must never write carry ``- DENY`` so they stand out in a capture."""
 
 FIFO_CONTROL_VALUES: dict[int, str] = {1: "clear", 2: "start", 3: "stop"}
 """Register 0x67 values (04 §3.5 verifier: clearFifo/startFifo/stopFifo)."""
 
+DISPLAY_K = 1000
+"""Unit scale used only to add mm / mm/s to the human output.
+
+``K`` is card register 50017 and is **1000 on this machine** (11 §2, A1 §2: speeds in
+0.001 mm/s, distances in µm). A capture from a machine with another K would be mislabelled
+in the bracketed part of the description; the raw words are always printed as well.
+UNVERIFIED for any card other than this one.
+"""
+
 COMMAND_NAMES: dict[int, str] = {
-    1: "home",  # 04 §3.6, 08 §4.5 [1, axisMask, 2, vSlow, vFast]
-    3: "move-axis",  # [3, axis, v, a, j, target]
-    4: "start-manu?",  # 04 §3.6 INFERENCE
-    5: "move-multi",  # [5, mask, v, a, j, dX, dY, dZ, dW]
-    7: "offline-upload?",
-    0x66: "reset/resync?",  # 08 §3.3 [102]
+    # 11 §8 correction 1 (supersedes 04 §3.6 / 08 §4.5 / 00 §5.1): sub-command 1 is STOP
+    # and sub-command 2 is HOME, not the other way round.
+    1: "stop",  # [1, mask, 2, vd, 10*vd] (11 §2 V3/V4) or [1, 0x1F] (V5)
+    2: "home",  # [2, 1<<slot, 0] per axis (V6); config mask = system home (V7)
+    3: "jog",  # [3, axis(|bit31 = absolute), v, a, 10*a, d] - d is RELATIVE (V1/V2/V9)
+    4: "sub4?",  # 04 §3.6 "start manu"; not re-verified, DENY (11 §3.3)
+    5: "goto",  # [5, mask|bit31, v, a, 10*a, x, y, w, z] go-to point (V8)
+    7: "sub7?",  # 04 §3.6 "offline upload"; not re-verified, DENY (11 §3.3)
+    101: "zf-stop",  # single word (V14, A1 row 17)
+    102: "zf-resync?",  # A1 §1 CNCModule slot 59; rejected with exception 2 (11 §3.3, C10)
+    103: "zf-move",  # ZF vectors outside the FIFO: DENY (11 §3.3, A5 §3)
+    104: "zf-104",
+    107: "zf-calibrate?",
+    109: "zf-lift",
+    117: "zf-pierce?",
+    118: "zf-bookkeeping",
     9999: "misc",
 }
-"""Command register 0x65 sub-commands (04 §3.6; meanings INFERENCE)."""
+"""Command register 0x65 sub-commands (11 §2 vector table, §3.3 deny list, A1 §0).
+
+Names of 4/7/102/107/117 are INFERENCE and end in ``?``; 1/2/3/5/101 are EVIDENCE (A1 §0).
+"""
 
 MISC_SUBCOMMANDS: dict[int, str] = {
-    1: "fifo-clear(alt)",  # 04 §3.6
-    2: "DO 1..10",  # A3 §6
-    3: "PWM",
-    4: "DA",
-    13: "DO 11..26 / init",  # A3 §5 vs 04 §3.6 (conflicting readings)
-    17: "PWM(5V)",
+    1: "fifo-clear(alt)",  # 04 §3.6 legacy, not re-verified: DENY (11 §3.3)
+    2: "DO 1..10",  # [9999, 2, 1<<(p-1), v<<(p-1)] (11 §2 V11, §5.2, A3 §6)
+    3: "PWM",  # [9999, 3, freq, duty] (V13, §5.2)
+    4: "DA",  # [9999, 4, ch-1, mV] (V12, §5.2)
+    5: "connect-prologue",  # [9999, 5, 0, 0] once per connect (V0, 11 N4)
+    13: "DO 11..26",  # [9999, 13, 1<<(p-11), v<<(p-11)] (§5.2; 11 §2.1: never seen here)
+    16: "per-record?",  # unexplained per-record write (11 N6): DENY
+    17: "PWM(5V)",  # sub-code 0x11, this machine's CO2 5 V PWM (V13, §5.2)
 }
-"""Sub-codes of the 9999 family, both on 0x65 and in the FIFO stream (A3 §5/§6, 04 §3.6)."""
+"""Sub-codes of the 9999 family, both on 0x65 and in the FIFO stream (11 §2/§5.2, A3 §5/§6)."""
 
 FIFO_OPCODES: dict[int, str] = {
-    3000: "tick",
+    3000: "tick",  # [(dY<<16)|dX, (freq<<16)|duty], dX/dY int16 motor pulses (11 §5.2)
     3001: "boundary",
-    3002: "mode",
-    9999: "misc",
-    103: "zf-move",
-    104: "zf-104",
+    3002: "mode",  # [mode]: 5 before laser-on, 4 after
+    9999: "misc",  # [sub, ...] - see MISC_SUBCOMMANDS
+    103: "zf-move",  # [trunc(v*10), trunc(h*1000)] move to height
+    104: "zf-104",  # ZF short (2 words) / section block (8 words)
     105: "zf-follow",
     106: "zf-section-drill",
     108: "zf-gradual-drill",
-    109: "zf-move-neg",
-    118: "zf-bookkeeping",
-    2001: "wait/config",
+    109: "zf-lift",  # [trunc(v*10), trunc(h*-1000)] lift / dock (11 §5.2)
+    118: "zf-bookkeeping",  # [4, flag, int(g+0x4d28)] - [4, 0, 35] on this machine
+    2001: "wait",  # mode 0 [ms, 3000]; mode 3 [r|0x03000000, FollowOvertime]
     2002: "fibre-2002",
     2004: "fibre-2004",
     3: "fibre-3",
 }
-"""FIFO item opcodes (08 §4.4, 11-static/A3 §5; meanings INFERENCE except 3000 fields)."""
+"""FIFO item opcodes (11 §5.2, A3 §5; meanings INFERENCE except the 3000 fields)."""
 
 
 def _s32(v: int) -> int:
@@ -247,6 +278,90 @@ def parse_fifo_words(words: Sequence[int], *, strict: bool = True) -> FifoFrame:
 # ================================================================================================
 
 
+AXIS_SLOT_NAMES: dict[int, str] = {0: "X", 1: "Y", 2: "Y2", 3: "Z", 4: "W"}
+"""Machine axis slots of this machine (11 §0 O7, A1 §5.3). Slot 3 is the height axis."""
+
+
+def _mask_names(mask: int) -> str:
+    """``0x1f`` -> ``X|Y|Y2|Z|W``; unknown bits are shown as ``bit<n>``."""
+    if mask == 0:
+        return "none"
+    out = []
+    for bit in range(32):
+        if mask & (1 << bit):
+            out.append(AXIS_SLOT_NAMES.get(bit, f"bit{bit}"))
+    return "|".join(out)
+
+
+def _mm(word: int) -> str:
+    return f"{_s32(word) / DISPLAY_K:+.3f} mm"
+
+
+def _mm_s(word: int) -> str:
+    return f"{_s32(word) / DISPLAY_K:.3f} mm/s"
+
+
+def describe_command(data: Sequence[int]) -> str:
+    """Meaning of a ``WRITE 0x65`` word list, in words (11 §2 vector table, A1 §0).
+
+    Returns the empty string when the sub-command has no documented word layout. Distances
+    and speeds are divided by :data:`DISPLAY_K`; accelerations carry no K (11 §2).
+    """
+    if not data:
+        return ""
+    sub, w = data[0], list(data[1:])
+    if sub == 1:  # STOP (V3/V4/V5)
+        if len(w) >= 4:
+            return f"stop axes {_mask_names(w[0])}, decel {w[2]} (jerk {w[3]}), word2={w[1]}"
+        if len(w) == 1:
+            return f"stop axes {_mask_names(w[0])}, card default decel (V5)"
+        return ""
+    if sub == 2 and len(w) >= 1:  # HOME (V6/V7)
+        kind = "home" if w[0] and w[0] & (w[0] - 1) == 0 else "system home"
+        return f"{kind} axes {_mask_names(w[0])}"
+    if sub == 3 and len(w) >= 5:  # JOG / single-axis move (V1/V2/V9/A1 row 14)
+        idx, absolute = w[0] & 0x7FFFFFFF, bool(w[0] & 0x80000000)
+        target = f"target {_mm(w[4])}" if absolute else f"distance {_mm(w[4])} (relative)"
+        return (
+            f"axis {AXIS_SLOT_NAMES.get(idx, idx)} {target}, "
+            f"v {_mm_s(w[1])}, a {w[2]} mm/s^2, jerk {w[3]}"
+        )
+    if sub == 5 and len(w) >= 8:  # go-to point (V8)
+        mask, absolute = w[0] & 0x7FFFFFFF, bool(w[0] & 0x80000000)
+        return (
+            f"{'absolute' if absolute else 'relative'} move of {_mask_names(mask)} to "
+            f"X {_mm(w[4])}, Y {_mm(w[5])}, W {_mm(w[6])}, Z {_mm(w[7])}, "
+            f"v {_mm_s(w[1])}, a {w[2]} mm/s^2, jerk {w[3]}"
+        )
+    if sub == 9999 and w:
+        return describe_misc(w)
+    if sub in (103, 104, 109) and len(w) >= 2:  # ZF vectors outside the FIFO (11 §3.3)
+        return f"ZF v {w[0] / 10:.1f} mm/s, height {_s32(w[1]) / 1000:+.3f} mm"
+    return ""
+
+
+def describe_misc(w: Sequence[int]) -> str:
+    """Meaning of the words after ``9999`` (11 §2 V11-V13, §5.2, A3 §5/§6)."""
+    sub = w[0]
+    if sub in (2, 13) and len(w) >= 3:
+        base = 1 if sub == 2 else 11
+        mask, val = w[1] & 0xFFFFFFFF, w[2] & 0xFFFFFFFF
+        ports = [
+            f"DO{base + b}={'1' if val & (1 << b) else '0'}"
+            for b in range(32)
+            if mask & (1 << b)
+        ]
+        return ("set " + " ".join(ports)) if ports else f"DO mask {mask:#x} value {val:#x}"
+    if sub == 4 and len(w) >= 3:
+        return f"DA channel {w[1] + 1} = {w[2]} mV"
+    if sub in (3, 0x11) and len(w) >= 3:
+        return f"PWM {w[1]} Hz, duty {w[2]} %"
+    if sub == 5:
+        return "connect prologue (11 §2 V0, meaning unknown)"
+    return ""
+
+
+
 def describe_vector(vector: Sequence[int]) -> str:
     """One-line human description of a DLL request vector (04 §3.5-§3.7)."""
     if not vector:
@@ -273,8 +388,18 @@ def describe_vector(vector: Sequence[int]) -> str:
             name = COMMAND_NAMES.get(sub, f"sub{sub}")
             if sub == 9999 and len(data) > 1:
                 name = f"misc/{MISC_SUBCOMMANDS.get(data[1], data[1])}"
-            args = ", ".join(str(_s32(w)) for w in data[1:])
-            return f"CMD {name} [{sub}{', ' if args else ''}{args}]"
+            # The axis / axis-mask word of sub-commands 1/2/3/5 is a bit field (bit 31 =
+            # absolute, 11 §2 V8/§7 step 4), so it is shown unsigned in hex, not as -2^31.
+            shown = [
+                f"{w & 0xFFFFFFFF:#x}" if i == 0 and sub in (1, 2, 3, 5) else str(_s32(w))
+                for i, w in enumerate(data[1:])
+            ]
+            args = ", ".join(shown)
+            meaning = describe_command(data)
+            return (
+                f"CMD {name} [{sub}{', ' if args else ''}{args}]"
+                + (f"  {meaning}" if meaning else "")
+            )
         return f"WRITE {addr} x{count} [{', '.join(f'{w:#x}' for w in data[:8])}{'...' if count > 8 else ''}]"
     if func == FUNC_BYTE_BLOCK:
         return f"BYTEBLOCK {addr} x{count}"

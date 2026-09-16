@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import re
 from collections import deque
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -49,8 +49,12 @@ __all__ = [
     "FillResult",
     "FramePacker",
     "PackedFrame",
+    "count_frame_file",
+    "fifo_queued_bytes",
+    "fifo_queued_items",
     "format_frame_line",
     "item_header",
+    "iter_frame_file",
     "pack_records",
     "parse_frame_line",
     "read_frame_file",
@@ -214,15 +218,22 @@ class FifoFeeder:
         send: Callable[[int, list[int]], None],
         *,
         max_frames: int = MAX_FRAMES_PER_FILL,
+        first_frame_id: int | None = None,
     ) -> FillResult:
         """Send frames while ``bytes + 2000 <= space`` (≤ 50 per call).
 
         ``frame_id_reg`` = reg 1015 and ``space_margin`` = reg 1016 from the latest status poll.
         ``send(frame_id, payload_words)`` writes register 0x66; if it raises, the frame is
         reported with :class:`FifoFrameLost` (the vendor would drop it silently, A3 §7 verifier).
+
+        ``first_frame_id`` overrides ``reg 1015 + 1`` for the first frame of this pass. The
+        vendor reads reg 1015 immediately before each ``fillFifo`` (A3 §7); a caller that
+        instead works from a status poll taken *earlier* must carry the id on itself, or a
+        pass would re-use ids the card has already seen - the card acknowledges a repeated
+        frame id without queuing it (08 §4.4), so frames would silently go missing.
         """
         res = FillResult(space_left=int(space_margin))
-        frame_id = next_frame_id(frame_id_reg)
+        frame_id = next_frame_id(frame_id_reg) if first_frame_id is None else first_frame_id
         space = int(space_margin)
         while True:
             if not self._ring:
@@ -256,6 +267,32 @@ class FifoFeeder:
             and space_margin == FIFO_MARGIN_EMPTY
             and fifo_program_running(processing_status)
         )
+
+
+def fifo_queued_bytes(space_margin: int, margin_empty: int = FIFO_MARGIN_EMPTY) -> int:
+    """Bytes the card still holds, from reg 1016 (11 C2: 60000 = empty, see module docstring).
+
+    UNVERIFIED like the unit itself (11 §7 step 8); never negative.
+    """
+    return max(0, int(margin_empty) - int(space_margin))
+
+
+def fifo_queued_items(
+    space_margin: int,
+    words_per_item: int = 3,
+    margin_empty: int = FIFO_MARGIN_EMPTY,
+) -> int:
+    """Queued **items** estimated from reg 1016 (``FifoAlarmNum`` is an item count, 01 §2.3).
+
+    The card reports bytes, the ``FifoAlarmNum = 30`` threshold counts items (04 §1
+    ``RegName101`` "processing FIFO alarm limit"), so the two have to be related by an
+    assumed item size: 3 words = 12 bytes, the 3000 interpolation tick that makes up almost
+    every job item (11 §5.2).  A job whose items are longer therefore over-estimates the
+    depth; UNVERIFIED, like the reg-1016 unit (11 §7 step 8).
+    """
+    if words_per_item <= 0:
+        raise ValueError("words_per_item must be > 0")
+    return fifo_queued_bytes(space_margin, margin_empty) // (words_per_item * WORD_BYTES)
 
 
 # ------------------------------------------------------------------------------ frame files
@@ -305,11 +342,39 @@ def write_frame_file(
     return n
 
 
+def iter_frame_file(path: str | Path) -> Iterator[tuple[int, list[int]]]:
+    """Yield ``(frame_id, data)`` per frame line, reading the file line by line.
+
+    Streaming on purpose: a planned job of any length must not have to fit in memory before
+    the daemon can feed it (PORT-PLAN §8.3; :mod:`nexcut.mccd.feeder` pulls from here).
+    """
+    with open(path, encoding="utf-8", errors="replace", newline="") as fh:
+        for line in fh:
+            parsed = parse_frame_line(line)
+            if parsed is not None:
+                yield parsed
+
+
+def count_frame_file(path: str | Path) -> int:
+    """Number of frame lines, without decoding the words (cheap length for a job header)."""
+    n = 0
+    with open(path, "rb") as fh:
+        for raw in fh:
+            text = raw.strip()
+            if text.startswith(b"#") or not text:
+                continue
+            if b"DataEx:" in text:
+                text = text.split(b"DataEx:", 1)[1].strip()
+            toks = text.split()
+            if (
+                len(toks) >= 4
+                and toks[0].lower() == b"%02x" % FUNC_WRITE
+                and toks[1].lower() == b"%02x" % REG_FIFO_DATA
+            ):
+                n += 1
+    return n
+
+
 def read_frame_file(path: str | Path) -> list[tuple[int, list[int]]]:
     """Read every frame line of a frame file or log excerpt."""
-    out: list[tuple[int, list[int]]] = []
-    for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
-        parsed = parse_frame_line(line)
-        if parsed is not None:
-            out.append(parsed)
-    return out
+    return list(iter_frame_file(path))

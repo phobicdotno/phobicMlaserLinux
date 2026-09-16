@@ -2,10 +2,14 @@
 
 This is the geometry of ``tools/chf_parse.py`` (``flatten_glyph``/``--check``)
 with the global chord step turned into a parameter; the numeric results for a
-given step are identical.  The conventions it encodes are proven only as far as
-the samples go (segment, circle, closed bulge polyline; 03 §11, 99-gaps §1):
-arc/ellipse/spline evaluation is from disassembly (03 §7) and the positive-sweep
-= CCW rule is INFERENCE high.
+given step are identical, except that splines here honour the step
+(:func:`_bspline_sample_count`) where the tool keeps its fixed sample count.
+The conventions it encodes are proven only as far as the samples go (segment,
+circle, closed bulge polyline; 03 §11, 99-gaps §1): arc/ellipse/spline evaluation
+is from disassembly (03 §7) and the positive-sweep = CCW rule is INFERENCE high.
+
+SciPy is imported lazily, inside :func:`_bspline_pts_np`, and only for a spline
+that needs more samples than the old fixed count; everything else is stdlib.
 """
 
 from __future__ import annotations
@@ -31,6 +35,9 @@ DEFAULT_STEP = 0.2
 
 CHECK_STEP = 0.002
 """Chord step (mm) used by the self-check (03 §11)."""
+
+MAX_CURVE_SAMPLES = 20000
+"""Upper bound on the samples of one flattened curve (the cap of ``_arc_pts``)."""
 
 Polyline = list[tuple[float, float]]
 
@@ -95,10 +102,62 @@ def _ellipse_pts(g: EllipseArcGlyph, step: float) -> Polyline:
     return out
 
 
-def _bspline_pts(ctrl: list[Vec2], knots: list[float], degree: int = 3) -> Polyline:
-    """Sample a non-rational B-spline by de Boor over ``[knots[p], knots[n]]`` (03 §7, type 7)."""
+def _bspline_sample_count(ctrl: list[Vec2], step: float) -> int:
+    """Samples for one spline: the ``max(24, 8 * n_ctrl)`` floor, scaled by ``step``.
+
+    The floor is the sample count this module used unconditionally, which ignored
+    the chord step and left a 1 m, 4-point spline 0.36 mm short even at
+    :data:`CHECK_STEP` (import/UI fidelity review, STATUS X10).  The step-driven
+    term is the control-polygon length over ``step`` - the same rule, and the same
+    ``MAX_CURVE_SAMPLES`` cap, as :func:`nexcut.ui.scene._spline_np`, so the display
+    and the model agree on how finely a spline is sampled.
+    """
     m = len(ctrl)
-    n = max(24, 8 * m)
+    floor = max(24, 8 * m)
+    if not (step > 0.0):
+        return floor
+    poly = sum(math.dist(ctrl[i], ctrl[i + 1]) for i in range(m - 1))
+    return max(floor, min(MAX_CURVE_SAMPLES, int(poly / step) + 1))
+
+
+def _bspline_pts_np(ctrl: list[Vec2], knots: list[float], degree: int, n: int) -> Polyline | None:
+    """``n + 1`` samples of a clamped, non-rational B-spline via SciPy, or ``None``.
+
+    ``None`` means the knot vector is not one SciPy can evaluate (wrong length,
+    not non-decreasing, empty domain); the caller then uses the de Boor loop,
+    which tolerates anything a ``.chf`` file may hold (03 §7, type 7).
+    """
+    m = len(ctrl)
+    if m < degree + 1 or len(knots) != m + degree + 1:
+        return None
+    lo, hi = knots[degree], knots[m]
+    if not (hi > lo) or any(knots[i] > knots[i + 1] for i in range(len(knots) - 1)):
+        return None
+    import numpy as np
+    from scipy.interpolate import BSpline
+
+    u = np.linspace(lo, hi, n + 1)
+    spline = BSpline(
+        np.asarray(knots, dtype=np.float64), np.asarray(ctrl, dtype=np.float64), degree
+    )
+    return [(float(x), float(y)) for x, y in spline(u)]
+
+
+def _bspline_pts(
+    ctrl: list[Vec2], knots: list[float], degree: int = 3, step: float = DEFAULT_STEP
+) -> Polyline:
+    """Sample a non-rational B-spline by de Boor over ``[knots[p], knots[n]]`` (03 §7, type 7).
+
+    The sample count follows ``step`` (:func:`_bspline_sample_count`).  Where the
+    old fixed count is already enough the de Boor loop below runs unchanged, so
+    the numbers this module produced for short splines are bit-identical.
+    """
+    m = len(ctrl)
+    n = _bspline_sample_count(ctrl, step)
+    if n > max(24, 8 * m):
+        dense = _bspline_pts_np(ctrl, knots, degree, n)
+        if dense is not None:
+            return dense
     lo, hi = knots[degree], knots[m]
     out: Polyline = []
     for i in range(n + 1):
@@ -149,7 +208,7 @@ def flatten_glyph(glyph: Glyph, step: float = DEFAULT_STEP) -> list[Polyline]:
                 pts.extend(seg)
             return [pts]
         case SplineGlyph():
-            return [_bspline_pts(glyph.control_points, glyph.knots, SplineGlyph.DEGREE)]
+            return [_bspline_pts(glyph.control_points, glyph.knots, SplineGlyph.DEGREE, step)]
     raise TypeError(f"not a glyph: {glyph!r}")
 
 

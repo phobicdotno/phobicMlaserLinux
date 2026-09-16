@@ -85,6 +85,20 @@ def test_status_json_and_text(served: Path, capsys: pytest.CaptureFixture[str]) 
     assert "pos mm" in out and "alarms: none" in out and "K=1000 " in out
 
 
+def test_one_shot_arm_does_not_survive_its_process(
+    served: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """docs/DECISIONS.md D9: arming belongs to the connection that asked for it."""
+    s = ["--socket", str(served)]
+    code, out, err = run(["arm", *s], capsys)
+    assert code == 0 and json.loads(out)["arm_state"] == "MOTION_ARMED"
+    assert "D9" in err and "jog --arm" in err
+    assert wait_for(lambda: _status(served)["arm_state"] == "DISARMED")
+    code, _, err = run(["jog", "X", "5", "--wait", *s], capsys)
+    assert code == 1 and "D9" in err
+    assert _status(served)["axes"][0]["position_counts"] == 0
+
+
 def test_one_shot_motion_flow(served: Path, capsys: pytest.CaptureFixture[str]) -> None:
     s = ["--socket", str(served)]
     # Nothing moves without an explicit arm (PORT-PLAN §8).
@@ -92,30 +106,30 @@ def test_one_shot_motion_flow(served: Path, capsys: pytest.CaptureFixture[str]) 
     assert code == 1 and err
     assert _status(served)["axes"][0]["position_counts"] == 0
 
-    code, out, _ = run(["arm", *s], capsys)
-    assert code == 0 and json.loads(out) == {"arm_state": "MOTION_ARMED"}
-
-    code, out, _ = run(["jog", "X", "5", "--speed", "50", "--wait", *s], capsys)
+    # --arm arms, moves and disarms inside one connection (D9); it implies --wait.
+    code, out, _ = run(["jog", "X", "5", "--speed", "50", "--arm", *s], capsys)
     assert code == 0, capsys.readouterr()
     assert json.loads(out.splitlines()[0])["words"] == [3, 0, 50000, 5999, 59990, 5000]  # 11 §2 V2
     assert _status(served)["axes"][0]["position_counts"] == 5000
+    assert _status(served)["arm_state"] == "DISARMED"
 
-    code, out, _ = run(["jog", "x", "-2", "--wait", *s], capsys)  # negative positional
+    code, out, _ = run(["jog", "x", "-2", "--arm", *s], capsys)  # negative positional
     assert code == 0
     assert _status(served)["axes"][0]["position_counts"] == 3000
 
     # A step longer than speed x deadman is leased by the gate: the CLI refreshes it for its
     # expected duration, otherwise the 200 ms deadman would stop the 0.3 s simulator move.
-    code, out, _ = run(["jog", "Y", "20", "--speed", "20", "--wait", *s], capsys)
+    code, out, _ = run(["jog", "Y", "20", "--speed", "20", "--arm", *s], capsys)
     assert code == 0
     assert json.loads(out.splitlines()[0])["deadman"] is True
     assert _status(served)["axes"][1]["position_counts"] == 20000
 
-    code, out, _ = run(["home", "X", "--wait", *s], capsys)
+    code, out, _ = run(["home", "X", "--arm", *s], capsys)
     assert code == 0 and json.loads(out.splitlines()[0]) == {"homing": [0]}
     snap = _status(served)
     assert 0 in snap["homed_slots"] and 1 not in snap["homed_slots"]
     assert snap["axes"][0]["position_counts"] == 0
+    assert snap["arm_state"] == "DISARMED"
 
     code, out, _ = run(["stop", *s], capsys)
     assert code == 0 and "stop_all" in json.loads(out)["sent"]
@@ -125,11 +139,11 @@ def test_one_shot_motion_flow(served: Path, capsys: pytest.CaptureFixture[str]) 
 
 def test_refusals_and_estop(served: Path, capsys: pytest.CaptureFixture[str]) -> None:
     s = ["--socket", str(served)]
-    assert run(["arm", *s], capsys)[0] == 0
     assert wait_for(lambda: _status(served)["machine_state"] == "READY")
-    code, _, err = run(["jog", "W", "1", *s], capsys)  # lift table: DENY in M1 (11 §3)
+    # Deny-listed axes are refused even with --arm (11 §3.3 rows "lift table" / V9-V10).
+    code, _, err = run(["jog", "W", "1", "--arm", *s], capsys)  # lift table: DENY in M1
     assert code == 1 and "refused" in err
-    code, _, err = run(["home", "W", *s], capsys)
+    code, _, err = run(["home", "W", "--arm", *s], capsys)
     assert code == 1 and "refused" in err
     code, _, err = run(["jog", "Q", "1", *s], capsys)
     assert code == 2 and "unknown axis" in err

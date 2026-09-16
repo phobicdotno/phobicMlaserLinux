@@ -118,6 +118,12 @@ def build_job(
         laser_type=laser_type,
         co2_control_type=int(float(hv["LGP.CO2LaserControlType"])),
         zf_type=int(float(hv["ZF.ZFType"])),
+        # The speed word of the prologue 103 and the epilogue 109 (11 §5.2; A3 §8 read
+        # int(v*10) = 1000 off the leaked frames).  A3 could not tell `ZF.ZFFollowSpeed` from
+        # `ZF.ZFUpSpeed` apart because both are 100 on this machine - UNVERIFIED which
+        # descriptor `g+0x49c8` is (11 §7, session E).  Taking the follow speed at least makes
+        # the records follow the machine instead of a hard-coded 100 mm/s.
+        zf_move_speed=float(_value(manu, "ZF.ZFFollowSpeed", 100.0)),
         zf_up_speed=float(_value(manu, "ZF.ZFUpSpeed", 100.0)),
         zf_dock_height=float(_value(manu, "ZF.ZFDockHeight", 20.0)),
     )
@@ -165,7 +171,8 @@ def build_job(
             cl = ContourLaser(
                 gas_port=gas_do_port(ll.gas_type, hv),  # type: ignore[arg-type]
                 laser_port=int(float(hv["LGP.CO2DOLaser"])),
-                pierce_dwell_ms=ll.laser_on_delay_ms + gas_delay_ms,
+                pierce_dwell_ms=ll.laser_on_delay_ms,
+                gas_delay_ms=gas_delay_ms,
             )
             builder.add_contour(motion.xy, freq, duty, cl, cycle)
             pos = motion.xy[-1]

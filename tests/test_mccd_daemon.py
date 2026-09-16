@@ -185,7 +185,9 @@ def test_ipc_status_arm_disarm_round_trip() -> None:
         assert st["link"] == "CONNECTED" and st["arm_state"] == "DISARMED"
         assert st["machine_state"] == "READY" and st["program_version"] == 20152
         assert st["poll_age_s"] is not None and st["poll_age_s"] < 0.5
-        assert c.call("arm_motion") == {"arm_state": "MOTION_ARMED"}
+        # D9: the reply names the connection that now owns the arming.
+        armed = c.call("arm_motion")
+        assert armed["arm_state"] == "MOTION_ARMED" and isinstance(armed["arm_owner"], int)
         wait_ready(daemon)
         res = c.call("jog_step", slot=0, mm=5.0, speed=50.0)
         assert res["words"] == [3, 0, 50000, 5999, 59990, 5000]  # 11 §2 V2
@@ -193,7 +195,9 @@ def test_ipc_status_arm_disarm_round_trip() -> None:
         assert c.call("disarm")["arm_state"] == "DISARMED"
         with pytest.raises(IpcError) as exc:
             c.call("jog_step", slot=0, mm=1.0, speed=50.0)
-        assert exc.value.code in ("refused", "busy")
+        # D9 (safety review R12): a jog needs MOTION_ARMED armed on *this* connection, and
+        # it is refused with the "arming" code that ``home`` has always used for that.
+        assert exc.value.code == "arming" and "D9" in exc.value.message
 
 
 def test_ipc_has_no_raw_register_path() -> None:
@@ -342,7 +346,8 @@ def test_watchdog_simulator_drop_disarms_and_stops() -> None:
         sim.drop_requests(10**9)
         assert wait_for(lambda: daemon.link is Link.LINK_LOST, 3.0)
         assert 0.9 <= time.monotonic() - t0 <= 2.5
-        assert daemon.gate.arming.state is ArmState.DISARMED
+        # the watchdog publishes LINK_LOST first and disarms a step later
+        assert wait_for(lambda: daemon.gate.arming.state is ArmState.DISARMED, 3.0)
         t1 = time.monotonic()
         st = c.call("status")  # must not wait behind the stop's retry ladder
         assert time.monotonic() - t1 < 0.5
@@ -413,7 +418,9 @@ def test_ui_estop_latches_until_acknowledged() -> None:
             c.call("arm_motion")
         assert exc.value.code == "arming"
         assert c.call("ack_estop")["estop_latched"] is False
-        assert c.call("arm_motion") == {"arm_state": "MOTION_ARMED"}
+        # D9: the reply names the connection that now owns the arming.
+        armed = c.call("arm_motion")
+        assert armed["arm_state"] == "MOTION_ARMED" and isinstance(armed["arm_owner"], int)
 
 
 def test_card_estop_bit_latches_and_ack_needs_release() -> None:

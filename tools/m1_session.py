@@ -722,9 +722,10 @@ def render_markdown(report: dict[str, Any]) -> str:
             L.append("```")
             L.append("")
             L.append(
-                "Note: the dissector's request labels follow 04 (it calls 0x65 sub-command 1 "
-                "'home'); per 11 §8 sub-command 1 = STOP, 2 = HOME, 3 = relative jog. The "
-                "per-step write labels above use the 11 §8 names."
+                "Note: request labels follow 11 §8 - 0x65 sub-command 1 = STOP, 2 = HOME, "
+                "3 = relative jog (bit 31 = absolute), 5 = go-to. A summary produced by a "
+                "build older than 2026-09-16 labelled 1 'home' and 3 'move-axis' (04 naming); "
+                "re-run the dissector rather than trusting such a file."
             )
     if report.get("vendor_logs"):
         L.append("")

@@ -218,13 +218,15 @@ def test_dry_run_builder_has_no_laser_content() -> None:
         assert changed == 0 and out == f.payload(i + 1)
     ops = [it.opcode for grp in b.items() for it in grp]
     assert ops.count(9999) == 3  # gas on, laser off (safe), gas off at job end
-    assert total_ticks(frames) == 200 + 1 + 20 + 200
+    # the 5 ms LaserOnDelay is a 2001 wait record, not 20 stationary ticks (A9 §2)
+    assert total_ticks(frames) == 200 + 1 + 200
+    assert [it.args for grp in b.items() for it in grp if it.opcode == 2001].count((5, 3000)) == 1
 
 
 def test_laser_records_are_flagged_and_stripped_by_safety() -> None:
     b = _contour_builder(True)
     frames = b.frames()
-    assert sum(f.laser_items for f in frames) == 1 + 20 + 200  # DO9 on + dwell + cut ticks
+    assert sum(f.laser_items for f in frames) == 1 + 200  # DO9 on + cut ticks (A9 §2: no dwell)
     changed_total = 0
     for i, f in enumerate(frames):
         out, changed = strip_laser_records(f.payload(i + 1))
@@ -234,7 +236,7 @@ def test_laser_records_are_flagged_and_stripped_by_safety() -> None:
                 assert item.args[1] & 0xFFFF == 0
             if item.opcode == 9999:
                 assert item.args[2] & 0x100 == 0
-    assert changed_total == 1 + 20 + 200
+    assert changed_total == 1 + 200
 
 
 def test_gas_port_map_and_unassigned_laser_port() -> None:

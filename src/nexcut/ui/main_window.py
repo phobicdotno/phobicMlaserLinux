@@ -14,9 +14,14 @@ else from the descriptor defaults.  The recent-file list is kept in
 ``QSettings`` (10 entries - port choice; the vendor keeps ``RecentFile`` per
 layer and ``MSC.LatestFilePath``, whose use is not traced).
 
+The "Layer parameters" dock (``lp0``) is the schema-driven CO2 layer page of
+:mod:`nexcut.ui.pages.layer_co2`; it edits the ``layer`` parameter document
+passed as ``layer=`` (descriptor defaults when absent) and exchanges slots with
+the vendor technology library.
+
 SAFETY (PORT-PLAN §8): this window has no machine control.  The "Machine" dock
 is a disabled placeholder for the later ``mccd`` IPC client; nothing here opens
-a socket or talks to the card.
+a socket or talks to the card.  The layer page edits files only.
 """
 
 from __future__ import annotations
@@ -47,6 +52,7 @@ from nexcut.ui.canvas import CanvasWidget, bed_from_hardware, canvas_style
 from nexcut.ui.i18n import Translator, get_translator
 from nexcut.ui.layers import LAYER_COUNT, layer_color, layer_name
 from nexcut.ui.loader import LoadedDocument, LoadError, load_document, save_document
+from nexcut.ui.pages.layer_co2 import Co2LayerPage
 from nexcut.ui.render import ViewFlags
 from nexcut.ui.scene import SceneData
 
@@ -138,6 +144,7 @@ class MainWindow(QMainWindow):
         translator: Translator | None = None,
         manu: object | None = None,
         hard: object | None = None,
+        layer: object | None = None,
         settings: QSettings | None = None,
         interactive: bool = True,
         parent: QWidget | None = None,
@@ -145,6 +152,7 @@ class MainWindow(QMainWindow):
         super().__init__(parent)
         self.t = translator or get_translator()
         self.manu = manu
+        self.layer_params = layer
         self.interactive = interactive
         self.settings = settings or QSettings("nexcut", "nexcut")
         self.document: ChfDocument | None = None
@@ -205,6 +213,17 @@ class MainWindow(QMainWindow):
         self.property_dock.setObjectName("propertyDock")
         self.property_dock.setWidget(self.property_panel)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.property_dock)
+
+        self.layer_page = Co2LayerPage(
+            translator=t,
+            document=self.layer_params,  # type: ignore[arg-type]
+            manu=self.manu,
+        )
+        self.layer_param_dock = QDockWidget(t.tr("lp0", "Layer Parameters"), self)
+        self.layer_param_dock.setObjectName("layerParamDock")
+        self.layer_param_dock.setWidget(self.layer_page)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.layer_param_dock)
+        self.layer_tree.currentItemChanged.connect(self._on_layer_row_selected)
 
         machine = QWidget()
         lay = QVBoxLayout(machine)
@@ -295,7 +314,7 @@ class MainWindow(QMainWindow):
             tools.addAction(a)
             view_menu.addAction(a)
         view_menu.addSeparator()
-        for dock in (self.layer_dock, self.property_dock, self.machine_dock):
+        for dock in (self.layer_dock, self.property_dock, self.layer_param_dock, self.machine_dock):
             view_menu.addAction(dock.toggleViewAction())
 
     def _toggle(self, menu: QMenu, text: str, checked: bool, slot: object) -> QAction:
@@ -334,6 +353,7 @@ class MainWindow(QMainWindow):
         self.document = loaded.document
         self.path = loaded.path if loaded.kind == "chf" else None
         scene = self.canvas.set_document(loaded.document)
+        self.layer_page.set_job(loaded.document)
         self._update_layers(scene)
         self.canvas.zoom_to_fit()
         self._add_recent(loaded.path)
@@ -422,6 +442,14 @@ class MainWindow(QMainWindow):
         except (TypeError, ValueError):
             text = f"X: {dx:.3f}mm  Y: {dy:.3f}mm  Length: {length:.3f}mm"
         self.statusBar().showMessage(text)
+
+    def _on_layer_row_selected(self, item: QTreeWidgetItem | None, _previous: object = None) -> None:
+        """Follow the layer dock's selection with the layer-parameter page (slots are 1-based)."""
+        if item is None:
+            return
+        index = item.data(0, Qt.ItemDataRole.UserRole)
+        if isinstance(index, int):
+            self.layer_page.set_slot(index + 1)
 
     def _on_layer_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
         if column != 0:

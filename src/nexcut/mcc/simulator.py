@@ -28,7 +28,11 @@ What it does:
   byte 2 busy / byte 3 command type / bit 15 homed (A2 §3.1).
 * Exception 2 while "not ready" after a (re)boot (08 §3.3, §7) and exception 3 when a
   motion command arrives while the card is busy (08 §4.5).
-* FIFO items are consumed at a configurable tick; opcode 3000 costs one tick.
+* FIFO items are consumed at a configurable tick (``SimConfig.tick_s``); opcode 3000 costs
+  one tick, every other item is executed between ticks. ``consumed_log_limit`` keeps the
+  executed items so a test can diff the stream the card ran against the planned one, and
+  :attr:`CardSimulator.queue_low_water` records the smallest queue depth seen while the
+  program ran (the PORT-PLAN §8.3 jitter gate).
 * Reg 1016 (FIFO space margin) is reported in *bytes free*, 60000 when the FIFO is empty,
   because that is how the PC side uses it (11 C2, §4.1 row 16; :mod:`nexcut.mcc.fifo`).
   ``SimConfig(fifo_space_unit="items")`` restores the older free-item-slot reading (A2 §2).
@@ -166,6 +170,22 @@ class SimConfig:
     (whether frame prefixes count, how an item is charged) is UNVERIFIED (11 §7 step 8)."""
     fifo_margin_empty: int = FIFO_MARGIN_EMPTY
     """Reg 1016 with an empty FIFO in ``"bytes"`` mode (11 §4.1 row 16)."""
+    fifo_starvation_alarm: bool = True
+    """Raise reg 1007 bit 5 when the running FIFO drains (A2 §2.4).
+
+    **The end of a job looks exactly like starvation and the PC cannot tell the card apart.**
+    The card reports "FIFO empty" (reg 1016 == 60000) at the same instant the last item is
+    consumed, so however fast the PC polls, ``0x67 <- [3]`` always arrives after the FIFO ran
+    dry; if the real card alarmed there, every vendor cut would end in a fault. Either the
+    card does not alarm at a clean drain, or the alarm needs some idle time first - which one
+    is **UNVERIFIED** (11 §7 step 8/9 settles it by watching reg 1007 at the end of a vendor
+    dry run). The conservative reading is kept as the default; the streaming tests of
+    :mod:`nexcut.mccd.feeder` set this to False and measure the queue depth instead
+    (:attr:`CardSimulator.queue_low_water`), which is what PORT-PLAN §8.3 asks for."""
+    consumed_log_limit: int = 0
+    """Keep this many consumed items in :attr:`CardSimulator.consumed_items` so a test can
+    diff the *executed* stream against what the planner emitted.  0 = keep none (default:
+    a 10-minute job is millions of items)."""
     program_id: int = 100
     """UNVERIFIED placeholder."""
     program_version: int = 20152
@@ -301,6 +321,13 @@ class CardSimulator:
         self.items_consumed = 0
         self.ticks_consumed = 0
         self.underruns = 0
+        self.consumed_items: list[FifoItem] = []
+        """Items the FIFO executed, oldest first, capped by ``SimConfig.consumed_log_limit``."""
+        self.consumed_overflow = 0
+        """Items dropped from :attr:`consumed_items` because the cap was reached."""
+        self.queue_low_water: int | None = None
+        """Lowest queue depth in items seen while the program ran (``None`` = never ran).
+        Reset with :meth:`reset_flow_stats`; the PORT-PLAN §8.3 jitter gate reads it."""
         self.position = [0, 0]
         """Accumulated ``(dX, dY)`` of consumed 3000 ticks (low int16 = X, per dissector A3 §5)."""
         self.laser_samples: list[tuple[int, int]] = []
@@ -381,7 +408,26 @@ class CardSimulator:
                 "running": int(self.fifo_running),
                 "x": self.position[0],
                 "y": self.position[1],
+                "low_water": -1 if self.queue_low_water is None else self.queue_low_water,
             }
+
+    def reset_flow_stats(self) -> None:
+        """Forget :attr:`queue_low_water` (call it once the job is streaming)."""
+        with self._lock:
+            self.queue_low_water = None
+
+    def consumed_words(self) -> list[int]:
+        """Flat item words of :attr:`consumed_items` (``header, args…`` per item, 11 §5.2).
+
+        The word stream a test can compare against the planned frames' data, which is what
+        "the card executed exactly what the planner emitted" means (PORT-PLAN §4 M4 gate 1).
+        """
+        with self._lock:
+            out: list[int] = []
+            for item in self.consumed_items:
+                out.append(((len(item.args) * 4) << 16) | item.opcode)
+                out.extend(int(a) & 0xFFFFFFFF for a in item.args)
+            return out
 
     # -- simulation --------------------------------------------------------------------------------
 
@@ -397,17 +443,33 @@ class CardSimulator:
                 while self.fifo and (budget > 0 or self.fifo[0].opcode != OP_TICK):
                     item = self.fifo.popleft()
                     self.items_consumed += 1
+                    self._log_consumed(item)
                     self._execute_item(item)
                     if item.opcode == OP_TICK:
                         budget -= 1
+                depth = len(self.fifo)
+                self.queue_low_water = (
+                    depth if self.queue_low_water is None else min(self.queue_low_water, depth)
+                )
                 if not self.fifo and budget > 0:
                     # Ran dry while running: FIFO starvation (04 §3.7 EtherCATErrorInfo_2_05).
                     self.underruns += 1
                     self.fifo_running = False
-                    self.registers[RO_ALARM2] = (
-                        self.registers.get(RO_ALARM2, 0) | ALARM2_FIFO_STARVATION
-                    )
+                    if self.config.fifo_starvation_alarm:
+                        self.registers[RO_ALARM2] = (
+                            self.registers.get(RO_ALARM2, 0) | ALARM2_FIFO_STARVATION
+                        )
         self._update_status(now)
+
+    def _log_consumed(self, item: FifoItem) -> None:
+        """Keep the executed item for a stream diff (``SimConfig.consumed_log_limit``)."""
+        limit = self.config.consumed_log_limit
+        if limit <= 0:
+            return
+        if len(self.consumed_items) >= limit:
+            self.consumed_overflow += 1
+            return
+        self.consumed_items.append(item)
 
     def _execute_item(self, item: FifoItem) -> None:
         t = item.tick
@@ -425,6 +487,17 @@ class CardSimulator:
     def _set_outputs(self, mask: int, value: int) -> None:
         out = self.registers.get(RO_OUTPUTS, 0)
         self.registers[RO_OUTPUTS] = ((out & ~mask) | (value & mask)) & 0xFFFFFFFF
+
+    def _fifo_overflows(self, new_items: Sequence[FifoItem]) -> bool:
+        """Whether the frame does not fit, in the same unit reg 1016 is reported in.
+
+        In ``"bytes"`` mode the depth that reg 1016 advertises (``fifo_margin_empty``) *is*
+        the capacity; counting items as well would let the card refuse a frame the PC's
+        space test (11 C2) said would fit. UNVERIFIED either way (11 §7 step 8)."""
+        if self.config.fifo_space_unit == "items":
+            return len(self.fifo) + len(new_items) > self.config.fifo_capacity_items
+        extra = 4 * sum(1 + len(item.args) for item in new_items)
+        return 4 * sum(1 + len(i.args) for i in self.fifo) + extra > self.config.fifo_margin_empty
 
     def _fifo_space(self) -> int:
         """Reg 1016 in the configured unit (:attr:`SimConfig.fifo_space_unit`, 11 C2)."""
@@ -609,7 +682,7 @@ class CardSimulator:
             return EXC_BUSY  # UNVERIFIED (cf. EtherCATErrorInfo_2_01 "interpolation data length")
         if frame.frame_id == self.last_frame_id:
             return 0  # UNVERIFIED: a re-sent frame id (08 §4.4) is acknowledged, not re-queued
-        if len(self.fifo) + len(frame.items) > self.config.fifo_capacity_items:
+        if self._fifo_overflows(frame.items):
             return EXC_BUSY  # UNVERIFIED
         self.fifo.extend(frame.items)
         self.last_frame_id = frame.frame_id

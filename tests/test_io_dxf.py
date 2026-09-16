@@ -135,7 +135,13 @@ def test_vendor_bbox_and_cached_geometry(vendor_dxf: Path) -> None:
     r = read_dxf(vendor_dxf)
     bbox = r.bbox
     assert bbox is not None
-    assert bbox[0] == pytest.approx(EXTMIN, abs=1e-6)
+    # $EXTMIN/$EXTMAX are the CAD program's own extents.  Since model/flatten began
+    # to honour the chord step (STATUS X10) the port samples the first spline finely
+    # enough to reach its true leftmost point at x = 210.0390009 (200 001-sample ezdxf
+    # evaluation), 1.1e-3 mm left of the file's own $EXTMIN.  The other three
+    # components still match the header exactly.
+    assert bbox[0].x == pytest.approx(210.0390009, abs=1e-5)
+    assert bbox[0].y == pytest.approx(EXTMIN[1], abs=1e-6)
     assert bbox[1] == pytest.approx(EXTMAX, abs=1e-6)
     for c in _all_contours(r.document):
         assert check_contour(c) == []
@@ -178,8 +184,10 @@ def test_vendor_gates_give_three_closed_contours(vendor_dxf: Path) -> None:
     assert all(isinstance(g, Contour) and is_closed(g) for g in graphs)
     lengths = [g.length for g in graphs]  # type: ignore[union-attr]
     # nearest sort with inner-first: the two holes before the outline
-    assert lengths[-1] == pytest.approx(220.3435, abs=2e-3)
-    assert sorted(lengths[:2]) == pytest.approx([19.2031, 69.2444], abs=2e-3)
+    # converged values: identical at flatten step 0.002, 0.0005 and 0.0001.  They were
+    # 220.3435 / 69.2444 while spline flattening ignored the step (STATUS X10).
+    assert lengths[-1] == pytest.approx(220.3503, abs=2e-3)
+    assert sorted(lengths[:2]) == pytest.approx([19.2031, 69.2492], abs=2e-3)
     assert [type(e.glyph).__name__ for e in graphs[-1].elements] == [
         "SplineGlyph",
         "LwPolylineGlyph",

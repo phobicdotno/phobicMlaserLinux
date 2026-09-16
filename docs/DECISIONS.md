@@ -6,6 +6,26 @@ A decision that rests on a value not proven by evidence says so (UNVERIFIED).
 
 ---
 
+## Index
+
+| Id | Decision | Status |
+|---|---|---|
+| D1 | Un-homed jogs: 10 mm steps, or ≤ 20 mm/s under the deadman | decided |
+| D2 | Soft limits from read-back positions only with a verified position scale | decided; `position_scale_verified` still `false` until the bench measurement |
+| D3 | Default card address is the simulator; the real card only via `--card-ip` | decided |
+| D4 | Transport arbitration: priority bus, short reads, vendor ladder for writes | decided |
+| D5 | The enforcement boundary is the `nexcut-mccd` process | decided; amended for job streaming, the socket directory and safety review R17 |
+| D6 | Deadman and input sources | decided; amended (no lease refresh while disarmed) |
+| D7 | Watchdog scope and recovery | decided, **with one open issue**: jogging off a pressed hard limit while `alarm_1 ≠ 0` (11 §7 step 7) |
+| D8 | Card-side motion gates mirrored on the PC | decided; amended (one motion lock) |
+| D9 | Arming is owned by the IPC connection that asked for it | **decided 2026-09-16**; amended the same day by safety review R12 (the owner also owns the right to move) |
+| D10 | Motion epoch: nothing queued before a stop is sent after it | decided |
+| D11 | No letter key starts motion; the key table is data | **decided 2026-09-16**; re-reviewed unchanged (exhaustive key × mode × case matrix) |
+| D12 | One master per card: an advisory lock keyed by the card address | **decided 2026-09-16**; amended the same day by safety review R13/R14/R15 |
+| D13 | Laser arming (`LASER_ARMED`) | **not written yet** — see "Entries still to be written"; it blocks all of M5 |
+
+---
+
 ## D1 — Un-homed jogs: 10 mm steps, or ≤ 20 mm/s under the deadman (F8)
 
 **Decision.** While an axis is not homed (or its position is not trusted, D2), a relative jog on it is accepted only if
@@ -81,7 +101,11 @@ Periods: 1000/36 every `MCCore × MCUpdateFactor` = 30 ms (04 §1); 2000/50 90 m
 
 ## D5 — The enforcement boundary is the `nexcut-mccd` process (F12)
 
-**Decision.** Only the daemon process owns `McTransaction` and the safety gate. Clients (UI, CLI, tests) talk JSON lines over `$XDG_RUNTIME_DIR/nexcut/mccd.sock` (directory 0700, socket 0600, peer uid must equal the daemon uid). The IPC vocabulary is fixed (`nexcut.mccd.daemon.IPC_COMMANDS`): `ping, status, subscribe, unsubscribe, arm_motion, disarm, jog_step, jog_continuous_start, jog_refresh, jog_continuous_stop, home, stop, estop, ack_estop, read_block, set_do`. There is no raw write, transact or firmware command; `read_block` goes through the read allow-list (11 §3.2); `set_do` only addresses allow-listed ports and can only switch laser outputs **off**; there is no `arm_laser` in this phase.
+**Decision.** Only the daemon process owns `McTransaction` and the safety gate. Clients (UI, CLI, tests) talk JSON lines over `$XDG_RUNTIME_DIR/nexcut/mccd.sock` (directory 0700, socket 0600, peer uid must equal the daemon uid). The IPC vocabulary is fixed (`nexcut.mccd.daemon.IPC_COMMANDS`): `ping, status, subscribe, unsubscribe, arm_motion, disarm, jog_step, jog_continuous_start, jog_refresh, jog_continuous_stop, home, stop, estop, ack_estop, read_block, set_do, load_job, start_job, pause_job, stop_job, job_status`. There is no raw write, transact or firmware command; `read_block` goes through the read allow-list (11 §3.2); `set_do` only addresses allow-listed ports and can only switch laser outputs **off**; there is no `arm_laser` in this phase.
+
+**Job streaming (amendment, task 8).** The five `*_job` commands stream a job planned by `nexcut.plan` into the card FIFO (`src/nexcut/mccd/feeder.py`). They carry no register address and no item words: `load_job` takes the path of a planned frame file (or, in process, an iterator of packed frames), every frame is validated against the item grammar of 11 §5.2 and neutralised by `strip_laser_records` as it is read, and the gate strips it again on the way out. `load_job` needs `MOTION_ARMED` because the job token comes from `ArmingStateMachine.begin_job`, and it is refused outright while `LASER_ARMED`: this phase runs dry runs only. `stop` / `estop` / `disarm` and every watchdog trip end the job; `stop_job` is the clean one (`0x67 <- [3]`, `0x67 <- [1]`, token dropped, machine still armed). A feeder reaches its final state *before* that closing pair is on the wire, so `load_job` waits for the previous feeder's thread (`JobFeeder.closed`, up to `CLEAN_STOP_JOIN_S` = 5 s) and otherwise refuses with "the previous job is still stopping": without it the old feeder's clean stop would clear the new job's queue. Tests: `tests/test_mccd_job.py`, `tests/test_perf_streaming.py`.
+
+**A stop on a job that never started (amendment, safety review R17).** `JobFeeder.request_stop` now finishes a job whose thread was never created: state `STOPPED`, `closed` set, job token returned. Before, such a job stayed `LOADED` with a latent stop flag, and two things followed. `start_job` after `stop_job` cleared the FIFO, streamed the frames and sent `0x67 ← [2]` before the streaming loop looked at the flag — the card saw `clear, start, stop, clear` and briefly ran a program the operator had already stopped (PORT-PLAN §8.2 says a stop ends motion, not "starts it once more"). And because the job never reached a final state, every later `load_job` was refused with `a job is already loaded (LOADED)` for the life of the daemon, with no IPC way out. `_stream` also re-checks the stop flag on entry and immediately before `0x67 ← [2]`, and the feeder now carries the motion epoch (D10) of its `start_job` request instead of reading the current one on the streaming thread. Tests: `test_r17_*`.
 
 **Why.** Inside one Python process nothing can hide `SafeMccClient.client` or `McTransaction.transact` (which can send func 0x26 or any register). A process boundary with a narrow protocol is the only enforcement that holds against a buggy or hostile UI (PORT-PLAN §2.3).
 
@@ -142,11 +166,27 @@ Periods: 1000/36 every `MCCore × MCUpdateFactor` = 30 ms (04 §1); 2000/50 90 m
 
 ---
 
-## D9 — Arming lifetime (OPEN)
+## D9 — Arming is owned by the IPC connection that asked for it
 
-**Open.** `MOTION_ARMED` is daemon state: it persists after the connection that armed closes (TUI `q`, CLI `arm` exits, crashed UI). Any later client of the same uid can then jog or home without its own `arm_motion` (strict xfail `test_r9_arming_does_not_outlive_the_arming_client`). The one-shot CLI flow `nexcut-mccd arm` → `nexcut-mccd jog` relies on this, and PORT-PLAN §8.2 does not define the lifetime.
+**Status: decided (2026-09-16) and enforced.** This entry was the open question "who owns the arming?"; option (a) was taken, implemented, and then amended the same day by safety review R12 (see below), which found that the first implementation owned the *lifetime* of arming but not the right to move. The strict xfail X3 is an ordinary passing test now.
 
-**Options.** (a) disarm when the arming connection closes (CLI would need `jog --arm` in one process); (b) disarm after N s without a motion command (UNVERIFIED value); (c) keep, and have the TUI/m1 tool disarm on exit. Decide before M1 on the machine.
+**Decision.** Option (a) of the open entry. `arm_motion` records the connection that sent it (`MccDaemon._arm_owner`, returned as `arm_owner` in the reply; a later `arm_motion` on another connection transfers ownership). When that connection closes — clean close, `q` in the TUI, a crash, a socket error — the daemon runs the same sequence as an operator `disarm`: invalidate the motion epoch (D10), cancel a homing job, disarm, and — if anything could still be moving — send the stop sequence. The jogs that connection itself started were already stopped per axis one step earlier by the input-source rule (D6); the stop sequence covers what *another* client started while the machine was armed. `arm_motion` without a connection is refused.
+
+A motion command refused because nothing armed this connection says so: the refusal text names D9 and `nexcut-mccd jog --arm`.
+
+**Why.** PORT-PLAN §8.2 requires an explicit operator arming step before anything moves. With arming as daemon state it was not the *operator* who armed but whoever had armed last, possibly hours earlier in a process that no longer exists: a stray `nexcut-mccd jog` (or any buggy client of the same uid) then moved the machine with no arming step of its own. Refusing that is the whole point of the arming state. The strict xfail `test_r9_arming_does_not_outlive_the_arming_client` is now a passing test, and it kills the arming client with SIGKILL, not a clean close.
+
+Option (b), an idle timeout, was rejected: the timeout value would be UNVERIFIED, and it still leaves a window in which a foreign client moves. Option (c), "have the TUI and the m1 tool disarm on exit", was rejected because it protects only against tidy clients — the case that matters is the untidy one.
+
+**Cost, and how the one-shot CLI keeps working.** `nexcut-mccd arm` followed by `nexcut-mccd jog` no longer works (the first process exits, so the daemon disarms; `arm` prints that on stderr). `nexcut-mccd jog --arm` and `home --arm` arm, move and disarm inside one connection instead. `--arm` implies `--wait`, because the disarm on exit stops whatever is still moving. `tools/m1_session.py` is unaffected: it arms and moves on one long-lived `DaemonLink` connection.
+
+**The owner also owns motion (amendment, safety review R12).** `jog_step`, `jog_continuous_start`, `home`, `load_job` and `start_job` are accepted only on the connection that is the current `_arm_owner`; any other connection gets `arming: … needs MOTION_ARMED armed on this connection … (docs/DECISIONS.md D9)`. The first version of D9 tied only the *lifetime* of arming to a connection, so while the arming client was alive **any** other client of the same uid still jogged, homed and streamed jobs without an arming step of its own — precisely the stray-`nexcut-mccd jog` case this entry calls the whole point of the arming state, and a window in which a client that connected after `arm_motion` inherited an armed machine. `arm_motion` on another connection still transfers ownership, so a deliberate hand-over works. Stops are deliberately **not** owned: `stop`, `estop`, `disarm`, `jog_continuous_stop`, `pause_job` and `stop_job` are accepted from any connection, so a stuck arming client can never lock an operator out. `jog_refresh` is not owned either — the TUI refreshes the deadman on its own connection (`IpcBackend._refresh_loop`), and a lease cannot be refreshed while the machine is DISARMED (D6 amendment), so the arming owner's death still ends it. In-process callers (`conn is None`, e.g. `load_job_frames`) are inside the D5 boundary and are not checked.
+
+**Residual (documented, not fixed).** A client that is alive but stuck — SIGSTOPped, hung in a syscall, or half-closed on the read side only — never produces a close event, so it keeps the machine armed. D9 rejected an idle timeout, and with the amendment above a stuck owner can no longer be *used* by anything else: nothing moves, and any connection can still stop and disarm. A half close (`shutdown(SHUT_WR)`) does disarm: the daemon's reader sees EOF. Tests: `test_r19_*`.
+
+**Where.** `MccDaemon._cmd_arm_motion`, `_require_arm_owner`, `_release_arming`, `_disarm_and_stop`, `_arming_hint`; `nexcut.mccd.cli._armed`, `_jog`, `_home`, `_one_shot`. Tests: `tests/test_mccd_safety_review.py::test_r9_*`, `test_r12_*`, `test_r19_*`, `tests/test_mccd_cli.py::test_one_shot_arm_does_not_survive_its_process`.
+
+**How to change.** Code only. To let arming survive its client (not recommended), drop the `_release_arming` call in `MccDaemon._on_close`; the CLI `--arm` flag keeps working either way.
 
 ---
 
@@ -162,14 +202,62 @@ Periods: 1000/36 every `MCCore × MCUpdateFactor` = 30 ms (04 §1); 2000/50 90 m
 
 ---
 
-## D11 — TUI letter bindings under Caps Lock (OPEN)
+## D11 — No letter key starts motion; the key table is data
 
-**Fixed.** Stop (`s`), E-stop (`e`) and disarm (`d`) keys accept both cases: with Caps Lock on they arrived uppercase and were "not bound" (test `test_r7_tui_stop_keys_work_with_caps_lock`).
+**Status: decided (2026-09-16) and enforced.** X4 is an ordinary passing test. Re-reviewed on the same day against an exhaustive matrix (112 keys × 4 modes × both cases, plus every `CSI 1;<mod>` escape sequence, `Alt+<letter>` and every control code 1–31) and left **unchanged**: motion in normal mode is exactly `{UP, DOWN, LEFT, RIGHT, PGUP, PGDN, S_UP, S_DOWN, S_LEFT, S_RIGHT}`, in the home menu exactly `{x, X, y, Y, b, B}`, and nothing at all in the read prompt or the help overlay (`tests/test_mccd_safety_review.py::test_r18_*`).
 
-**Open.** The vi-style continuous-jog keys are uppercase `H J K L`. With Caps Lock on, `h` (home menu) arrives as `H` and starts a continuous jog X− at 20 mm/s for the initial hold (0.7 s ≈ 14 mm) — motion from a menu key (strict xfail `test_r7_caps_lock_home_key_does_not_start_motion`). Curses cannot see the Caps Lock state. Options: drop the letter bindings (Shift+arrows only), move the home menu to a key whose other case is not a motion key, or require a second confirmation key for letter-started jogs.
+**Decision.** The TUI key map is one table, `nexcut.mccd.tui.KEY_BINDINGS` (`KeyBinding(keys, action, label, what, mode, motion, arg)`), and the controller does nothing that is not a row of it. Two rules hold over the whole table:
+
+1. **Motion keys are named keys only.** In normal mode a jog is started by the arrow keys (step), PgUp/PgDn (W step) and Shift+arrow (continuous). The vi-style `H J K L` continuous-jog keys are **removed**. Homing keeps letter keys, but only inside the `home` menu that `h` opens — a two-key confirmation with a prompt on screen, never one keystroke.
+2. **Every printable key is bound in both cases**, so Caps Lock or a stuck Shift cannot change what a key does.
+
+`?` shows the whole table as a help overlay built from it (`tui.help_lines`, any key returns); the two footer lines of the normal screen name the same keys in short form.
+
+Keys after the change: `m` arm, `d` disarm, `a` acknowledge E-stop (was `A`), `h` home menu, `r` read block, `?` help, `q` quit, `[` `]` step size, space/`s` STOP, Esc/`e` E-STOP — each in both cases. Home menu: `x`, `y`, and `b` = X then Y (was `a`, which now collides with nothing) and only with `--allow-home-all`. Acknowledging the E-stop is a normal-mode key now, not a global one, so the home menu's letters cannot be shadowed by it.
+
+**Why.** Curses cannot see the Caps Lock state, so binding `H` is really binding `h` as well. With Caps Lock on, the home-menu key `h` arrived as `H` and started a continuous jog X− at 20 mm/s for the initial hold (0.7 s ≈ 14 mm): motion from a menu key, PORT-PLAN §8.2's "nothing moves without an explicit operator step" broken by a stuck modifier. The same trap was latent in `l`/`j`/`k` (unbound lowercase, motion uppercase) and, less dangerously, in `m`/`M` and `A`/`a`. Removing the letter jogs costs the terminals that send no Shift+arrow; both xterm (`CSI 1;2A`) and rxvt (`CSI a`) do, and `tokenize` decodes both.
+
+The rules are enforced by tests over the table itself, not key by key: `test_r7_key_table_has_no_case_or_motion_trap` (each alphabetic key resolves to the same binding as its swapped case; every `motion=True` row outside the home menu uses only names from `KEY_NAMES`) and `test_r7_no_printable_key_starts_motion_in_normal_mode` (all 95 printable characters, fed to a fresh controller, send no `jog*`/`home`).
+
+**Where.** `src/nexcut/mccd/tui.py`: `KEY_BINDINGS`, `BINDINGS_BY_MODE`, `binding_for`, `help_lines`, `TuiController.handle_key` / `_normal_key` / `_home_menu_key`. Tests: `tests/test_mccd_safety_review.py::test_r7_*`, `tests/test_mccd_cli_tui.py`.
+
+**How to change.** Add a row to `KEY_BINDINGS`; a printable key must list both cases, and a `motion=True` row outside `MODE_HOME` must use key *names* (`S_UP`, `PGUP`, …), or the two tests above fail.
 
 ---
 
-## D12 — Single master per card (OPEN)
+## D12 — One master per card: an advisory lock keyed by the card address
 
-**Open.** Nothing prevents a second `nexcut-mccd` (different `--socket`) from driving the same card address: two gates, two E-stop latches, two deadmen, two sequence counters on one card (strict xfail `test_r11_second_daemon_on_same_card_is_refused`). Today "single master" is only an item of the `tools/m1_session.py` checklist. Options: an `flock` on `$XDG_RUNTIME_DIR/nexcut/card-<ip>-<port>.lock` (same user and machine only); detecting foreign traffic is not possible from the reply stream (UNVERIFIED whether the card answers two masters).
+**Status: decided (2026-09-16) and enforced.** X5 is an ordinary passing test. Amended the same day by safety review R13/R14/R15 — the first implementation could be defeated by deleting the lock file, did not check the directory or file ownership, and keyed on the raw address string. What the lock still cannot see is listed under "Limits" and pinned by a test, so it is not mistaken for coverage.
+
+**Decision.** `MccDaemon.start()` takes an exclusive, non-blocking `flock` on `$XDG_RUNTIME_DIR/nexcut/card-<ip>-<port>.lock` (`/tmp/nexcut-<uid>/…` without `XDG_RUNTIME_DIR`, following `default_socket_path`) and holds it until `close()`. The file contains the holder's pid; a second daemon is refused before it sends anything, with `another nexcut-mccd is already driving the card at <ip>:<port> (pid N); only one master per card (docs/DECISIONS.md D12, lock <path>)`. The IPC socket path is the second interlock, unchanged: `IpcServer._prepare_path` refuses a socket another daemon already answers on (and removes a stale one). The lock is taken **first**, so a second daemon with a different `--socket` never reaches the card.
+
+Key = address, not socket: `--card-ip 10.1.1.168` twice collides, `--sim` twice does not (each simulator gets its own ephemeral port).
+
+**Stale locks.** A holder killed with SIGKILL leaves the file but not the lock: the kernel drops an `flock` when the last descriptor closes, so the next daemon acquires it and overwrites the pid. Nothing has to time out or be cleaned up by hand. On a clean release the file is unlinked while the lock is still held, and an acquirer that opened the old inode in that window notices (it compares `fstat(fd)` with `stat(path)`) and retries, so unlinking cannot hand the same card to two daemons.
+
+**Why.** Two daemons on one card means two safety gates, two E-stop latches, two deadmen and two sequence counters: each would see the other's replies as unexpected, and a stop from one would be invisible to the other's state. Before this, "single master" was only a checklist line in `tools/m1_session.py` (bench prerequisite 6).
+
+**The lock is re-asserted, not just taken (amendment, safety review R13).** An `flock` lives on the *inode*, not on the name, so a lock file deleted or replaced while the holder runs stops protecting anything: the next daemon creates a new inode, locks that one and drives the same card. This needs no attacker — the refusal message names the lock path, which invites "just delete the stale lock", and in the `/tmp/nexcut-<uid>` fallback any local user can replace the file. `CardLock.reassert()` compares `stat(path)` with `fstat(fd)` and the daemon's watchdog calls it every `_CARD_LOCK_RECHECK_S` = 1 s (UNVERIFIED port choice): a removed or replaced file is **re-taken**, so a second daemon is refused again; if another process got the new inode first there are two masters, and this daemon stops being one — `MccDaemon.card_lock_lost` is set, the watchdog trip disarms and stops, and `arm_motion` is refused until the daemon is restarted. Tests: `test_r13_*`.
+
+**Directory and file ownership (amendment, safety review R14).** The lock directory now gets the same check as the IPC socket directory (D5 amendment): `ipc.ensure_private_dir` refuses a symlink or a directory owned by another uid, and the lock file is opened `O_NOFOLLOW` and refused unless this uid owns it. Before, `CardLock` created the directory with `mkdir(mode=0o700)` and used whatever was already there. Test: `test_r14_*`.
+
+**Key normalisation (amendment, safety review R15).** The key is the *normalised* address (`_card_key`): `ipaddress.ip_address` canonical form, IPv4-mapped IPv6 folded to IPv4, so `10.1.1.168`, `::ffff:10.1.1.168` and `::1` / `0:0:0:0:0:0:0:1` collide. Test: `test_r15_*`.
+
+**Limits.** An advisory lock binds only this user on this host. It says nothing about Mlaser under Wine, the machine's own control PC, or a second workstation on the card network — those stay operator discipline (M1-BENCH-SESSION §4 prerequisite 6). Detecting a foreign master from the reply stream is not possible; whether the card even answers two masters is UNVERIFIED. **Undetectable by the lock, and left that way on purpose:** a host *name* and its address (`--card-ip laser.local` vs `--card-ip 10.1.1.168`) are two different keys, because resolving a name in `MccDaemon.start()` would put a DNS lookup in front of the card lock; likewise a card reachable on two addresses (second NIC, NAT, a router alias). `test_r15_the_card_lock_key_normalises_the_address` pins this as a known gap so it is not mistaken for coverage.
+
+**Where.** `nexcut.mccd.daemon.card_lock_path`, `CardLock`, `MccDaemon.start` / `close`. Tests: `tests/test_mccd_safety_review.py::test_r11_*` (second daemon, same socket path, SIGKILLed holder), `test_r13_*` (re-assert, a lost lock disarms, a lost lock is released without deleting the winner's file), `test_r14_*` (directory and file ownership, 0700/0600), `test_r15_*` (address normalisation and the documented gaps).
+
+**How to change.** The path comes from `card_lock_path()`; set `XDG_RUNTIME_DIR` to move it. There is no flag to disable the lock: a second master is never wanted.
+
+---
+
+## Entries still to be written
+
+* **D13 — laser arming (`LASER_ARMED`).** D5 says this needs its own entry, and nothing in the port
+  can reach `LASER_ARMED` until it exists: there is no `arm_laser` in `IPC_COMMANDS`,
+  `strip_laser_records` removes every DO9/PWM/DA record, and `mccd/feeder.py` refuses to load a job
+  while `LASER_ARMED` as a placeholder. The entry has to settle the IPC shape, the job token the
+  command must quote, the operator confirmation, and the auto-disarm rule (stop / alarm / comm loss
+  / job end). It blocks all of M5 and needs no measurement — only a decision.
+* **The open half of D7** (see that entry): whether the operator may jog off a pressed hard limit
+  while `alarm_1 ≠ 0`. Settled by 11 §7 step 7, not by argument.

@@ -199,6 +199,70 @@ Check it from a third terminal: `.venv/bin/nexcut-mccd status`. It should show
 `link CONNECTED`, `DISARMED` and machine state `READY`. Do not use the TUI to move the machine
 during the session: every motion should come from the tool so that it is recorded.
 
+**Only one daemon may talk to the card** (docs/DECISIONS.md D12). A second `nexcut-mccd` on the same
+`--card-ip` — even with another `--socket` — is refused before it sends anything:
+
+```
+nexcut-mccd: another nexcut-mccd is already driving the card at 10.1.1.168:502 (pid 12345);
+only one master per card (docs/DECISIONS.md D12, lock /run/user/1000/nexcut/card-10.1.1.168-502.lock)
+```
+
+If you see that and no daemon should be running, `ps -p <pid>` names the holder. A daemon that was
+killed with `kill -9` leaves the lock file behind but not the lock, so the next start just takes it —
+never delete the lock file by hand while a daemon is running. This lock covers only this laptop and
+this user: it cannot see Mlaser under Wine or the machine's own control PC (checklist item 6).
+
+**Arming — and the right to move with it — belongs to one connection** (docs/DECISIONS.md D9).
+`nexcut-mccd arm` in one terminal followed by `nexcut-mccd jog` in another no longer works: the
+daemon disarms as soon as the `arm` process exits. And even *while* the session tool is armed, a
+`jog`, `home` or `run-job` sent from another terminal is refused — arming is not a machine-wide
+mode, it is held by the connection that asked for it:
+
+```
+arming: jog_step needs MOTION_ARMED armed on this connection (another connection holds the
+arming): arming - and the right to move with it - belongs to the connection that asked for it
+(docs/DECISIONS.md D9). Send arm_motion on this connection, or use 'nexcut-mccd jog --arm' /
+'home --arm' / 'run-job --arm'
+```
+
+That is deliberate: during the session every motion must come from the tool, so that it is
+recorded. **Stopping is never owned** — `nexcut-mccd stop`, `estop`, `ack-estop` and `disarm` work
+from any terminal at any time, which is what makes it safe to leave the session tool holding the
+arming. For a one-shot move outside the session tool use
+
+```sh
+.venv/bin/nexcut-mccd jog X 5 --speed 20 --arm      # arms, moves, waits, disarms
+.venv/bin/nexcut-mccd home X --arm
+```
+
+`tools/m1_session.py` and the TUI keep one connection open for commands, so they are unaffected.
+The TUI's deadman refresher runs on a second connection on purpose: `jog_refresh` is not owned, so
+a jog keeps its lease, but a refresh cannot revive a lease while the machine is disarmed (D6).
+
+**TUI keys changed** (docs/DECISIONS.md D11). If you open `.venv/bin/nexcut-mccd tui` to watch status
+or to recover between steps, note that **no letter key starts motion any more**: the vi-style
+`H J K L` continuous-jog keys are gone. Press `?` in the TUI for the full list.
+
+| Key | Action |
+|---|---|
+| space or `s` | STOP (works in every mode, either case) |
+| Esc or `e` | E-STOP, latches |
+| `a` | acknowledge the E-stop latch (was `A`) |
+| `m` / `d` | arm motion / disarm |
+| arrows | step jog X/Y by the current step size |
+| PgUp / PgDn | step jog W (lift table) |
+| **Shift+arrows** | continuous jog X/Y while held — the only continuous-jog keys |
+| `[` `]` | step size 0.1 / 1 / 10 mm |
+| `h` then `x` / `y` | home one axis (`b` = X then Y, only with `--allow-home-all`; was `a`) |
+| `r` | read a register block `ADDR/N` |
+| `?` / `q` | key list / quit (the daemon keeps running, and disarms — D9) |
+
+Every printable key works with Caps Lock on: each is bound in both cases. Only STOP and E-STOP are
+global; `a` (acknowledge) is a normal-mode key, so it cannot shadow the home menu's `x` / `y` / `b`.
+Continuous jog needs a terminal that sends Shift+arrow — xterm (`CSI 1;2A`) and rxvt (`CSI a`) both
+do. Arming in the TUI (`m`) and its jogs share one connection, so the D9 rule above is invisible
+there.
+
 ---
 
 ## 6. Run the session tool
@@ -221,6 +285,10 @@ In the third terminal:
 | `--power-cycle-timeout-s 300` | 300 s | step 10 wait for reconnection |
 | `--vendor-log-dir DIR` | `~/.wine/drive_c/users/$USER/AppData/Local/NexCut/Log` | Mlaser logs to copy into the report |
 | `--socket PATH` | `$XDG_RUNTIME_DIR/nexcut/mccd.sock` | daemon socket |
+| `--date YYYY-MM-DD` | today | the date tag used in the default pcap and report paths |
+| `--motion-timeout-s 30` | 30 s | how long one motion may take before the step is recorded as timed out |
+| `--connect-timeout-s 30` | 30 s | how long to wait for the daemon to report `CONNECTED` at the start |
+| `--estop-wait-s 5` | 5 s | step 2: how long to wait for alarm word 1006 bit 30 to follow the hardware E-stop |
 | `--no-dissector` | off | skip the pcap analysis |
 
 How it prompts:
@@ -493,10 +561,31 @@ followed Y.
 
 * The tool reads the FIFO baseline from `1000/36`: 1015 frame id, 1016 margin (expected 60000 when
   empty), 1017 and 1019.
-* The streaming part is **deferred in this build**:
-  `0x67 <- [1]`, first frame of a planned 100 mm pure-X move at 50 mm/s with duty 0 and no
-  DO9/PWM records, 1015/1016 before and after, the rest of the stream, then `0x67 <- [2]`.
-* `nexcut-mccd` has no FIFO streaming IPC command yet (M3/M4). O6's FIFO half stays open.
+* The streaming part **exists in software since 2026-09-16** but has only ever run against the
+  card simulator, so it is *not* part of this session's required sequence. If the owner chooses to
+  run it, the sequence is:
+
+  ```sh
+  .venv/bin/nexcut-plan line100.chf --layer-xml BkLayerPara.xml --hard-xml BkHardPara.xml -o f.txt
+  .venv/bin/nexcut-mccd run-job f.txt --arm      # rehearse this against `serve --sim` first
+  ```
+
+  `nexcut-mccd run-job` does exactly what the deferred note described: `0x67 <- [1]`, then frames
+  under reg 1015/1016 flow control, then `0x67 <- [2]`, and always `0x67 <- [3]` + `0x67 <- [1]`
+  at the end. It is a dry run — laser records are stripped three times over (PORT-PLAN §8.2) —
+  but **it does move the gantry**, so the step-1 preconditions of §4 apply in full and the
+  operator keeps a hand on the E-stop. `job-status --json` shows frames sent, reg 1015/1016 and
+  the queue low water, which is what O1 and C2 are read from.
+* Two behaviours to expect, both added by the streaming review and both relevant here: the feeder
+  waits for a status poll taken **after** `0x67 <- [1]` before its first fill, and refuses to start
+  a program at all if nothing fitted (`no frame fits the card FIFO after 0x67 ← [1]`) — the card is
+  never told to run an empty FIFO. And a frame reg 1015 has not acknowledged within 600 ms
+  (`ipAdd.ini FifoTimeout`) is re-sent once and then the job is aborted; the vendor silently drops
+  it instead. If the card re-runs a re-sent frame rather than ignoring it, that shows up here as a
+  doubled move, so watch the first run closely.
+* Running it natively also closes O6's FIFO half (a FIFO start without the licence exchange).
+  Until it has been run once on the card, treat O6's FIFO half as open and prefer the vendor
+  variant below, which is what the tick period was always going to come from.
 
 **Vendor variant (tick period from the capture).** Follow the handover in §8, then in Mlaser:
 
@@ -664,6 +753,11 @@ cp -a "/home/karstein/Documents/CF1390-250715-1084-0973/Mlaser-v0.0.0.52/." ~/.w
 | Motion refused `arming: E-stop latched` | Release the hardware E-stop, then `nexcut-mccd ack-estop` (or answer `y` to the tool's acknowledge prompt) |
 | Motion refused `busy: axis status not refreshed…` | Normal right after a motion. Repeat the step with `--steps N` |
 | Motion refused `refused: axis … not homed …` | The D1 rule: un-homed steps up to 10 mm, continuous jog at ≤ 20 mm/s |
+| Motion refused `… (state DISARMED); arming ends with the connection that asked for it` | D9. Arm on the same connection: use `nexcut-mccd jog --arm` / `home --arm`, or let the session tool arm |
+| Motion refused `arming: … needs MOTION_ARMED armed on this connection (another connection holds the arming)` | D9 again, the other half: something *is* armed, but not your connection — normally the session tool. Move from the tool, or stop it first. Stops and `disarm` are never refused this way |
+| `run-job` refused `busy: axis status not refreshed since the last motion command` | The FIFO start waits for a 2000/50 poll newer than the last motion write (~90 ms). Wait a moment and run it again; the CLI does not retry yet |
+| `run-job` fails `no frame fits the card FIFO after 0x67 ← [1] (reg 1016 = …)` | The card still holds a program, or reg 1016 is not what the port assumes. Send `stop`, check `job-status --json`, and record reg 1016 — this is one of the numbers step 8 exists to settle |
+| Daemon start refused `another nexcut-mccd is already driving the card …` | D12. `ps -p <pid>` names the holder; stop it. Do not delete the lock file by hand |
 | Motion outcome `aborted: daemon disarmed (…)` | The watchdog saw an alarm, a limit bit or comm loss. See `report.json` → `events` → `status` |
 | tcpdump "Permission denied" on the file | Use `-Z "$USER"`, or write to `/tmp/…pcap` and pass `--pcap` |
 | pkexec dialog does not appear | It needs the graphical session. Run tcpdump from a GNOME Terminal, not over SSH |
@@ -674,13 +768,23 @@ cp -a "/home/karstein/Documents/CF1390-250715-1084-0973/Mlaser-v0.0.0.52/." ~/.w
 
 ## 11. Known limits of this build and UNVERIFIED items
 
-* **Deferred natively:** step 4, because the IPC has no absolute move, and step 8's FIFO stream,
-  because the IPC has no FIFO commands. Both have vendor variants. Step 9 is vendor-only by nature.
+* **Deferred natively:** step 4, because the IPC has no absolute move. Step 9 is vendor-only by
+  nature. Step 8's FIFO stream is no longer deferred in software — `nexcut-mccd run-job` streams a
+  planned frame file — but it has only been exercised against the simulator, so the vendor variant
+  stays the primary way to get the tick period.
+* **A link blip ends the arming.** `tools/m1_session.py` reconnects to the daemon lazily, and a
+  reconnect is a *new* connection: it inherits neither the arming nor the right to move (D9, and the
+  R12 amendment). If a step fails with an `arming:` refusal after a hiccup, re-run just that step
+  with `--steps N` — the tool arms again at the next motion prompt. Nothing moves in the meantime,
+  which is the intended direction of the failure.
 * **Jog-while-moving (step 3)** is refused PC-side by the daemon (D8), so the card's exception 3
   shows only in the vendor capture.
 * **Continuous jog speed (step 5)** is 20 mm/s natively; 50 mm/s only via the vendor variant.
-* **Dissector labels.** `python -m nexcut.mcc.dissector` still names 0x65 sub-command 1 "home"
-  (04 naming). Per 11 §8, 1 = STOP and 2 = HOME. The tool's per-step census uses the 11 §8 names.
+* **Dissector labels.** `python -m nexcut.mcc.dissector` now uses the 11 §8 names: 0x65 sub-command
+  1 = `stop`, 2 = `home`, 3 = `jog` (relative; bit 31 = absolute), 5 = `goto`, 101 = `zf-stop`, and
+  each line carries the decoded meaning (`axis X distance +5.000 mm (relative), v 20.000 mm/s, …`).
+  A capture dissected with an older build reads sub-command 1 as "home" and 3 as "move-axis" —
+  re-run the dissector rather than trusting such a summary.
 * **UNVERIFIED** (recorded as such in the tool):
   * that the card answers the 1-word marker read `READ 1000/1`;
   * `tcpdump -Z "$USER"` behaviour on this laptop;

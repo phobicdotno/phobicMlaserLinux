@@ -25,6 +25,10 @@ Threads (all blocking I/O; transactions are serialised by :class:`~nexcut.mccd.g
   8) are handled by the gate on every status read (stop + disarm, bit 30 latches E-stop).
 * **publisher** - status subscription stream.
 * **homing** - one job at a time, axes one after the other (11 §2 V6 "one axis at a time").
+* **feeder** (one per loaded job, :mod:`nexcut.mccd.feeder`) - fills the card FIFO from a
+  planned frame stream with the reg 1015 / 1016 flow control of 11 §5.1 / A3 §7. It consumes
+  the fast thread's block 1000 instead of polling itself, so streaming never displaces the
+  30 ms status poll.
 
 Jog rules (docs/DECISIONS.md D1, F8): before homing, relative steps <= 10 mm per command,
 continuous jog only at <= 20 mm/s under the deadman; after homing (with a trusted position
@@ -38,18 +42,34 @@ while the write is queued makes the gate refuse it under the bus. A stop that a 
 not deliver (dead link) is re-sent after the start-up sequence, before the link is
 reported CONNECTED again (PORT-PLAN §8.2).
 
+Arming (docs/DECISIONS.md D9): ``arm_motion`` is owned by the IPC connection that sent it.
+When that connection closes - cleanly, on ``q`` in the TUI, or because the client was killed -
+the daemon cancels homing, disarms and sends the stop sequence if anything could be moving.
+The one-shot CLI flow is ``nexcut-mccd jog --arm`` / ``home --arm``, which does all three on
+one connection.
+
+Single master (docs/DECISIONS.md D12): :meth:`MccDaemon.start` takes an advisory ``flock`` on
+``$XDG_RUNTIME_DIR/nexcut/card-<ip>-<port>.lock`` (:class:`CardLock`) before it touches the
+card, so a second daemon on the same card address is refused even with another socket path.
+
 Laser: there is no ``arm_laser`` command in this phase; laser DO ports can only be switched
-off over IPC (PORT-PLAN §8.2).
+off over IPC (PORT-PLAN §8.2). Job streaming is therefore a **dry run**: ``load_job`` refuses
+to build a job while ``LASER_ARMED``, strips every laser record as it reads the frames, and
+the gate strips them again on the way out (docs/DECISIONS.md D5).
 """
 
 from __future__ import annotations
 
 import contextlib
+import fcntl
+import ipaddress
 import logging
 import math
+import os
+import re
 import threading
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
@@ -59,6 +79,7 @@ from nexcut import __version__
 from nexcut.core.config import NexcutConfig, default_socket_path
 from nexcut.mcc import commands as C
 from nexcut.mcc.commands import MachineParams, Policy
+from nexcut.mcc.fifo import PackedFrame, count_frame_file, iter_frame_file
 from nexcut.mcc.registers import (
     AXIS_RO_WORDS,
     MachineState,
@@ -75,16 +96,26 @@ from nexcut.mcc.safety import (
     classify_read,
 )
 from nexcut.mcc.transaction import CardBusy, CardRefused, McError, McTransaction, RetryPolicy
+from nexcut.mccd.feeder import FeederConfig, JobError, JobFeeder, JobState, frames_from_words
 from nexcut.mccd.gate import BusClient, MccdGate, MotionRules, Priority, PriorityBus
-from nexcut.mccd.ipc import PROTOCOL_VERSION, Connection, IpcError, IpcServer
+from nexcut.mccd.ipc import (
+    PROTOCOL_VERSION,
+    Connection,
+    IpcError,
+    IpcServer,
+    ensure_private_dir,
+)
 from nexcut.mccd.status import StatusSnapshot, axis_limit_blocks, watchdog_reasons
 
 __all__ = [
     "IPC_COMMANDS",
+    "MAX_JOB_FRAMES",
     "STARTUP_READS",
+    "CardLock",
     "InputSource",
     "Link",
     "MccDaemon",
+    "card_lock_path",
 ]
 
 log = logging.getLogger("nexcut.mccd")
@@ -109,14 +140,192 @@ IPC_COMMANDS: tuple[str, ...] = (
     "ack_estop",
     "read_block",
     "set_do",
+    "load_job",
+    "start_job",
+    "pause_job",
+    "stop_job",
+    "job_status",
 )
-"""The complete IPC vocabulary. No raw write / transact / firmware command exists (F12)."""
+"""The complete IPC vocabulary. No raw write / transact / firmware command exists (F12).
+
+The five ``*_job`` commands stream a job planned by :mod:`nexcut.plan` into the card FIFO
+(:mod:`nexcut.mccd.feeder`). They are **dry run only**: laser records are stripped on load
+and again by the gate, and streaming is refused while ``LASER_ARMED`` (D5)."""
 
 _WATCHDOG_PERIOD_S = 0.02
 """Watchdog/deadman service period. UNVERIFIED choice (well inside the 200 ms deadman)."""
+_CARD_LOCK_RECHECK_S = 1.0
+"""How often the watchdog re-checks the D12 card lock (:meth:`CardLock.reassert`).
+
+UNVERIFIED port choice: two ``stat`` calls, so it costs nothing, and it is far shorter than
+the time it takes a human to delete a lock file and start a second daemon."""
 _PUBLISH_TICK_S = 0.01
 _LOG_KEEP = 2000
 """Gate write-log / arming-history entries kept in memory."""
+MAX_JOB_FRAMES = 1_000_000
+"""Frames one ``load_job`` accepts (~7 h of machine time at 99 ticks x 250 us per frame).
+A port choice: the feeder streams lazily, so this only bounds pathological input."""
+CLEAN_STOP_JOIN_S = 5.0
+"""How long ``load_job`` waits for the previous feeder's clean stop (JobFeeder.closed).
+
+It is the two ``0x67`` writes of :meth:`~nexcut.mccd.feeder.JobFeeder._clean_stop` plus the
+retry ladder behind them, so it is generous on purpose: refusing a job here is better than
+letting the old feeder clear the new job's FIFO. UNVERIFIED port choice."""
+
+
+def _card_key(ip: str) -> str:
+    """Filename-safe, *normalised* spelling of a card address (docs/DECISIONS.md D12).
+
+    Numeric addresses are canonicalised (``::ffff:10.1.1.168`` and ``10.1.1.168``,
+    ``0:0:0:0:0:0:0:1`` and ``::1``), so two daemons started with different spellings of one
+    address still collide. A host **name** is not resolved and therefore does not collide
+    with its address - that limit is documented in D12 along with the ones an advisory lock
+    cannot see at all (a second NIC, NAT, Mlaser under Wine, another workstation).
+    """
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return re.sub(r"[^A-Za-z0-9._-]", "_", ip)
+    mapped = getattr(addr, "ipv4_mapped", None)
+    return str(mapped or addr).replace(":", ".")
+
+
+def card_lock_path(ip: str, port: int, env: Mapping[str, str] | None = None) -> Path:
+    """``$XDG_RUNTIME_DIR/nexcut/card-<ip>-<port>.lock`` (docs/DECISIONS.md D12).
+
+    Keyed by the (normalised, :func:`_card_key`) card address, so two daemons with
+    different ``--socket`` paths still collide. Same user and same host only: an advisory
+    ``flock`` says nothing about a Windows/Wine Mlaser or another PC on the card network
+    (11 §7 setup, bench checklist).
+    """
+    return default_socket_path(env).parent / f"card-{_card_key(ip)}-{port}.lock"
+
+
+class CardLock:
+    """Advisory ``flock`` held for the daemon's lifetime: one master per card (D12).
+
+    A holder killed with SIGKILL leaves the file behind but not the lock (the kernel drops
+    it when the last descriptor closes), so the next daemon takes it and overwrites the pid.
+    The file is unlinked on a clean release; a racing acquirer that opened the old inode
+    notices through the inode re-check and retries.
+
+    An ``flock`` lives on the inode, not on the name, so a lock file that is **deleted or
+    replaced** while the holder runs no longer protects anything: the next daemon creates a
+    new inode and locks that one instead. The refusal message names the lock path, which
+    invites exactly that ("clean the stale lock"), and in the ``/tmp/nexcut-<uid>`` fallback
+    any local user can do it. :meth:`reassert` therefore re-checks the inode and repairs or
+    reports the loss; the daemon calls it from the watchdog (safety review R13).
+    """
+
+    def __init__(self, path: Path, what: str = "the card") -> None:
+        self.path = Path(path)
+        self.what = what
+        self._fd: int | None = None
+
+    @property
+    def held(self) -> bool:
+        """True while this process holds the lock."""
+        return self._fd is not None
+
+    def holder_pid(self) -> int | None:
+        """pid written by the daemon that holds the lock, if it is readable."""
+        try:
+            with self.path.open("rb") as fh:
+                return int(fh.read(32).split(b"\n", 1)[0] or 0) or None
+        except (OSError, ValueError):
+            return None
+
+    def acquire(self) -> None:
+        """Take the lock or raise :class:`RuntimeError` naming the holding pid."""
+        if self._fd is not None:
+            return
+        # The directory gets the same check as the IPC socket directory (D5 amendment):
+        # a foreign or symlinked /tmp/nexcut-<uid> would let its owner replace the lock file.
+        ensure_private_dir(self.path.parent, "card lock directory")
+        for _ in range(4):
+            try:
+                fd = os.open(
+                    self.path,
+                    os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    0o600,
+                )
+            except OSError as exc:  # unwritable runtime directory, symlink, foreign owner, ...
+                raise RuntimeError(f"cannot open the card lock {self.path}: {exc}") from exc
+            if os.fstat(fd).st_uid != os.getuid():
+                os.close(fd)
+                raise RuntimeError(f"cannot open the card lock {self.path}: owned by another uid")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                os.close(fd)
+                pid = self.holder_pid()
+                raise RuntimeError(
+                    f"another nexcut-mccd is already driving {self.what}"
+                    + (f" (pid {pid})" if pid else "")
+                    + f"; only one master per card (docs/DECISIONS.md D12, lock {self.path})"
+                ) from None
+            try:
+                fresh = os.fstat(fd).st_ino == os.stat(self.path).st_ino
+            except OSError:
+                fresh = False
+            if not fresh:  # the previous holder unlinked it between open() and flock()
+                os.close(fd)
+                continue
+            os.ftruncate(fd, 0)
+            os.write(fd, f"{os.getpid()}\n".encode())
+            self._fd = fd
+            return
+        raise RuntimeError(f"cannot take the card lock {self.path}: it keeps being replaced")
+
+    def reassert(self) -> str:
+        """Re-check that the lock file still names the locked inode (docs/DECISIONS.md D12).
+
+        Returns ``"held"`` (nothing changed), ``"repaired"`` (the file had been removed or
+        replaced and this process took the new one, so a second daemon is refused again) or
+        ``"lost"`` (another process now holds the card - the caller must stop being a
+        master). Never blocks: the re-acquire is the same non-blocking ``flock``.
+        """
+        fd = self._fd
+        if fd is None:
+            return "lost"
+        try:
+            if os.stat(self.path).st_ino == os.fstat(fd).st_ino:
+                return "held"
+        except OSError:
+            pass  # removed
+        self._fd = None
+        try:
+            self.acquire()
+        except RuntimeError:
+            self._fd = fd  # someone else has the new inode; keep the old fd for release()
+            return "lost"
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        return "repaired"
+
+    def release(self) -> None:
+        """Drop the lock (idempotent); the file is removed while it is still held.
+
+        Only if the path still names *our* inode: after :meth:`reassert` reported ``"lost"``
+        the descriptor points at an unlinked inode and the path belongs to the daemon that
+        took the card, whose lock file must not be deleted from under it.
+        """
+        fd, self._fd = self._fd, None
+        if fd is None:
+            return
+        try:
+            ours = os.stat(self.path).st_ino == os.fstat(fd).st_ino
+        except OSError:
+            ours = False
+        if ours:
+            with contextlib.suppress(OSError):
+                self.path.unlink()
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            os.close(fd)
 
 
 class Link(StrEnum):
@@ -254,11 +463,27 @@ class MccDaemon:
         self.socket_path = Path(socket_path or d.socket_path or default_socket_path())
         self._serve_ipc = serve_ipc
         self.server: IpcServer | None = None
+        self.card_lock = CardLock(
+            card_lock_path(*self.card_addr), f"the card at {self.card_addr[0]}:{self.card_addr[1]}"
+        )
+        """Advisory single-master lock, held from :meth:`start` to :meth:`close` (D12)."""
+        self._arm_owner: int | None = None
+        """IPC connection id that armed motion; arming dies with it (docs/DECISIONS.md D9).
+
+        It also owns *motion*: ``jog_*``/``home``/``load_job``/``start_job`` from any other
+        connection are refused (:meth:`_require_arm_owner`)."""
+        self.card_lock_lost: str | None = None
+        """Set when another process took the card lock away (D12): the daemon has stopped
+        being the master, is disarmed, and refuses to arm again."""
+        self._card_lock_next = 0.0
 
         self.link = Link.DISCONNECTED
         self.last_error: str | None = None
         self.program_version: int | None = None
         self.block1000: list[int] | None = None
+        self.block1000_t: float | None = None
+        """``time.monotonic()`` of the poll that produced :attr:`block1000` (the feeder only
+        acts on a status newer than the one it last used)."""
         self.axis_ro: list[int] | None = None
         self.axis_ro_t: float | None = None
         self.system_rw: list[int] | None = None
@@ -272,6 +497,9 @@ class MccDaemon:
         """Time of the last motion command sent; READY needs a 2000/50 read taken after it."""
         self._sources: list[InputSource] = []
         self._homing: _HomingJob | None = None
+        self._job: JobFeeder | None = None
+        """The one loaded/streaming job (:mod:`nexcut.mccd.feeder`); one at a time."""
+        self._job_lock = threading.Lock()
         self._motion_lock = threading.Lock()
         """Held from the READY check to the end of the send of one motion command (D8)."""
         self._stop_pending = 0
@@ -325,11 +553,19 @@ class MccDaemon:
         """Start IPC and the worker threads (the card is contacted by the fast thread)."""
         if self._started:
             return self
+        # D12: one master per card, before anything is sent. The socket is the second
+        # interlock (IpcServer refuses a path another daemon already serves).
+        self.card_lock.acquire()
         self._started = True
-        if self._serve_ipc:
-            self.server = IpcServer(
-                self.socket_path, self.handle, on_open=self._on_open, on_close=self._on_close
-            ).start()
+        try:
+            if self._serve_ipc:
+                self.server = IpcServer(
+                    self.socket_path, self.handle, on_open=self._on_open, on_close=self._on_close
+                ).start()
+        except BaseException:
+            self._started = False
+            self.card_lock.release()
+            raise
         for name, target in (
             ("mccd-fast", self._fast_loop),
             ("mccd-slow", self._slow_loop),
@@ -346,6 +582,7 @@ class MccDaemon:
         if self._closed:
             return
         self._closed = True
+        self.abort_job("daemon shutdown", join=3.0)
         self.gate.invalidate_motion()
         self._cancel_homing("daemon shutdown")
         if self.server is not None:
@@ -356,6 +593,8 @@ class MccDaemon:
         with self.bus.priority(Priority.URGENT):
             try:
                 if self.gate.leases() or self.gate.arming.state is not ArmState.DISARMED:
+                    with self._lock:
+                        self._arm_owner = None
                     self.gate.arming.disarm("daemon shutdown")
                     if self.link is Link.CONNECTED:
                         self.gate.stop()
@@ -363,6 +602,7 @@ class MccDaemon:
                 log.exception("shutdown stop")
         if self._owns_transport:
             self._bus_client.close()
+        self.card_lock.release()
 
     def __enter__(self) -> MccDaemon:
         return self.start()
@@ -390,8 +630,10 @@ class MccDaemon:
     def _on_raw_read(self, addr: int, count: int, words: list[int]) -> None:
         """Store block 1000 before the gate's alarm reaction (BusClient.on_read)."""
         if addr == 1000 and count == 36:
+            now = time.monotonic()
             with self._lock:
                 self.block1000 = words
+                self.block1000_t = now
 
     def _note_error(self, where: str, exc: BaseException) -> None:
         with self._lock:
@@ -607,6 +849,11 @@ class MccDaemon:
                 if key is not None and key != self._trip_key and self._moving_possible():
                     self._trip(key)
                 self._trip_key = key
+        # 3b. single master (D12): an flock lives on the inode, so a lock file removed or
+        # replaced while we run no longer refuses a second daemon.
+        if now >= self._card_lock_next:
+            self._card_lock_next = now + _CARD_LOCK_RECHECK_S
+            self._check_card_lock()
         # 4. input sources: silence (11 N7).
         for src in list(self._sources):
             if (
@@ -632,12 +879,42 @@ class MccDaemon:
         if len(self.gate.arming.history) > 2 * _LOG_KEEP:
             del self.gate.arming.history[:-_LOG_KEEP]
 
+    def _check_card_lock(self) -> None:
+        """Keep the D12 single-master lock asserted (safety review R13).
+
+        A lock file deleted by hand ("cleaning a stale lock" - the refusal message names the
+        path) or replaced by another user in a shared ``/tmp/nexcut-<uid>`` is re-taken. If
+        another process got there first there are two masters on one card, which no reply
+        from the card can reveal (D12 limits): this daemon stops being one - it disarms,
+        stops, and refuses to arm again until it is restarted.
+        """
+        if self._closed or self.card_lock_lost is not None or not self.card_lock.held:
+            return
+        state = self.card_lock.reassert()
+        if state == "repaired":
+            log.error(
+                "the card lock %s was removed or replaced; re-taken (docs/DECISIONS.md D12)",
+                self.card_lock.path,
+            )
+        elif state == "lost":
+            reason = (
+                f"another process took the card lock {self.card_lock.path}: two masters on "
+                f"{self.card_addr[0]}:{self.card_addr[1]} (docs/DECISIONS.md D12)"
+            )
+            with self._lock:
+                self.card_lock_lost = self.last_error = reason
+            log.critical("%s - disarming", reason)
+            self._trip(reason)
+
     def _trip(self, reason: str, *, comm_loss: bool = False) -> None:
         """Watchdog reaction: disarm now, stop (PORT-PLAN §8.2), abort homing and jogs."""
         log.error("watchdog: %s -> stop + disarm", reason)
         moving = self._moving_possible()
+        self.abort_job(f"watchdog: {reason}")
         self.gate.invalidate_motion()
         self._cancel_homing(reason)
+        with self._lock:
+            self._arm_owner = None
         self.gate.arming.disarm(f"watchdog: {reason}")
         for src in list(self._sources):
             src.take_slots()
@@ -710,6 +987,31 @@ class MccDaemon:
         src = conn.context.get("source")
         if isinstance(src, InputSource):
             self.unregister_input_source(src)
+        self._release_arming(conn)
+
+    def _release_arming(self, conn: Connection) -> None:
+        """D9: arming does not outlive the connection that asked for it.
+
+        The jogs this connection started were already stopped per axis by
+        :meth:`unregister_input_source` (D6); this adds the stop sequence for anything
+        another client may have started while the machine was armed, and disarms. A client
+        killed with SIGKILL reaches here the same way as a clean close: the kernel closes
+        its socket, the reader thread sees EOF.
+        """
+        with self._lock:
+            if self._arm_owner != conn.id:
+                return
+            self._arm_owner = None
+        if self._closed:
+            return
+        if self.gate.arming.state is ArmState.DISARMED and not self.gate.leases():
+            return
+        log.warning("arming client ipc#%d closed: stopping and disarming (D9)", conn.id)
+        with self.bus.priority(Priority.URGENT):
+            try:
+                self._disarm_and_stop(f"arming client ipc#{conn.id} closed")
+            except Exception as exc:  # pragma: no cover - must not kill the IPC server
+                self._note_error("disarm on client close", exc)
 
     # ------------------------------------------------------------------------------- status
 
@@ -827,11 +1129,11 @@ class MccDaemon:
             raise IpcError("unknown_command", f"unknown command {cmd!r}")
         if conn is not None and isinstance(conn.context.get("source"), InputSource):
             conn.context["source"].touch()
-        if cmd not in ("status", "ping", "jog_refresh", "subscribe", "unsubscribe"):
+        if cmd not in ("status", "ping", "jog_refresh", "subscribe", "unsubscribe", "job_status"):
             log.info("IPC %s %s", cmd, {k: v for k, v in req.items() if k not in ("cmd", "id")})
         prio = (
             Priority.URGENT
-            if cmd in ("stop", "estop", "disarm", "jog_continuous_stop")
+            if cmd in ("stop", "estop", "disarm", "jog_continuous_stop", "stop_job", "pause_job")
             else Priority.COMMAND
         )
         epoch = self.gate.motion_epoch
@@ -839,7 +1141,7 @@ class MccDaemon:
             try:
                 return fn(conn, req)
             except SafetyViolation as exc:
-                raise IpcError("refused", exc.reason) from exc
+                raise IpcError("refused", self._arming_hint(exc.reason)) from exc
             except ArmingError as exc:
                 raise IpcError("arming", str(exc)) from exc
             except CardBusy as exc:
@@ -848,6 +1150,47 @@ class MccDaemon:
                 ) from exc
             except McError as exc:
                 raise IpcError("card", str(exc)) from exc
+
+    def _arming_hint(self, reason: str) -> str:
+        """Add the D9 hint when a command was refused because nothing armed this connection."""
+        if "state DISARMED" not in reason or self.gate.arming.estop_latched:
+            return reason
+        return (
+            f"{reason}; arming ends with the connection that asked for it "
+            "(docs/DECISIONS.md D9): send arm_motion on this connection, or use "
+            "'nexcut-mccd jog --arm' / 'home --arm'"
+        )
+
+    def _require_arm_owner(self, conn: Connection | None, what: str) -> None:
+        """D9: only the connection that armed motion may start any (safety review R12).
+
+        D9 tied the *lifetime* of arming to its connection but not the right to move: while
+        the arming client was alive, any other connection of the same uid jogged, homed and
+        streamed jobs without an arming step of its own - the "stray ``nexcut-mccd jog``"
+        case D9 calls the whole point of the arming state (PORT-PLAN §8.2). ``arm_motion``
+        on another connection transfers ownership, so a deliberate hand-over still works.
+
+        ``conn is None`` is an in-process caller (``load_job_frames``, the harness): that is
+        inside the enforcement boundary of D5, where the gate is the only check there can be.
+        Stops are deliberately *not* owned - ``stop``/``estop``/``disarm``/``stop_job`` are
+        accepted from any connection.
+        """
+        if conn is None:
+            return
+        with self._lock:
+            owner = self._arm_owner
+        if owner == conn.id:
+            return
+        held = (
+            "another connection holds the arming" if owner is not None else "nothing is armed"
+        )
+        raise IpcError(
+            "arming",
+            f"{what} needs MOTION_ARMED armed on this connection ({held}): arming - and the "
+            "right to move with it - belongs to the connection that asked for it "
+            "(docs/DECISIONS.md D9). Send arm_motion on this connection, or use "
+            "'nexcut-mccd jog --arm' / 'home --arm' / 'run-job --arm'",
+        )
 
     # -- argument helpers
 
@@ -973,20 +1316,35 @@ class MccDaemon:
         return {}
 
     def _cmd_arm_motion(self, conn: Connection | None, req: dict[str, Any]) -> Any:
+        # D9: arming belongs to this connection. When it closes - cleanly, or because the
+        # client crashed - the daemon stops and disarms (_release_arming).
+        if conn is None:
+            raise IpcError("bad_request", "arm_motion needs a connection (docs/DECISIONS.md D9)")
+        if self.card_lock_lost is not None:
+            raise IpcError("refused", self.card_lock_lost)
         self._require_connected()
         self.gate.arming.arm_motion()
-        return {"arm_state": str(self.gate.arming.state)}
+        with self._lock:
+            self._arm_owner = conn.id
+        return {"arm_state": str(self.gate.arming.state), "arm_owner": conn.id}
 
     def _cmd_disarm(self, conn: Connection | None, req: dict[str, Any]) -> Any:
+        sent = self._disarm_and_stop("operator")
+        return {"arm_state": str(self.gate.arming.state), "stop_sent": sent}
+
+    def _disarm_and_stop(self, reason: str) -> list[str]:
+        """Disarm and, if anything could be moving, send the stop sequence (D9/D10)."""
+        self.abort_job(f"{reason} disarm")
+        with self._lock:
+            self._arm_owner = None
         self.gate.invalidate_motion()
         moving = self._moving_possible()
-        self._cancel_homing("operator disarm")
-        self.gate.arming.disarm("operator")
-        sent: list[str] = []
-        if moving and self.link is Link.CONNECTED:
-            out = self._stop_all_tracked(estop=False)
-            sent = [c.name for c in out.sent]
-        return {"arm_state": str(self.gate.arming.state), "stop_sent": sent}
+        self._cancel_homing(f"{reason} disarm")
+        self.gate.arming.disarm(reason)
+        if not (moving and self.link is Link.CONNECTED):
+            return []
+        out = self._stop_all_tracked(estop=False)
+        return [c.name for c in out.sent]
 
     def _cmd_jog_step(self, conn: Connection | None, req: dict[str, Any]) -> Any:
         slot = self._arg_slot(req)
@@ -996,6 +1354,7 @@ class MccDaemon:
             raise IpcError(
                 "bad_request", f"'mm' must be non-zero and |mm| <= {self.config.motion.max_step_mm}"
             )
+        self._require_arm_owner(conn, "jog_step")
         with self._one_motion():
             self._require_ready(slot, mm > 0)
             cmd = C.jog_step(slot, mm, self._jog_params(speed))
@@ -1012,6 +1371,7 @@ class MccDaemon:
         slot = self._arg_slot(req)
         positive = self._arg_bool(req, "positive")
         speed = self._arg_speed(req)
+        self._require_arm_owner(conn, "jog_continuous_start")
         with self._one_motion():
             return self._jog_continuous_start(conn, slot, positive, speed)
 
@@ -1082,13 +1442,17 @@ class MccDaemon:
         bad = [s for s in slots if s not in self.gate.config.home_slots]
         if bad:
             raise IpcError("refused", f"home of slots {bad} not allowed (11 §2 V6/V7/V10)")
+        self._require_arm_owner(conn, "home")
         with self._one_motion():
             if self._homing is not None:
                 raise IpcError("busy", "homing already running")
             self._require_ready()
             if not self.gate.arming.allows(Policy.MOTION):
                 raise IpcError(
-                    "arming", f"home needs MOTION_ARMED (state {self.gate.arming.state})"
+                    "arming",
+                    self._arming_hint(
+                        f"home needs MOTION_ARMED (state {self.gate.arming.state})"
+                    ),
                 )
             epoch = self.gate.guarded_epoch()
             job = _HomingJob(slots, self.gate.motion_epoch if epoch is None else epoch)
@@ -1108,6 +1472,7 @@ class MccDaemon:
         return out
 
     def _cmd_stop(self, conn: Connection | None, req: dict[str, Any]) -> Any:
+        self.abort_job("stop")
         self.gate.invalidate_motion()
         self._cancel_homing("stop")
         out = self._stop_all_tracked(estop=False)
@@ -1117,6 +1482,7 @@ class MccDaemon:
         }
 
     def _cmd_estop(self, conn: Connection | None, req: dict[str, Any]) -> Any:
+        self.abort_job("estop")
         self.gate.invalidate_motion()
         self._cancel_homing("estop")
         out = self._stop_all_tracked(estop=True)
@@ -1168,3 +1534,177 @@ class MccDaemon:
         self._require_connected()
         self.gate.send(C.do_set(port, on, laser_ports=cfg.laser_do_ports))
         return {"port": port, "on": on}
+
+    # ---------------------------------------------------------------------------- job stream
+
+    def _feeder_status(self) -> tuple[Sequence[int], float] | None:
+        """Newest block 1000/36 and when it was read (the feeder never polls the card)."""
+        with self._lock:
+            b, t = self.block1000, self.block1000_t
+        return None if b is None or t is None else (b, t)
+
+    def _feeder_config(self) -> FeederConfig:
+        mc = self.config.mc
+        return FeederConfig(
+            alarm_items=mc.fifo_alarm_num,
+            unacked_timeout_s=mc.fifo_timeout_ms / 1000.0,
+        )
+
+    @property
+    def job(self) -> JobFeeder | None:
+        """The loaded job, if any (tests, UI)."""
+        return self._job
+
+    def load_job_frames(
+        self,
+        frames: Iterable[PackedFrame],
+        *,
+        name: str = "",
+        total_frames: int | None = None,
+    ) -> JobFeeder:
+        """In-process ``load_job``: take already packed frames (PORT-PLAN §8.3 harness, UI).
+
+        The caller is responsible for the frames being dry-run frames; the gate strips any
+        laser record on the way out regardless (PORT-PLAN §8.2). Needs ``MOTION_ARMED``:
+        the token comes from :meth:`~nexcut.mcc.safety.ArmingStateMachine.begin_job`, which
+        is also what a later ``arm_laser`` would have to quote (D5, M5).
+        """
+        self._require_connected()
+        with self._job_lock:
+            old = self._job
+            if old is not None and not old.finished:
+                raise IpcError("busy", f"a job is already loaded ({old.state})")
+            if old is not None and not old.closed:
+                # A feeder reaches its final state before its thread has sent the closing
+                # 0x67 <- [3] / 0x67 <- [1] and returned the job token. Starting a new job in
+                # that window would let the old feeder's clean stop clear the new job's queue,
+                # so wait for the thread instead of racing it (JobFeeder.closed).
+                old.join(CLEAN_STOP_JOIN_S)
+                if not old.closed:
+                    raise IpcError("busy", f"the previous job is still stopping ({old.state})")
+            if self.gate.arming.state is ArmState.LASER_ARMED:
+                raise IpcError(
+                    "refused",
+                    "the machine is LASER_ARMED: this phase streams dry runs only "
+                    "(docs/DECISIONS.md D5)",
+                )
+            try:
+                token = self.gate.arming.begin_job()
+            except ArmingError as exc:
+                raise IpcError("arming", f"load_job needs MOTION_ARMED: {exc}") from exc
+            feeder = JobFeeder(
+                self.gate,
+                self._feeder_status,
+                frames,
+                token=token,
+                name=name,
+                total_frames=total_frames,
+                config=self._feeder_config(),
+                bus=self.bus,
+                priority=Priority.COMMAND,
+            )
+            self._job = feeder
+            return feeder
+
+    def abort_job(self, reason: str, join: float | None = None) -> bool:
+        """Ask a running job to stop and clean up. Never blocks unless ``join`` is given.
+
+        Called by ``stop`` / ``estop`` / ``disarm`` / a watchdog trip and by :meth:`close`:
+        those paths already hold the bus at URGENT priority, so waiting here for a feeder
+        that wants the bus would deadlock the stop.
+        """
+        job = self._job
+        if job is None or job.finished:
+            return False
+        job.request_stop(reason)
+        if join is not None:
+            job.join(join)
+        return True
+
+    def _job_or_refuse(self, req: dict[str, Any]) -> JobFeeder:
+        job = self._job
+        if job is None:
+            raise IpcError("refused", "no job loaded")
+        token = req.get("token")
+        if token is not None and token != job.token:
+            raise IpcError("refused", "token does not name the loaded job")
+        return job
+
+    def _cmd_load_job(self, conn: Connection | None, req: dict[str, Any]) -> Any:
+        """``load_job path=<frame file>``: a file written by ``python -m nexcut.plan``.
+
+        The file is read lazily while streaming (11 §5.1 frame lines, 08 §2.1 format), so a
+        job of any length costs constant memory; only its frame count is scanned up front.
+        """
+        path = req.get("path")
+        if not isinstance(path, str) or not path:
+            raise IpcError("bad_request", "'path' must be the path of a planned frame file")
+        name = req.get("name")
+        if name is not None and not isinstance(name, str):
+            raise IpcError("bad_request", "'name' must be a string")
+        try:
+            total = count_frame_file(path)
+        except OSError as exc:
+            raise IpcError("bad_request", f"cannot read {path}: {exc}") from exc
+        if total == 0:
+            raise IpcError("bad_request", f"{path} holds no FIFO frame line (11 §5.1)")
+        if total > MAX_JOB_FRAMES:
+            raise IpcError("refused", f"{total} frames exceed the {MAX_JOB_FRAMES} frame limit")
+        self._require_arm_owner(conn, "load_job")
+        frames = frames_from_words(iter_frame_file(path), self.gate.config)
+        feeder = self.load_job_frames(frames, name=name or path, total_frames=total)
+        log.warning("job %s loaded from %s (%d frames)", feeder.token[:8], path, total)
+        return {"token": feeder.token, "frames": total, "state": str(feeder.state)}
+
+    def _cmd_start_job(self, conn: Connection | None, req: dict[str, Any]) -> Any:
+        """Start (or resume) the loaded job. Needs MOTION_ARMED and a READY machine."""
+        job = self._job_or_refuse(req)
+        if job.finished:
+            raise IpcError("refused", f"job already {job.state}")
+        self._require_arm_owner(conn, "start_job")
+        if job.state is JobState.LOADED:
+            self._require_ready()
+        try:
+            job.start()
+        except JobError as exc:
+            raise IpcError("refused", str(exc)) from exc
+        self._last_motion_t = time.monotonic()
+        # The streaming thread clears the FIFO and fills it before it reports RUNNING; wait
+        # for that so the reply says whether the job actually took off.
+        self._wait_job_state({JobState.RUNNING}, 5.0)
+        if job.state is JobState.FAILED:
+            raise IpcError("refused", job.error or "job failed to start")
+        return {"token": job.token, "state": str(job.state)}
+
+    def _cmd_pause_job(self, conn: Connection | None, req: dict[str, Any]) -> Any:
+        """Stop the FIFO program and keep the queue (resume with ``start_job``; N2 UNVERIFIED)."""
+        job = self._job_or_refuse(req)
+        if job.finished:
+            raise IpcError("refused", f"job already {job.state}")
+        job.pause()
+        self._wait_job_state({JobState.PAUSED}, 2.0)
+        return {"token": job.token, "state": str(job.state)}
+
+    def _cmd_stop_job(self, conn: Connection | None, req: dict[str, Any]) -> Any:
+        """Clean stop: ``0x67 <- [3]`` then ``0x67 <- [1]``, token dropped. Does not disarm."""
+        job = self._job_or_refuse(req)
+        job.stop_and_join("operator stop_job", timeout=5.0)
+        return {"token": job.token, "state": str(job.state), "error": job.error}
+
+    def _cmd_job_status(self, conn: Connection | None, req: dict[str, Any]) -> Any:
+        """Job state plus the PORT-PLAN §8.3 flow numbers (frame intervals, queue low water)."""
+        job = self._job
+        if job is None:
+            return {"state": "NONE"}
+        return job.to_json()
+
+    def _wait_job_state(self, states: set[JobState], timeout: float) -> bool:
+        job = self._job
+        if job is None:
+            return False
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if job.state in states or job.finished:
+                return True
+            time.sleep(0.005)
+        return job.state in states

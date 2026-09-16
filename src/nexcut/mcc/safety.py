@@ -795,14 +795,18 @@ class SafeMccClient:
     def _record(self, rec: WriteRecord) -> None:
         self.write_log.append(rec)
         if rec.decision == "sent":
-            log.info(
-                "WRITE %#x %s frame=%s state=%s (%s)",
-                rec.addr,
-                " ".join(f"{x:x}" for x in rec.words),
-                rec.frame.hex(" "),
-                rec.state,
-                rec.reason,
-            )
+            # Formatting the words and the frame bytes of a 298-word FIFO frame costs more
+            # than sending it, and the arguments would be built even with INFO switched off
+            # (pytest's log capture enables it): a job streams tens of frames per second.
+            if log.isEnabledFor(logging.INFO):
+                log.info(
+                    "WRITE %#x %s frame=%s state=%s (%s)",
+                    rec.addr,
+                    " ".join(f"{x:x}" for x in rec.words),
+                    rec.frame.hex(" "),
+                    rec.state,
+                    rec.reason,
+                )
         else:
             log.warning(
                 "%s WRITE %#x %s state=%s: %s",

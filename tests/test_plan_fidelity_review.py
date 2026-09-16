@@ -99,8 +99,13 @@ def test_raw_logs_decode_to_the_committed_frames(src_dir: Path) -> None:
 
 
 def test_prologue_dwell_is_14_stationary_ticks_in_frames_0x39_0x3a() -> None:
-    """Frame 0x3a directly follows 0x39: after ``DO9 on`` exactly 14 stationary 4 % ticks, then
-    the cut moves.  (0x1f8 has the same prologue but its successor frame was not logged.)"""
+    """Read 0x39 and 0x3a as one stream: after ``DO9 on`` 14 stationary 4 % ticks, then motion.
+
+    NB (A9 §3): the two frames are **not** consecutive - 0x39 was logged at 14:22:17 and 0x3a at
+    15:04:19, two job restarts apart - so this number describes the committed splice, not a
+    vendor stream.  What the frames prove on their own is a *lower bound* of 13 stationary ticks
+    after ``DO9 on`` (0x39 and 0x1f8 both end there).  See
+    ``test_leaked_stationary_run_after_do9_is_the_ramp_not_a_dwell``."""
     items = FRAMES[0x39] + FRAMES[0x3A]
     i_on = next(
         i for i, it in enumerate(items) if it.opcode == 9999 and tuple(it.args) == (2, 0x100, 0x100)
@@ -119,8 +124,11 @@ def _vendor_cut_start() -> np.ndarray:
 
 
 def test_vendor_cut_start_kinematics_frame_0x3a() -> None:
-    """Quadratic fit of the 99 moving-frame ticks: v0 ~ 6.9 mm/s, a ~ 570 mm/s² (residual below
-    one pulse) - the cut does not leave the pierce point from rest (see the xfail below)."""
+    """Quadratic fit of the 99 ticks of frame 0x3a: v0 ~ 6.9 mm/s, a ~ 570 mm/s² (residual below
+    one pulse) at its first tick.  A9 §3: this is why 0x3a cannot be the start of a contour - the
+    vendor's node list forces ``node[0].v = 0`` (CADModule ``0x100ff8dd``) - and it is instead a
+    stretch ~145 ticks into a jerk-limited ramp (pinned by
+    ``test_port_cut_start_matches_leaked_frames``)."""
     c = _vendor_cut_start()[13:]  # cumulative pulses at the end of each tick of frame 0x3a
     assert len(c) == 99 and c[-1] == 90
     k = np.arange(1, 100) * DT
@@ -153,42 +161,93 @@ def test_cut_end_tail_frame_0x279_matches_jerk_rule() -> None:
         assert sum(1 for d in dx[-55:] if d) <= 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "fidelity gap: __main__.build_job dwells LaserOnDelay + GC.GasDelay = 0 + 100 ms = 400 "
-        "ticks after DO9 on; the leaked CO2 layer-2 job (frames 0x39/0x3a) shows 14 stationary "
-        "ticks. The source of the 14 (3.5 ms, not an integer-ms dwell) is not traced (A3 V dwell "
-        "builder 0x4427e0); GasDelay as a tick dwell is contradicted"
-    ),
-)
 def test_port_pierce_dwell_matches_leaked_frames() -> None:
+    """FIXED (A9 §2, 11 §5.5).  The vendor dwell builder ``0x4427e0`` has two branches: with its
+    fourth argument true it appends ``(1000 idiv AX.InterpolationCycle)·ms`` stationary records,
+    otherwise **one** type-1 sub-5 record that NCModule turns into ``2001[ms, 3000]`` and drops
+    when ``ms <= 0``.  All ten MainApp call sites push 0, so no shipped stream contains dwell
+    ticks; the three CO2 dwells are ``layer+0x88`` = ``LaserOnDelay`` (after the laser DO,
+    ``0x443259``), ``layer+0x8c`` = ``LaserOffBeforeDelay`` and ``layer+0x90`` =
+    ``LaserOffAfterDelay``.  The gas delay is a *different* builder (``0x4424e0``) and also a wait
+    record.  So for this machine's CO2 layer 2 (``LaserOnDelay = 0``) the prologue emits **no**
+    record after ``DO9 on`` - matching frames 0x39/0x1f8, whose only ``2001`` is the ZF
+    ``[0x03000002, 20000]``.  The port used to emit ``LaserOnDelay + GC.GasDelay`` = 400 ticks."""
     ll = LayerLaser.from_layer(LAYER2)
-    laser = ContourLaser(
-        gas_port=3, laser_port=9, pierce_dwell_ms=ll.laser_on_delay_ms + GAS_DELAY_MS
-    )
+    assert ll.laser_on_delay_ms == 0.0
     b = JobStreamBuilder(laser_records=True)
-    b.prologue(laser, ll.freq, ll.duty)
+    b.prologue(ContourLaser(gas_port=3, laser_port=9, pierce_dwell_ms=ll.laser_on_delay_ms))
     i_on = max(i for i, r in enumerate(b.records) if r.type == RecordType.IO)
-    assert len(b.records) - i_on - 1 == 14
+    assert len(b.records) - i_on - 1 == 0  # nothing at all after DO9 on
+    ops = [(it.opcode, it.args) for grp in b.items() for it in grp]
+    assert ops[-1] == (9999, (2, 0x100, 0x100))  # DO9 on is the last prologue item
+    assert [a for op, a in ops if op == 2001] == [(0x03000002, 20000)]  # ZF only, no dwell
+    # a non-zero LaserOnDelay becomes exactly one card-side wait, not ms·4 ticks
+    b2 = JobStreamBuilder(laser_records=True)
+    b2.prologue(ContourLaser(gas_port=3, laser_port=9, pierce_dwell_ms=7.0))
+    tail = [(it.opcode, it.args) for grp in b2.items() for it in grp][-1]
+    assert tail == (2001, (7, 3000))
+    # ... and the gas delay is its own wait record, emitted once, with the gas DO
+    b3 = JobStreamBuilder(laser_records=True)
+    b3.prologue(ContourLaser(gas_port=3, laser_port=9, gas_delay_ms=GAS_DELAY_MS))
+    b3.prologue(ContourLaser(gas_port=3, laser_port=9, gas_delay_ms=GAS_DELAY_MS))
+    waits = [a for grp in b3.items() for it in grp if it.opcode == 2001 for a in [it.args]]
+    assert waits.count((int(GAS_DELAY_MS), 3000)) == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "fidelity gap: the port starts every contour at rest with zero acceleration (05 §7.2 node "
-        "0 = 0, jerk-limited S-curve, J = 5000 for layer 2) and covers < 6 pulses in the first "
-        "113 ticks; vendor frames 0x39/0x3a cover 90 pulses in the same 113 ticks after DO9 on "
-        "(v0 ~ 6.9 mm/s, a ~ 570 mm/s²). The look-ahead core 0x100114d0 was not re-traced (05 §7.4)"
-    ),
-)
-def test_port_cut_start_matches_leaked_frames() -> None:
-    vendor = int(_vendor_cut_start()[-1])
-    assert vendor == 90
+def test_leaked_stationary_run_after_do9_is_the_ramp_not_a_dwell() -> None:
+    """The 13 stationary 4 % ticks that close frames 0x39/0x1f8 after ``DO9 on`` are the cut
+    ramp's own zero-displacement ticks (A9 §3): with no dwell record in the stream, the first
+    ticks of a contour leaving rest move less than one pulse.  For layer 2 (``J = 4·Vmax/Ta²`` =
+    5000, 05 §7.1 / CADModule ``0x101000a2``) the port emits **at least** 66 such ticks whatever
+    the persistent carry, so the 13 of the frame are a lower bound it satisfies."""
     plan, geom = plan_line((0.0, 0.0), (-100.0, 0.0), LAYER2_PARAMS)
-    dx, _ = TickQuantizer().quantize(sample_plan(plan, geom).xy)
-    port = -sum(dx[:113])  # even if all 14 vendor dwell ticks counted as motion
-    assert port >= vendor - 10
+    assert plan.jerk == pytest.approx(5000.0)
+    xy = sample_plan(plan, geom).xy
+    firsts = []
+    for carry in np.linspace(0.0, 0.99, 34):
+        dx, _ = TickQuantizer(PPM, (float(carry), 0.0)).quantize(xy)
+        firsts.append(next(i for i, d in enumerate(dx) if d))
+    assert min(firsts) >= 13 and min(firsts) == 66
+
+
+def test_port_cut_start_matches_leaked_frames() -> None:
+    """RESTATED (A9 §3, 11 §5.5).  The old expectation - "the vendor covers 90 pulses in the 113
+    ticks after ``DO9 on``" - came from splicing frame 0x3a onto frame 0x39.  The two frames are
+    **not** consecutive: 0x39 was logged at 14:22:17 and 0x3a at 15:04:19, with two job restarts
+    between them (the frame id is the card's own counter, `A3 §8`), and the splice contradicts the
+    binary.  CADModule's node builder A (``0x100ff220``) ends by forcing ``node[last].v = 0`` and
+    ``node[0].v = 0`` (``0x100ff8dd-0x100ff90c``); the slow-start routine that runs after it
+    (``0x100ffac0``) only ever clamps node speeds **down** to ``P7``; the only floor, ``P4``, is a
+    constant 0 (A6 §1.3) and is applied before the zeroing; and the look-ahead core
+    (``0x100fdc50``) receives no entry-velocity parameter at all - just ``{A, J, Ta, P5, Vmax}``.
+    So the vendor leaves every pierce point from rest, exactly as the port does.
+
+    What is pinned here: with layer-2 parameters no start-from-rest profile can put four pulses in
+    its first nine ticks at any carry (frame 0x3a does), and the port's own S-curve reproduces
+    frame 0x3a to within one pulse when it is read as what it is - a stretch 145 ticks into a
+    jerk-limited ramp."""
+    vendor = [it.tick[0] for it in FRAMES[0x3A] if it.tick is not None]
+    assert len(vendor) == 99 and sum(vendor) == -90
+    assert [k for k, d in enumerate(vendor[:9]) if d] == [1, 3, 5, 7, 8]  # 4 pulses in 9 ticks
+
+    # (a) impossible from rest at this layer's jerk, for every carry
+    plan, geom = plan_line((0.0, 0.0), (-100.0, 0.0), LAYER2_PARAMS)
+    assert plan.jerk == pytest.approx(5000.0)
+    xy = sample_plan(plan, geom).xy
+    for carry in np.linspace(0.0, 0.99, 34):
+        dx, _ = TickQuantizer(PPM, (float(carry), 0.0)).quantize(xy)
+        assert sum(1 for d in dx[:40] if d) == 0
+
+    # (b) the port reproduces 0x3a as a mid-ramp stretch: J = 4·Vmax/Ta² = 11 660 (Vmax fitted,
+    #     the job behind the frames is not recorded - UNVERIFIED, A9 §3.3), offset 145 ticks
+    mid = PlannerParams(MANU_ACC, ACC_TIME_MS * 0.001, SPLINE_ACC, 116.6)
+    mplan, mgeom = plan_line((0.0, 0.0), (-200.0, 0.0), mid)
+    assert mplan.jerk == pytest.approx(11660.0)
+    mdx, _ = TickQuantizer(PPM, (0.58, 0.0)).quantize(sample_plan(mplan, mgeom).xy)
+    seg = np.array(mdx[145 : 145 + 99])
+    assert seg.sum() == -90  # same net displacement as the frame
+    assert int(np.abs(np.cumsum(seg) - np.cumsum(vendor)).max()) <= 1
+    assert sum(1 for a, b in zip(seg.tolist(), vendor, strict=True) if a != b) <= 2
 
 
 def test_rapid_start_frame_0x279_reproduced_tick_for_tick() -> None:

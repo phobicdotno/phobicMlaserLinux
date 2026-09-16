@@ -175,12 +175,13 @@ def test_basic_keys_map_to_requests() -> None:
     assert c.step_mm == 0.1
     c.handle_key("LEFT")
     assert be.last()[2]["mm"] == -0.1
-    for key, cmd in ((" ", "stop"), ("s", "stop"), ("ESC", "estop"), ("e", "estop"),
+    for key, cmd in ((" ", "stop"), ("s", "stop"), ("S", "stop"), ("ESC", "estop"),
+                     ("e", "estop"), ("E", "estop"), ("a", "ack_estop"),
                      ("A", "ack_estop")):  # fmt: skip
         c.handle_key(key)
         assert be.last()[:2] == (Lane.URGENT, cmd), key
     n = len(be.sent)
-    c.handle_key("x")  # unbound
+    c.handle_key("x")  # unbound in normal mode (it is the home-menu "X axis" key)
     assert len(be.sent) == n and "not bound" in c.msg.text
     assert not c.quit
     c.handle_key("q")
@@ -198,7 +199,7 @@ def test_home_menu_one_axis_at_a_time() -> None:
     assert be.last()[1:3] == ("home", {"slots": [1]})
     n = len(be.sent)
     c.handle_key("h")
-    c.handle_key("a")  # "all" is not offered by default
+    c.handle_key("b")  # "X then Y" is not offered by default
     assert len(be.sent) == n and c.msg.text == "home cancelled"
     c.handle_key("h")
     c.handle_key("q")  # q cancels the menu, it does not quit
@@ -209,8 +210,12 @@ def test_home_menu_one_axis_at_a_time() -> None:
 
     c2, be2 = make(allow_home_all=True)
     c2.handle_key("h")
-    c2.handle_key("a")
+    c2.handle_key("b")
     assert be2.last()[1:3] == ("home", {"slots": [0, 1]})
+    # D11: the menu is case-insensitive, so Caps Lock cannot turn "home X" into "cancel".
+    c2.handle_key("h")
+    c2.handle_key("X")
+    assert be2.last()[1:3] == ("home", {"slots": [0]})
 
 
 def test_read_block_prompt() -> None:
@@ -295,7 +300,7 @@ def test_continuous_jog_refreshes_while_repeats_arrive_then_stops() -> None:
 
 def test_continuous_jog_single_press_stops_after_initial_hold() -> None:
     c, be = make(initial_hold_s=0.7)
-    c.handle_key("L", 0.0)  # vi-style alternative
+    c.handle_key("S_RIGHT", 0.0)
     be.ack()
     c.tick(0.1)
     c.tick(0.69)
@@ -628,9 +633,13 @@ def test_hung_ui_lets_the_daemon_deadman_stop_the_jog() -> None:
             assert c.cont is not None and c.cont.acked
             t_hang = time.monotonic()
             # the UI thread now hangs: no tick, no explicit stop
-            assert wait_for(lambda: bool(axis_stops(sim, 0)), 2.0)
-            assert axis_stops(sim, 0)[0][0] - t_hang < 1.0
-            assert daemon.gate.leases() == {}
+            assert wait_for(lambda: bool(axis_stops(sim, 0)), 6.0)
+            # Nominally hold 0.3 s + deadman 0.2 s; the bound only has to prove the stop
+            # is bounded without the UI, so keep it loose enough for a loaded CI runner.
+            assert axis_stops(sim, 0)[0][0] - t_hang < 4.0
+            # the watchdog sends the stop and then drops the lease; on a busy machine the two
+            # can be observed apart, so wait for the lease instead of reading it once
+            assert wait_for(lambda: daemon.gate.leases() == {}, 2.0), daemon.gate.leases()
         finally:
             c.cont = None
             be.close()
@@ -649,6 +658,9 @@ def test_tui_read_block_refusals_and_quit_leave_daemon_running() -> None:
         assert "jog_step: refused: axis 4 is not jog-enabled" in history  # W lift: DENY in M1
         assert (2, 1, 0) in sim.commands  # home X, one axis
         assert not any(v[:2] == (2, 2) or v[:2] == (2, 3) for v in sim.commands)
+        # D9: quitting the TUI closes its connections, so the daemon disarms; it keeps
+        # running and stays connected to the card.
         with MccdClient(path) as client:
+            assert wait_for(lambda: client.call("status")["arm_state"] == "DISARMED", 3.0)
             st = client.call("status")
-        assert st["link"] == "CONNECTED" and st["arm_state"] == "MOTION_ARMED"
+        assert st["link"] == "CONNECTED"

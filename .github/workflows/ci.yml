@@ -37,4 +37,8 @@ jobs:
       - name: Qt smoke
         run: python -c "from PySide6.QtWidgets import QApplication; QApplication([]); print('Qt offscreen OK')"
       - name: Test
-        run: pytest -q
+        # --durations surfaces the slow tests when a runner is having a bad day: the suite has
+        # wall-clock budgets (tests/test_import_ui_fidelity_review.py, tests/test_perf_*.py) and
+        # knowing which test ate the time is the difference between a fix and a retry.
+        # -p no:cacheprovider keeps runs independent of any cached last-failed state.
+        run: pytest -q -p no:cacheprovider --durations=15

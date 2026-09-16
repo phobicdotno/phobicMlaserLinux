@@ -7,8 +7,10 @@
     nexcut-mccd tui   [--socket PATH] [--step-speed V] [--jog-speed V] [--allow-home-all] ...
     nexcut-mccd status [--json]                             # one-shot snapshot
     nexcut-mccd arm | disarm | stop | estop | ack-estop     # one-shot
-    nexcut-mccd jog AXIS MM [--speed V] [--wait]            # one relative step jog
-    nexcut-mccd home AXIS [--wait]                          # one axis
+    nexcut-mccd jog AXIS MM [--arm] [--speed V] [--wait]    # one relative step jog
+    nexcut-mccd home AXIS [--arm] [--wait]                  # one axis
+    nexcut-mccd run-job FILE [--arm] [--timeout S] [--json] # stream a planned frame file
+    nexcut-mccd job-status [--json]                         # the loaded job
     nexcut-mccd ctl CMD [JSON-ARGS]                         # any IPC request, raw reply
     nexcut-mccd --version
 
@@ -24,11 +26,23 @@ a non-loopback ``card.ip`` from ``config.toml`` alone makes ``serve`` exit with 
 ephemeral loopback port and points the daemon at it. The daemon never arms by itself:
 motion needs an explicit ``arm`` (or ``m`` in the TUI) followed by a motion command. The
 one-shot commands never arm implicitly.
+
+Arming lifetime (docs/DECISIONS.md D9): the daemon disarms as soon as the connection that
+sent ``arm_motion`` closes, so a bare ``nexcut-mccd arm`` is disarmed again the moment it
+exits. Use ``jog --arm`` / ``home --arm``, which arm, move and disarm inside one
+connection, or keep a connection open (the TUI, ``tools/m1_session.py``).
+
+``run-job`` streams a frame file written by ``python -m nexcut.plan`` into the card FIFO.
+It is a **dry run**: laser records were already stripped when the file was planned, are
+stripped again when the daemon loads it, and a third time by the safety gate on the way out
+(PORT-PLAN §8.2); there is no way to arm the laser in this phase (docs/DECISIONS.md D5).
+The job dies with the connection, like any other motion this process starts.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import math
@@ -36,7 +50,8 @@ import signal
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from pathlib import Path
 from typing import Any
 
 from nexcut import __version__
@@ -111,13 +126,38 @@ def _parser() -> argparse.ArgumentParser:
     jog.add_argument("axis", help="X, Y (jog-enabled in M1), W, Z or a slot number")
     jog.add_argument("mm", type=float, help="signed distance in mm")
     jog.add_argument("--speed", type=float, default=50.0, help="mm/s (default 50)")
+    jog.add_argument(
+        "--arm", action="store_true",
+        help="arm motion for this command only, wait for it, then disarm (implies --wait, D9)",
+    )  # fmt: skip
     jog.add_argument("--wait", action="store_true", help="wait until the axis is idle again")
     jog.add_argument("--timeout", type=float, default=60.0, help="--wait timeout in s (60)")
 
     home = sub.add_parser("home", parents=[sock], help="home one axis (V6)")
     home.add_argument("axis", help="X or Y")
+    home.add_argument(
+        "--arm", action="store_true",
+        help="arm motion for this command only, wait for it, then disarm (implies --wait, D9)",
+    )  # fmt: skip
     home.add_argument("--wait", action="store_true", help="wait until homing finished")
     home.add_argument("--timeout", type=float, default=180.0, help="--wait timeout in s (180)")
+
+    runjob = sub.add_parser(
+        "run-job", parents=[sock], help="stream a planned frame file (dry run, 11 §5)"
+    )
+    runjob.add_argument("file", help="frame file written by 'python -m nexcut.plan -o FILE'")
+    runjob.add_argument(
+        "--arm", action="store_true",
+        help="arm motion for this job only and disarm again before exiting (D9)",
+    )  # fmt: skip
+    runjob.add_argument(
+        "--timeout", type=float, default=0.0,
+        help="give up after S seconds and stop the job (0 = no limit)",
+    )  # fmt: skip
+    runjob.add_argument("--json", action="store_true", help="print the final job status as JSON")
+
+    jobstatus = sub.add_parser("job-status", parents=[sock], help="status of the loaded job")
+    jobstatus.add_argument("--json", action="store_true", help="raw JSON")
 
     ctl = sub.add_parser("ctl", parents=[sock], help="send one raw IPC request, print the reply")
     ctl.add_argument("cmd", help="command, e.g. status")
@@ -244,10 +284,40 @@ def _one_shot(ns: argparse.Namespace) -> int:
     def run(client: Any) -> int:
         res = client.call(cmd)
         _print_json(res)
+        if ns.command == "arm":
+            # D9: this process owns the arming, so it ends here. Say so rather than let the
+            # next command fail with "needs motion (state DISARMED)".
+            print(
+                "nexcut-mccd arm: the daemon disarms again as this process exits "
+                "(docs/DECISIONS.md D9). Use 'nexcut-mccd jog --arm' / 'home --arm' for a "
+                "one-shot move, or the TUI to stay armed.",
+                file=sys.stderr,
+            )
         failed = res.get("failed") if isinstance(res, dict) else None
         return EXIT_ERROR if failed else EXIT_OK
 
     return _with_client(ns, ns.command, run)
+
+
+@contextlib.contextmanager
+def _armed(client: Any, prog: str, arm: bool) -> Iterator[None]:
+    """Arm for the body and disarm afterwards, on this one connection (D9).
+
+    The disarm is best effort: if it fails, closing the connection disarms anyway - that is
+    the whole point of D9.
+    """
+    if not arm:
+        yield
+        return
+    client.call("arm_motion")
+    try:
+        yield
+    finally:
+        try:
+            client.call("disarm")
+        except Exception as exc:  # noqa: BLE001 - the daemon disarms on close regardless
+            print(f"nexcut-mccd {prog}: disarm failed ({exc}); the daemon disarms on "
+                  "disconnect (D9)", file=sys.stderr)  # fmt: skip
 
 
 def _fresh_snapshot(client: Any, after_wall: float) -> dict[str, Any] | None:
@@ -306,28 +376,34 @@ def _jog(ns: argparse.Namespace) -> int:
         print("nexcut-mccd jog: MM and --speed must be finite, speed > 0", file=sys.stderr)
         return EXIT_USAGE
 
+    # --arm arms, moves and disarms inside one connection (D9). The disarm stops whatever
+    # may still be moving, so it must not run before the step is finished: --arm waits.
+    wait = ns.wait or ns.arm
+
     def run(client: Any) -> int:
-        res = client.call("jog_step", slot=slot, mm=ns.mm, speed=ns.speed)
-        t_sent = time.time()
-        _print_json(res)
-        refresh: Callable[[], None] | None = None
-        if res.get("deadman"):
-            # The gate leased this step (|d| > v x deadman, PORT-PLAN §8.2): keep it alive for
-            # its expected duration only, so it still stops if this process dies.
-            until = time.monotonic() + abs(ns.mm) / ns.speed * 1.25 + 0.3
-            state = {"alive": True}
+        with _armed(client, "jog", ns.arm):
+            res = client.call("jog_step", slot=slot, mm=ns.mm, speed=ns.speed)
+            t_sent = time.time()
+            _print_json(res)
+            refresh: Callable[[], None] | None = None
+            if res.get("deadman"):
+                # The gate leased this step (|d| > v x deadman, PORT-PLAN §8.2): keep it
+                # alive for its expected duration only, so it still stops if this process
+                # dies.
+                until = time.monotonic() + abs(ns.mm) / ns.speed * 1.25 + 0.3
+                state = {"alive": True}
 
-            def refresh() -> None:
-                if state["alive"] and time.monotonic() < until:
-                    state["alive"] = bool(client.call("jog_refresh", slot=slot).get("alive"))
+                def refresh() -> None:
+                    if state["alive"] and time.monotonic() < until:
+                        state["alive"] = bool(client.call("jog_refresh", slot=slot).get("alive"))
 
-            if not ns.wait:
-                while state["alive"] and time.monotonic() < until:
-                    refresh()
-                    time.sleep(0.05)
-        if not ns.wait:
-            return EXIT_OK
-        return _wait(client, "jog", t_sent, ns.timeout, lambda s: _axis_idle(s, slot), refresh)
+                if not wait:
+                    while state["alive"] and time.monotonic() < until:
+                        refresh()
+                        time.sleep(0.05)
+            if not wait:
+                return EXIT_OK
+            return _wait(client, "jog", t_sent, ns.timeout, lambda s: _axis_idle(s, slot), refresh)
 
     return _with_client(ns, "jog", run)
 
@@ -341,23 +417,95 @@ def _home(ns: argparse.Namespace) -> int:
         print(f"nexcut-mccd home: {exc}", file=sys.stderr)
         return EXIT_USAGE
 
+    # As for jog: --arm must outlive the homing run, so it implies --wait (D9).
+    wait = ns.wait or ns.arm
+
     def run(client: Any) -> int:
-        res = client.call("home", slots=[slot])
-        t_sent = time.time()
-        _print_json(res)
-        if not ns.wait:
-            return EXIT_OK
+        with _armed(client, "home", ns.arm):
+            res = client.call("home", slots=[slot])
+            t_sent = time.time()
+            _print_json(res)
+            if not wait:
+                return EXIT_OK
 
-        def finished(snap: dict[str, Any]) -> bool:
-            return (
-                not snap.get("homing")
-                and slot in (snap.get("homed_slots") or ())
-                and _axis_idle(snap, slot)
-            )
+            def finished(snap: dict[str, Any]) -> bool:
+                return (
+                    not snap.get("homing")
+                    and slot in (snap.get("homed_slots") or ())
+                    and _axis_idle(snap, slot)
+                )
 
-        return _wait(client, "home", t_sent, ns.timeout, finished)
+            return _wait(client, "home", t_sent, ns.timeout, finished)
 
     return _with_client(ns, "home", run)
+
+
+_JOB_FINAL = ("DONE", "STOPPED", "FAILED")
+
+
+def _format_job(js: dict[str, Any]) -> str:
+    """One line for a ``job_status`` reply."""
+    if js.get("state") == "NONE":
+        return "no job loaded"
+    st = js.get("stats") or {}
+    iv = st.get("frame_interval_s") or {}
+    total = js.get("frames_total")
+    return (
+        f"{js.get('state')} {st.get('frames_sent', 0)}"
+        + (f"/{total}" if total else "")
+        + f" frames, {st.get('ticks_sent', 0)} ticks, "
+        f"queue low {st.get('min_queue_items')}, starvation {st.get('starvation_events', 0)}, "
+        f"resends {st.get('resends', 0)}, frame gap p99 {1000 * float(iv.get('p99', 0.0)):.1f} ms "
+        f"max {1000 * float(iv.get('max', 0.0)):.1f} ms"
+        + (f" - {js['error']}" if js.get("error") else "")
+    )
+
+
+def _run_job(ns: argparse.Namespace) -> int:
+    path = Path(ns.file)
+    if not path.is_file():
+        print(f"nexcut-mccd run-job: {path} is not a file", file=sys.stderr)
+        return EXIT_USAGE
+
+    def run(client: Any) -> int:
+        with _armed(client, "run-job", ns.arm):
+            loaded = client.call("load_job", path=str(path.resolve()))
+            print(f"loaded {loaded['frames']} frames, token {loaded['token'][:8]}", file=sys.stderr)
+            client.call("start_job", token=loaded["token"])
+            deadline = None if ns.timeout <= 0 else time.monotonic() + ns.timeout
+            js: dict[str, Any] = {}
+            try:
+                while True:
+                    js = client.call("job_status")
+                    if js.get("state") in _JOB_FINAL:
+                        break
+                    if deadline is not None and time.monotonic() > deadline:
+                        print(f"nexcut-mccd run-job: timed out after {ns.timeout:g} s",
+                              file=sys.stderr)  # fmt: skip
+                        js = client.call("stop_job")
+                        break
+                    time.sleep(0.2)
+            except KeyboardInterrupt:
+                js = client.call("stop_job")
+            if ns.json:
+                _print_json(client.call("job_status"), indent=2)
+            else:
+                print(_format_job(js))
+            return EXIT_OK if js.get("state") == "DONE" else EXIT_ERROR
+
+    return _with_client(ns, "run-job", run)
+
+
+def _job_status(ns: argparse.Namespace) -> int:
+    def run(client: Any) -> int:
+        js = client.call("job_status")
+        if ns.json:
+            _print_json(js, indent=2)
+        else:
+            print(_format_job(js))
+        return EXIT_OK
+
+    return _with_client(ns, "job-status", run)
 
 
 def _ctl(ns: argparse.Namespace) -> int:
@@ -418,6 +566,10 @@ def main(argv: list[str] | None = None, *, stop_event: threading.Event | None = 
         return _jog(ns)
     if cmd == "home":
         return _home(ns)
+    if cmd == "run-job":
+        return _run_job(ns)
+    if cmd == "job-status":
+        return _job_status(ns)
     if cmd == "ctl":
         return _ctl(ns)
     _parser().print_help(sys.stderr)

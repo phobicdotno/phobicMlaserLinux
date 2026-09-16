@@ -85,21 +85,42 @@ _FLOAT_PREFIX = re.compile(r"\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)")
 _INT_PREFIX = re.compile(r"\s*([+-]?\d+)")
 _MSVC_SPECIAL = re.compile(r"\s*([+-]?)1\.#(INF|QNAN|SNAN|IND)", re.IGNORECASE)
 
+# What ``boost::lexical_cast<double, wstring>`` (ParaModule ``0x1000d2c0``) accepts.
+# The stream step (``0x1000bdc0``) runs a ``num_get`` extraction with ``skipws``
+# cleared and then demands WEOF (``cmp ax, 0xffff`` at ``0x1000bee3``), so the whole
+# text must be one C++ float literal: no leading or trailing space, no ``_`` digit
+# separator, no trailing ``e``/``E``/``+``/``-`` (checked again at ``0x1000d33b``).
+_CPP_DOUBLE = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?")
+_CPP_INT = re.compile(r"[+-]?\d+")
+# ``parse_inf_nan_impl`` (``0x1000af70``): an optional sign, then the *whole* rest
+# spelled ``nan`` / ``inf`` / ``infinity`` case-insensitively (the constants at
+# 0x1001af24/0x1001af48 are L"nan"/L"NAN" and at 0x1001af2c/0x1001af50
+# L"infinity"/L"INFINITY"; the 3-char branch is taken only when exactly 3 remain,
+# the 8-char branch only when exactly 8 remain), or ``nan(...)``.
+_CPP_INF_NAN = re.compile(r"[+-]?(?:nan(?:\(.*\))?|inf(?:inity)?)\Z", re.IGNORECASE)
+
 
 def format_double(value: float) -> str:
-    """Format a double the way the vendor writer does: ``%.17g`` (02 §2.1).
+    """Format a double the way the vendor writer does (02 §2.1).
 
     EVIDENCE: ``0.59999999999999998``, ``11.000000000000002``, ``3`` in the
     vendor files; ParaModule.dll carries the format string ``%.*g``.
 
+    Non-finite values go through ``boost::lexical_cast``'s ``put_inf_nan``
+    (``0x1000ade0``), which copies **3** wide characters from ``L"nan"``
+    (``0x1001af24``) or ``L"infinity"`` (``0x1001af2c``) after an optional
+    ``-``, before the ``swprintf("%.*g", 17)`` at ``0x1000ed37`` is reached.
+    So the spellings are ``nan`` / ``-nan`` / ``inf`` / ``-inf`` - not the
+    MSVCR100 ``1.#QNAN``/``1.#INF`` this used to write (STATUS X8).
+
     UNVERIFIED: no sample holds an exponent or a non-finite value. The vendor
     CRT is MSVCR100, whose ``printf`` writes at least three exponent digits
-    (``1e-020``) and ``1.#INF``/``1.#QNAN``; that style is reproduced here.
+    (``1e-020``); that style is reproduced here.
     """
     if math.isnan(value):
-        return "-1.#IND" if math.copysign(1.0, value) < 0 else "1.#QNAN"  # UNVERIFIED
+        return "-nan" if math.copysign(1.0, value) < 0 else "nan"
     if math.isinf(value):
-        return "-1.#INF" if value < 0 else "1.#INF"  # UNVERIFIED
+        return "-inf" if value < 0 else "inf"
     text = format(value, ".17g")
     if "e" in text:
         mant, exp = text.split("e")
@@ -111,14 +132,23 @@ def format_double(value: float) -> str:
 def parse_double(text: str) -> tuple[float, bool]:
     """Parse a double; returns ``(value, exact)``.
 
-    ``exact`` is False when the text was not a clean number and a C ``wcstod``
-    prefix rule had to be applied (UNVERIFIED which C function ParaModule uses;
-    unparsable text yields 0.0 like ``_wtof``).
+    ``exact`` is True only for text ``boost::lexical_cast<double>``
+    (``0x1000d2c0``) converts without throwing: one whole C++ float literal, or
+    a signed ``nan``/``nan(...)``/``inf``/``infinity``.  Python's ``float`` is
+    wider than that - it also takes ``1_0``, ``" 5"`` and ``"1.\u00a0"`` - so it
+    cannot decide ``exact`` on its own (STATUS X9).
+
+    UNVERIFIED: what the vendor does with the ``bad_lexical_cast`` thrown at
+    ``0x1000d366`` for text it rejects.  This keeps returning a value via the C
+    ``wcstod`` prefix rule (unparsable text yields 0.0 like ``_wtof``) and flags
+    it ``exact=False``, which ``io.params`` reports as *coerced*.
     """
-    try:
+    if _CPP_DOUBLE.fullmatch(text):
         return float(text), True
-    except ValueError:
-        pass
+    if _CPP_INF_NAN.fullmatch(text):
+        sign = -1.0 if text[:1] == "-" else 1.0
+        body = text.lstrip("+-").lower()
+        return (math.copysign(math.nan, sign) if body.startswith("nan") else sign * math.inf), True
     m = _MSVC_SPECIAL.match(text)
     if m:
         kind = m.group(2).upper()
@@ -129,11 +159,15 @@ def parse_double(text: str) -> tuple[float, bool]:
 
 
 def parse_int(text: str) -> tuple[int, bool]:
-    """Parse an integer; returns ``(value, exact)`` (C ``_wtoi`` prefix rule otherwise, UNVERIFIED)."""
-    try:
+    """Parse an integer; returns ``(value, exact)``.
+
+    ``exact`` uses the same whole-text rule as :func:`parse_double`: ``_wtoi``
+    and ``boost::lexical_cast<int>`` both read a plain signed decimal and nothing
+    else, while Python's ``int`` also takes ``1_0`` and surrounding whitespace.
+    Non-exact text falls back to the C ``_wtoi`` prefix rule (UNVERIFIED).
+    """
+    if _CPP_INT.fullmatch(text):
         return int(text, 10), True
-    except ValueError:
-        pass
     m = _INT_PREFIX.match(text)
     return (int(m.group(1)) if m else 0), False
 

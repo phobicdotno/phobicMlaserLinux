@@ -178,8 +178,15 @@ def wait_2001_word(mode: int, p: int = 0, q: int = 0, r: int = 0) -> int:
 
 
 def dwell_tick_count(ms: float, cycle_us: int = INTERP_CYCLE_US) -> int:
-    """``(1000 idiv cycle) · ms`` stationary ticks (``0x4373ec-0x4373f8``, A3 §3 / V: integer
-    division first).  ``ms`` is truncated to an int as the vendor argument is an int."""
+    """``(1000 idiv cycle) · ms`` stationary ticks (dwell builder ``0x4427e0``, A9 §2).
+
+    Integer division first (``mov eax,0x3e8; cdq; idiv [g+0x4890]; imul eax,ms``); ``ms`` is
+    truncated to an int as the vendor argument is an int.  **This branch is unreachable for a CO2
+    cut**: it runs only when the builder's fourth argument is true, nine of the ten MainApp call
+    sites push 0, and the tenth sits inside the multi-stage pierce emitter that only a layer with
+    ``ManuType != 0`` enters (A9 §2.2).  Kept because the branch exists in the binary;
+    :meth:`JobStreamBuilder.prologue` uses the wait-record branch instead.
+    """
     if cycle_us <= 0:
         raise ValueError("cycle must be > 0")
     return (1000 // int(cycle_us)) * max(int(ms), 0)
@@ -567,9 +574,22 @@ class ContourLaser:
     """XML DO of the cut gas (``CutGasType`` 3 -> ``MGP.HighAir`` = 3)."""
     laser_port: int = 9
     """``LGP.CO2DOLaser``."""
-    pierce_dwell_ms: float = 100.0
-    """Stationary laser-on ticks after the laser DO (frame 504 shows >= 13). UNVERIFIED source:
-    the CO2 layer has ``LaserOnDelay = 0``; ``GC.GasDelay = 100`` ms is used as the default."""
+    pierce_dwell_ms: float = 0.0
+    """``layer.LaserOnDelay`` (pd126 / CO2 ``A241025_3``) in ms: the dwell **after** the laser DO
+    and before the cut ticks.  Emitted as one ``2001[ms, 3000]`` wait record, never as stationary
+    ticks (dwell builder ``0x4427e0`` call site ``0x443259``, A9 §2).  0 emits nothing, which is
+    what this machine's CO2 layer 2 does and what the leaked frames 0x39/0x1f8 show."""
+    gas_delay_ms: float = 0.0
+    """Remaining gas delay in ms when this contour switches the gas DO on: ``2001[ms, 3000]``
+    between the gas DO and the ZF/laser records (gas-wait builder ``0x4424e0``, A9 §2.3).
+    UNVERIFIED which of ``GC.GasDelay`` / ``DirectGasDelay`` / ``ChangeGasDelay`` the vendor sums
+    for a given contour and how much elapsed travel time it subtracts."""
+    laser_off_before_ms: float = 0.0
+    """``layer.LaserOffBeforeDelay`` (pd137): wait record before the laser DO goes off
+    (``0x4432e7``, A9 §2.2).  0 on this machine."""
+    laser_off_after_ms: float = 0.0
+    """``layer.LaserOffAfterDelay`` (pd138): wait record after the laser DO goes off
+    (``0x443326``, A9 §2.2).  0 on this machine."""
 
 
 @dataclass(slots=True)
@@ -583,7 +603,8 @@ class JobStreamBuilder:
       9999[2,0x100,0x100]`` (the leading 3001 is the explicit type-0xe marker, no auto-marker
       because 0xe is excluded; the one-tick ``(0,0)`` record between 3002 and the DO is
       reproduced as observed, role UNVERIFIED);
-    * dwell ticks at the cut PWM, then the cut ticks;
+    * the ``LaserOnDelay`` wait record (``2001[ms, 3000]``, nothing when 0 - A9 §2), then the
+      cut ticks;
     * epilogue records ``DO laser off; 8; 0xe; 3[4]`` -> ``3001; 9999[2,0x100,0]; 109[1000,0];
       2001[…]; 118[4,0,35]; 3001; 3002[4]``.
 
@@ -624,30 +645,53 @@ class JobStreamBuilder:
     def add_dwell(
         self, ms: float, freq: int = 0, duty: int = 0, cycle_us: int = INTERP_CYCLE_US
     ) -> int:
-        """Stationary ticks ``(1000 idiv cycle)·ms`` (dwell builder ``0x4427e0``, A3 V)."""
+        """Stationary ticks ``(1000 idiv cycle)·ms`` - the tick branch of the vendor dwell
+        builder ``0x4427e0``.  No CO2 call site selects it (only the fibre pierce stages can,
+        A9 §2.2), so :meth:`prologue` does not use it; kept because the branch exists."""
         n = dwell_tick_count(ms, cycle_us)
         self._ticks([0] * n, [0] * n, freq, duty)
         return n
 
+    def add_wait(self, ms: float) -> bool:
+        """Append one ``2001[ms, 3000]`` card-side wait record (A9 §2).
+
+        The vendor writes a type-1 sub-5 record with ``value = int(ms)``; NCModule drops it when
+        the value is not positive (A3 §4.4 type 1 sub 5), so a zero delay emits nothing.  Returns
+        whether a record was appended.
+        """
+        v = int(ms)
+        if v <= 0:
+            return False
+        self.records.append(Record(RecordType.IO, IoSub.WAIT_MS, value=v))
+        return True
+
     def prologue(
-        self, laser: ContourLaser, freq: int, duty: int, cycle_us: int = INTERP_CYCLE_US
+        self, laser: ContourLaser, freq: int = 0, duty: int = 0, cycle_us: int = INTERP_CYCLE_US
     ) -> None:
-        """Contour start records (11 §5.4)."""
+        """Contour start records (11 §5.4, A9 §2).
+
+        ``freq``/``duty``/``cycle_us`` are accepted for call compatibility; since the dwells are
+        wait records and not stationary ticks they no longer influence the prologue.
+        """
         self.records.append(Record(RecordType.BOUNDARY))
         self.records.append(Record.mode(MODE_BEFORE_LASER_ON))
         self.records.append(Record.tick(0, 0))
         if laser.gas_port > 0:
             self.records.append(Record.do(laser.gas_port, True))
-            self._gas_on.add(laser.gas_port)
+            if laser.gas_port not in self._gas_on:
+                self._gas_on.add(laser.gas_port)
+                self.add_wait(laser.gas_delay_ms)  # 0x4424e0: gas delay, not a tick dwell
         self.records.append(Record(RecordType.ZF_CUT_HEIGHT))
         if self.laser_records and laser.laser_port > 0:
             self.records.append(Record.do(laser.laser_port, True))
-        self.add_dwell(laser.pierce_dwell_ms, freq, duty, cycle_us)
+        self.add_wait(laser.pierce_dwell_ms)  # 0x443259: layer.LaserOnDelay, 0 here
 
     def epilogue(self, laser: ContourLaser) -> None:
-        """Contour end records (11 §5.4)."""
+        """Contour end records (11 §5.4, A9 §2.2 for the two laser-off waits)."""
+        self.add_wait(laser.laser_off_before_ms)
         if laser.laser_port > 0:  # port <= 0 = unassigned: nothing is written (A3 §6)
             self.records.append(Record.do(laser.laser_port, False))
+        self.add_wait(laser.laser_off_after_ms)
         self.records.append(Record(RecordType.ZF_LIFT))
         self.records.append(Record(RecordType.BOUNDARY))
         self.records.append(Record.mode(MODE_AFTER_LASER_OFF))
@@ -660,8 +704,7 @@ class JobStreamBuilder:
         laser: ContourLaser | None = None,
         cycle_us: int = INTERP_CYCLE_US,
     ) -> int:
-        """Prologue + cut ticks + epilogue.  ``freq``/``duty`` per interval or scalar; the dwell
-        uses the first interval's PWM."""
+        """Prologue + cut ticks + epilogue.  ``freq``/``duty`` per interval or scalar."""
         laser = laser or ContourLaser()
         f0 = int(np.atleast_1d(np.asarray(freq))[0]) if np.size(freq) else 0
         d0 = int(np.atleast_1d(np.asarray(duty))[0]) if np.size(duty) else 0

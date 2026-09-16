@@ -218,6 +218,23 @@ _ATOI = re.compile(rb"-?\d+")
 _ATOF = re.compile(rb"-?(?:\d+\.?\d*|\.\d+)")
 
 
+_INT_CHARS = b"0123456789-"
+_DOUBLE_CHARS = b"0123456789-."
+_POINT_CHARS = b"0123456789-.,"
+_VEC2_NEW = tuple.__new__
+
+VALUE_CACHE_MAX = 1 << 17
+"""Distinct tokens per kind whose decoded value :class:`_Tokens` memoises.
+
+``.chf`` repeats its tokens: the 50 000-contour perf file of the import/UI
+fidelity review has 1.95 M tokens and 150 k distinct ones, and a hand-made job
+repeats ``0``/``0.0``/``1`` thousands of times.  The cap keeps the cost bounded
+for a file whose tokens are all distinct (nothing is evicted; past the cap the
+caches simply stop growing).  Values are immutable (``int``/``float``/``Vec2``),
+so sharing one object between readings is safe.
+"""
+
+
 def _atoi(tok: bytes) -> int:
     """C ``atoi`` on a token already validated to ``[0-9-]`` (03 §4.2).
 
@@ -225,25 +242,70 @@ def _atoi(tok: bytes) -> int:
     in ``SRC/msvcr100.dll`` ``atoi`` (RVA ``0x1fa21``) jumps to ``atol`` (``0x1fc9d``), which is
     ``strtol(s, NULL, 10)`` (``push 0xa; push 0; ... call 0x78abfc75``), so an out-of-range
     value saturates at ``INT_MIN``/``INT_MAX`` (32-bit ``long``) instead of growing.
+
+    ``int(tok)`` is the fast path for the usual whole-token number; a token that
+    only *starts* with a number (``1-2``) or holds none falls back to the
+    ``strtol`` prefix rule.  The token alphabet is ``[0-9-]`` so no Python-only
+    spelling (``_`` separators, whitespace, ``0x``) can reach the fast path.
     """
-    m = _ATOI.match(tok)
-    return min(INT_MAX, max(INT_MIN, int(m.group()))) if m else 0
+    try:
+        value = int(tok)
+    except ValueError:
+        m = _ATOI.match(tok)
+        if m is None:
+            return 0
+        value = int(m.group())
+    return min(INT_MAX, max(INT_MIN, value))
 
 
 def _atof(tok: bytes) -> float:
-    """C ``atof`` on a token already validated to ``[0-9.-]`` with <= 1 dot (03 §4.2)."""
-    m = _ATOF.match(tok)
-    return float(m.group()) if m else 0.0
+    """C ``atof`` on a token already validated to ``[0-9.-]`` with <= 1 dot (03 §4.2).
+
+    Same two-step shape as :func:`_atoi`: ``float(tok)`` for a whole-token number,
+    else the prefix rule.  The validated alphabet excludes ``e``/``E``/``_``/space,
+    so ``float`` cannot accept anything ``strtod`` would reject here.
+    """
+    try:
+        return float(tok)
+    except ValueError:
+        m = _ATOF.match(tok)
+        return float(m.group()) if m else 0.0
 
 
 def _valid_int(tok: bytes) -> bool:
-    """Validator ``0x100d97b0``: only ``0-9`` and ``-`` (empty is valid)."""
-    return all(0x30 <= c <= 0x39 or c == 0x2D for c in tok)
+    """Validator ``0x100d97b0``: only ``0-9`` and ``-`` (empty is valid).
+
+    ``bytes.translate(None, keep)`` deletes every accepted byte, so an empty
+    result means every byte was accepted (one C pass instead of a per-byte loop).
+    """
+    return not tok.translate(None, _INT_CHARS)
 
 
 def _valid_double(tok: bytes) -> bool:
     """Validator ``0x100d9800``: only ``0-9 . -`` and at most one dot (empty is valid)."""
-    return all(0x30 <= c <= 0x39 or c in (0x2D, 0x2E) for c in tok) and tok.count(b".") <= 1
+    return not tok.translate(None, _DOUBLE_CHARS) and tok.count(b".") <= 1
+
+
+_BLANKS = b" \t"
+"""Bytes ``ReadToken`` drops anywhere in a line (space, tab; 03 §4.2)."""
+
+_CR_BLANKS_LF = re.compile(rb"\r[ \t]+(?=\n)")
+"""A CR, blanks, then an LF: two line endings that must not fuse into one CRLF."""
+
+
+_MARKER_BYTES: dict[str, bytes] = {}
+"""ASCII form of each marker/header literal, with the blanks ``ReadToken`` drops removed.
+
+Filled on first use by :func:`_marker_bytes`; the keys are the module's own
+marker constants, so it stays tiny.
+"""
+
+
+def _marker_bytes(marker: str) -> bytes:
+    """ASCII form of a marker/header literal with the blanks ``ReadToken`` drops removed."""
+    value = marker.replace(" ", "").encode("ascii")
+    _MARKER_BYTES[marker] = value
+    return value
 
 
 class _Tokens:
@@ -251,44 +313,111 @@ class _Tokens:
 
     One token per line; CR, LF or CRLF terminate it; spaces and tabs are
     dropped anywhere in the line; an empty line is an empty token.
+
+    The whole buffer is tokenised once, in two C passes: ``translate`` drops the
+    blanks and ``bytes.splitlines`` cuts on CR / LF / CRLF - exactly the three
+    terminators of the DLL loop, and it also drops the empty remainder after a
+    final terminator, which is where ``ReadToken`` reports end of file.  The
+    byte-at-a-time Python loop this replaces needed ~7 s for a 50 000-contour
+    file (1.95 M calls; import/UI fidelity review, STATUS X12).
     """
 
+    __slots__ = ("_doubles", "_ints", "_points", "_tokens", "line", "strict")
+
     def __init__(self, data: bytes, strict: bool) -> None:
-        self.data = data
-        self.pos = 0
+        # GBK is safe here: no trail byte is 0x09/0x20/0x0a/0x0d (lead 0x81-0xfe,
+        # trail 0x40-0xfe minus 0x7f), so removing blanks first cannot split a
+        # multi-byte character, and the DLL drops those bytes unconditionally too.
+        # A blanks-only line between a CR and an LF would leave "\r\n" once the
+        # blanks are gone - one terminator instead of two, losing that empty token.
+        # Writing the CR's own terminator back in front of the LF keeps them apart.
+        # The two-byte probe costs a memchr and is false for every real .chf, where
+        # blanks occur only inside marker lines such as "<Begin Graphs>".
+        if b"\r " in data or b"\r\t" in data:
+            data = _CR_BLANKS_LF.sub(b"\r\n", data)
+        clean = data.translate(None, _BLANKS)
+        self._tokens: list[bytes] = clean.splitlines()
+        # A last line that holds nothing but blanks is a line too: the DLL loop
+        # reaches it, drops the blanks and returns an empty token.  ``splitlines``
+        # cannot see it any more, so put it back.
+        if data and data[-1:] not in (b"\r", b"\n") and (not clean or clean[-1:] in (b"\r", b"\n")):
+            self._tokens.append(b"")
         self.line = 0
         self.strict = strict
+        # Decoded-value caches (see VALUE_CACHE_MAX): .chf repeats its tokens
+        # heavily - a 50 000-contour file has 1.95 M tokens but 150 k distinct ones.
+        self._ints: dict[bytes, int] = {}
+        self._doubles: dict[bytes, float] = {}
+        self._points: dict[bytes, Vec2] = {}
 
     def tok(self) -> bytes:
-        data, n = self.data, len(self.data)
-        if self.pos >= n:
-            raise ChfError("unexpected end of file", 4, self.line + 1)
-        buf = bytearray()
-        while self.pos < n:
-            c = data[self.pos]
-            self.pos += 1
-            if c == 0x0D or c == 0x0A:
-                if c == 0x0D and self.pos < n and data[self.pos] == 0x0A:
-                    self.pos += 1
-                break
-            if c != 0x20 and c != 0x09:
-                buf.append(c)
-        self.line += 1
-        return bytes(buf)
+        i = self.line
+        try:
+            t = self._tokens[i]
+        except IndexError:
+            raise ChfError("unexpected end of file", 4, i + 1) from None
+        self.line = i + 1
+        return t
 
     def int(self) -> int:
-        """``ReadInt`` ``0x100d9db0``."""
-        t = self.tok()
-        if not _valid_int(t):
-            raise ChfError(f"expected int, got {t!r}", 3, self.line)
-        return _atoi(t)
+        """``ReadInt`` ``0x100d9db0``.
+
+        ``tok`` + :func:`_valid_int` + :func:`_atoi` are inlined and the decoded
+        value is memoised: a 50 000-contour file makes 600 000 of these calls and
+        the Python frames dominated the read (import/UI fidelity review, STATUS
+        X12).  The validation and the value are unchanged.
+        """
+        i = self.line
+        try:
+            t = self._tokens[i]
+        except IndexError:
+            raise ChfError("unexpected end of file", 4, i + 1) from None
+        self.line = i + 1
+        cache = self._ints
+        value = cache.get(t)
+        if value is not None:
+            return value
+        if t.translate(None, _INT_CHARS):
+            raise ChfError(f"expected int, got {t!r}", 3, i + 1)
+        try:
+            value = int(t)
+        except ValueError:
+            value = _atoi(t)
+        else:
+            if value > INT_MAX:
+                value = INT_MAX
+            elif value < INT_MIN:
+                value = INT_MIN
+        if len(cache) < VALUE_CACHE_MAX:
+            cache[t] = value
+        return value
 
     def double(self) -> float:
-        """``ReadDouble`` ``0x100d9df0``."""
-        t = self.tok()
-        if not _valid_double(t):
-            raise ChfError(f"expected double, got {t!r}", 3, self.line)
-        return _atof(t)
+        """``ReadDouble`` ``0x100d9df0`` (inlined and memoised like :meth:`int`)."""
+        i = self.line
+        try:
+            t = self._tokens[i]
+        except IndexError:
+            raise ChfError("unexpected end of file", 4, i + 1) from None
+        self.line = i + 1
+        cache = self._doubles
+        value = cache.get(t)
+        if value is not None:
+            return value
+        if t.translate(None, _DOUBLE_CHARS):
+            raise ChfError(f"expected double, got {t!r}", 3, i + 1)
+        try:
+            value = float(t)
+        except ValueError:
+            # Over the validated alphabet ``float`` fails only for a token that is
+            # not a whole number ('1-2', '', '-') or that holds a second dot, so
+            # the remaining dot check of 0x100d9800 is needed only on this path.
+            if t.count(b".") > 1:
+                raise ChfError(f"expected double, got {t!r}", 3, i + 1) from None
+            value = _atof(t)
+        if len(cache) < VALUE_CACHE_MAX:
+            cache[t] = value
+        return value
 
     def bool(self) -> bool:
         """``ReadBool`` ``0x100d9e30``: int-validated, then ``strcmp(token, "1") == 0``."""
@@ -299,19 +428,51 @@ class _Tokens:
 
     def point_from(self, t: bytes) -> Vec2:
         """``ReadPoint`` body (``0x100d9e80``): split at the first comma, halves > 30 chars -> "0"."""
-        if b"," not in t:
+        xs, comma, ys = t.partition(b",")
+        if not comma:
             raise ChfError(f"expected 'x,y', got {t!r}", 3, self.line)
-        xs, ys = t.split(b",", 1)
         if len(xs) > POINT_HALF_MAX:
             xs = b"0"
         if len(ys) > POINT_HALF_MAX:
             ys = b"0"
-        if not (_valid_double(xs) and _valid_double(ys)):
+        if xs.translate(None, _DOUBLE_CHARS) or ys.translate(None, _DOUBLE_CHARS):
             raise ChfError(f"expected 'x,y', got {t!r}", 3, self.line)
-        return Vec2(_atof(xs), _atof(ys))
+        try:
+            return Vec2(float(xs), float(ys))
+        except ValueError:  # see :meth:`double`: only here can a half hold two dots
+            if xs.count(b".") > 1 or ys.count(b".") > 1:
+                raise ChfError(f"expected 'x,y', got {t!r}", 3, self.line) from None
+            return Vec2(_atof(xs), _atof(ys))
 
     def point(self) -> Vec2:
-        return self.point_from(self.tok())
+        """``ReadPoint`` ``0x100d9e80`` (token read inlined and memoised like :meth:`int`).
+
+        The fast path needs the token to be at most ``2 * POINT_HALF_MAX + 1``
+        bytes long, so that neither half can trip the "> 30 chars -> 0" rule of
+        the DLL, and to hold exactly one comma with nothing outside ``[0-9.,-]``.
+        Everything else goes through :meth:`point_from` unchanged.
+        """
+        i = self.line
+        try:
+            t = self._tokens[i]
+        except IndexError:
+            raise ChfError("unexpected end of file", 4, i + 1) from None
+        self.line = i + 1
+        cache = self._points
+        p = cache.get(t)
+        if p is not None:
+            return p
+        if len(t) <= POINT_HALF_MAX + 1 and not t.translate(None, _POINT_CHARS) and t.count(b",") == 1:
+            xs, _, ys = t.partition(b",")
+            try:
+                p = _VEC2_NEW(Vec2, (float(xs), float(ys)))
+            except ValueError:
+                p = self.point_from(t)
+        else:
+            p = self.point_from(t)
+        if len(cache) < VALUE_CACHE_MAX:
+            cache[t] = p
+        return p
 
     def wstr(self) -> str:
         """``ReadWStr`` ``0x100da370``: cp936 bytes; unmappable bytes survive via surrogateescape."""
@@ -319,19 +480,34 @@ class _Tokens:
 
     def marker(self, marker: str) -> None:
         """Consume a marker line; checked only in strict mode (the DLL never compares, 03 §4.2)."""
-        t = self.tok()
-        if self.strict and t != marker.replace(" ", "").encode("ascii"):
-            raise ChfError(f"expected {marker!r}, got {t!r}", 3, self.line)
+        i = self.line
+        try:
+            t = self._tokens[i]
+        except IndexError:
+            raise ChfError("unexpected end of file", 4, i + 1) from None
+        self.line = i + 1
+        if self.strict and t != (_MARKER_BYTES.get(marker) or _marker_bytes(marker)):
+            raise ChfError(f"expected {marker!r}, got {t!r}", 3, i + 1)
 
     def header(self, prefix: str) -> None:
         """Consume a ``####...<n>`` index line (number ignored, like the DLL)."""
-        t = self.tok()
-        if self.strict and not t.startswith(prefix.replace(" ", "").encode("ascii")):
-            raise ChfError(f"expected {prefix!r}, got {t!r}", 3, self.line)
+        i = self.line
+        try:
+            t = self._tokens[i]
+        except IndexError:
+            raise ChfError("unexpected end of file", 4, i + 1) from None
+        self.line = i + 1
+        if self.strict and not t.startswith(_MARKER_BYTES.get(prefix) or _marker_bytes(prefix)):
+            raise ChfError(f"expected {prefix!r}, got {t!r}", 3, i + 1)
 
     def skip(self, n: int) -> None:
-        for _ in range(n):
-            self.tok()
+        """Consume ``n`` tokens (end of file is reported by the next read, as in the DLL)."""
+        if n <= 0:
+            return
+        if self.line + n > len(self._tokens):
+            self.line = len(self._tokens)
+            raise ChfError("unexpected end of file", 4, self.line + 1)
+        self.line += n
 
 
 # ---------------------------------------------------------------------------

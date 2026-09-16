@@ -13,7 +13,11 @@ import pytest
 
 from nexcut.mcc.crc import CrcOrder
 from nexcut.mcc.dissector import (
+    COMMAND_NAMES,
+    MISC_SUBCOMMANDS,
+    READ_BLOCKS,
     FifoParseError,
+    describe_vector,
     dissect_capture,
     dissect_file,
     dissect_logs,
@@ -108,18 +112,87 @@ def test_exception_line_rebuilds_request_frame() -> None:
     # decodeWithSeq accepts only the request's seq, so the request is recoverable byte-exactly
     assert tx.request is not None and tx.request.problems == ()
     assert tx.request.frame.raw == write_request(0x1D3F, 0x65, [3, 1, 50000, 5999, 59990, 4000000])
-    assert "CMD move-axis" in tx.describe()
+    # 11 §8 correction 1: sub-command 3 is a relative JOG, not "move-axis" (04 naming)
+    assert "CMD jog" in tx.describe()
+    assert "axis Y distance +4000.000 mm (relative)" in tx.describe()
     assert tx.notes == []
 
 
 def test_502_resync_and_recvfrom() -> None:
     (tx,) = transactions_from_log([parse_log_line(L_502W)])  # type: ignore[list-item]
     assert tx.errcode == 502 and tx.request_vector == (0x40, 0x65, 1, 0x66)
-    assert request_kind(tx.request_vector) == "CMD reset/resync?"
+    assert request_kind(tx.request_vector) == "CMD zf-resync?"  # 11 §3.3 [102], A1 §1 slot 59
     rec = parse_log_line(L_RECVFROM)
     assert rec is not None and rec.buffer is None and rec.data is None
     (tx2,) = transactions_from_log([rec])
     assert tx2.status == "socket-error" and tx2.errcode == 10038 and tx2.rungs == ((2, 3),)
+
+
+# ---- 0x65 label table against 11 §2 / §3.3 / §5.2 -----------------------------------------------
+
+
+def _cmd(words: list[int]) -> str:
+    return describe_vector([0x40, 0x65, len(words), *[w & 0xFFFFFFFF for w in words]])
+
+
+def test_command_labels_match_the_vector_table_of_11_section_2() -> None:
+    """Every 0x65 sub-command the findings name has the right label (11 §2, §8 correction 1).
+
+    Before this fix the table was the 04-era one: 1 was "home" and 3 "move-axis", so a
+    capture of 60 stops read as 60 homings (STATUS §1.1 "known defect").
+    """
+    assert COMMAND_NAMES[1] == "stop"  # V3/V4/V5 [1, mask, 2, vd, 10*vd]
+    assert COMMAND_NAMES[2] == "home"  # V6 [2, 1<<slot, 0]
+    assert COMMAND_NAMES[3] == "jog"  # V1/V2 relative, bit 31 absolute
+    assert COMMAND_NAMES[5] == "goto"  # V8 go-to point
+    assert COMMAND_NAMES[101] == "zf-stop"  # V14
+    assert COMMAND_NAMES[9999] == "misc"
+    # No label may still claim a motion meaning that 11 §8 corrected away.
+    assert "home" not in _cmd([1, 0x1F, 2, 2000, 20000])
+    assert "move-axis" not in _cmd([3, 0, 200000, 5999, 59990, 4000000])
+    # Deny-listed sub-commands (11 §3.3) are named, and their guesses end in "?".
+    for sub in (4, 7, 102, 107, 117, 118, 103, 104, 109):
+        assert sub in COMMAND_NAMES, sub
+    assert all(COMMAND_NAMES[sub].endswith("?") for sub in (4, 7, 102, 107, 117))
+    # The 9999 family of 11 §2 V11-V13 / §5.2, including the connect prologue V0.
+    assert MISC_SUBCOMMANDS[2] == "DO 1..10"
+    assert MISC_SUBCOMMANDS[4] == "DA"
+    assert MISC_SUBCOMMANDS[5] == "connect-prologue"
+    assert MISC_SUBCOMMANDS[13] == "DO 11..26"
+    assert MISC_SUBCOMMANDS[0x11] == "PWM(5V)"
+    # Register blocks: everything 11 §3.2 allows, and the deny-listed ones flagged (§3.3).
+    for addr in (1000, 1050, 2000, 5000, 10000, 11000, 50000, 50200, 60001):
+        assert addr in READ_BLOCKS, addr
+    for addr in (150, 151, 59500):
+        assert READ_BLOCKS[addr].endswith("- DENY"), addr
+    assert "READ 1000 x36 (status RO)" == describe_vector([0x30, 1000, 36])
+    assert "(card licence - DENY)" in describe_vector([0x30, 59500, 12])
+
+
+def test_command_descriptions_carry_the_vector_meaning() -> None:
+    """The human line says what the vector does, in words (11 §2 columns 2-3)."""
+    # V1 continuous jog X-, V2 step, V8 absolute go-to (11 §7 step 4: bit 31 = absolute).
+    assert _cmd([3, 0, 200000, 5999, 59990, -4000000]) == (
+        "CMD jog [3, 0x0, 200000, 5999, 59990, -4000000]  axis X distance -4000.000 mm "
+        "(relative), v 200.000 mm/s, a 5999 mm/s^2, jerk 59990"
+    )
+    assert "axis Y target +100.000 mm" in _cmd([3, 0x80000001, 20000, 5999, 59990, 100000])
+    # V4 stop-all and V5 two-word stop; V6 home one axis versus V7 system home.
+    assert "stop axes X|Y|Y2|Z|W, decel 2000" in _cmd([1, 0x1F, 2, 2000, 20000])
+    assert "card default decel" in _cmd([1, 0x1F])
+    assert "home axes X" in _cmd([2, 1, 0])
+    assert "system home axes X|Y" in _cmd([2, 3, 0])
+    # V11 DO write: DO9 is the CO2 laser enable on this machine (11 §2 V11).
+    assert "set DO9=1" in _cmd([9999, 2, 0x100, 0x100])
+    assert "set DO1=0" in _cmd([9999, 2, 1, 0])
+    assert "set DO11=1" in _cmd([9999, 13, 1, 1])
+    assert "DA channel 2 = 5000 mV" in _cmd([9999, 4, 1, 5000])
+    assert "PWM 5000 Hz, duty 4 %" in _cmd([9999, 0x11, 5000, 4])
+    assert "connect prologue" in _cmd([9999, 5, 0, 0])
+    # ZF vectors outside the FIFO are deny-listed but must still read correctly (11 §3.3).
+    assert "ZF v 100.0 mm/s, height +0.000 mm" in _cmd([103, 1000, 0])
+    # An unknown sub-command never invents a meaning.
+    assert _cmd([4242, 1]) == "CMD sub4242 [4242, 1]"
 
 
 def test_ladder_grouping() -> None:
@@ -541,11 +614,10 @@ def test_package_logs(src_dir: Path) -> None:
                 assert pdu.problems == (), (t.describe(), pdu.problems)
         assert t.notes in ([], ["ladder incomplete"])
     kinds_req = Counter(request_kind(t.request_vector) for t in exc if t.request_vector)
-    assert (kinds_req["CMD move-axis"], kinds_req["CMD home"], kinds_req["CMD move-multi"]) == (
-        506,
-        60,
-        1,
-    )
+    # 11 §8 correction 1 / §2.1 census: 506 six-word jogs (sub 3), 60 five-word stops
+    # (sub 1 - labelled "home" before this fix), 1 go-to (sub 5).
+    assert (kinds_req["CMD jog"], kinds_req["CMD stop"], kinds_req["CMD goto"]) == (506, 60, 1)
+    assert kinds_req["CMD home"] == 0  # sub-command 2 was never sent in the package logs
     ladders = Counter(len(t.rungs) for t in txs if t.status == "timeout")
     # 7-rung ladders: 139 with this grouping (analyst's count; the verifier's rule gave 138, 08 §2.3)
     assert ladders[7] == 139

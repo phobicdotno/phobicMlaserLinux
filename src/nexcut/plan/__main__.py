@@ -250,6 +250,8 @@ def _job_frames(
                 laser_port=laser_port,
                 pierce_dwell_ms=ll.laser_on_delay_ms,
                 gas_delay_ms=gas_delay_ms,
+                laser_off_before_ms=ll.laser_off_before_ms,
+                laser_off_after_ms=ll.laser_off_after_ms,
             )
             yield from stream.contour(motion.xy, freq, duty, cl)
             pos = motion.xy[-1]

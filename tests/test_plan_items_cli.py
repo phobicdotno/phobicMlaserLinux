@@ -140,3 +140,45 @@ def test_cli_on_vendor_job(src_dir: Path, tmp_path: Path) -> None:
     assert sum(1 for op, _ in items if op == 103) == 24  # 24 line contours of autosave.chf
     for fid, data in frames:
         assert strip_laser_records([fid, *data])[1] == 0
+
+
+def _job_items(layer: ParamDocument) -> list[tuple[int, tuple[int, ...]]]:
+    manu, hard, _ = machine_docs()
+    job = build_job(job_doc(), manu, hard, layer, laser_records=True)
+    return _items([(i, list(f.data)) for i, f in enumerate(job.frames)])
+
+
+def test_laser_off_delays_reach_the_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    """STATUS §5 task 10: ``GP.LaserOffBeforeDelay`` / ``LaserOffAfterDelay`` (pd137/pd138)
+    are read by ``LayerLaser.from_layer`` and plumbed through ``build_job`` into the two
+    epilogue wait records (A9 §2.2); absent or 0 - this machine - emits nothing.
+
+    The CO2 layer layout has no such attributes (only the fibre ``GP`` carries them), so the
+    layer record is extended through ``layer_values``, the one place ``build_job`` reads it.
+    """
+    from nexcut.plan import __main__ as plan_main
+    from nexcut.plan.pwm_schedule import LayerLaser
+
+    assert LayerLaser.from_layer({}).laser_off_before_ms == 0.0
+    ll = LayerLaser.from_layer({"LaserOffBeforeDelay": 7.0, "LaserOffAfterDelay": "11"})
+    assert (ll.laser_off_before_ms, ll.laser_off_after_ms) == (7.0, 11.0)
+
+    _, _, layer = machine_docs()
+    plain = _job_items(layer)
+    assert (2001, (7, 3000)) not in plain and (2001, (11, 3000)) not in plain
+    real = plan_main.layer_values
+
+    def with_delays(*args: object, **kw: object) -> dict[str, object]:
+        return {**real(*args, **kw), "LaserOffBeforeDelay": 7.0, "LaserOffAfterDelay": 11.0}  # type: ignore[arg-type]
+
+    monkeypatch.setattr(plan_main, "layer_values", with_delays)
+    items = _job_items(layer)
+    off = (9999, (2, 0x100, 0))
+    assert items.count(off) == 2
+    for i, item in enumerate(items):
+        if item == off:
+            assert items[i - 1] == (2001, (7, 3000)) and items[i + 1] == (2001, (11, 3000))
+    # nothing else moved: removing the four waits gives the plain stream back
+    waits = ((2001, (7, 3000)), (2001, (11, 3000)))
+    assert sum(it in waits for it in items) == 4
+    assert [it for it in items if it not in waits] == plain

@@ -242,6 +242,11 @@ class LayerLaser:
     freq_curve: CurveNodes = CurveNodes((0.0, 100.0), (100.0, 100.0))
     laser_on_delay_ms: float = 0.0
     gas_type: int = 0
+    laser_off_before_ms: float = 0.0
+    """``GP.LaserOffBeforeDelay`` (pd137): wait before the laser DO goes off (A9 §2.2).
+    Absent from this machine's CO2 layer XML, so 0 - which emits no record."""
+    laser_off_after_ms: float = 0.0
+    """``GP.LaserOffAfterDelay`` (pd138): wait after the laser DO goes off (A9 §2.2)."""
 
     @classmethod
     def from_layer(cls, layer: Mapping[str, float | int | str]) -> LayerLaser:
@@ -257,6 +262,8 @@ class LayerLaser:
             freq_curve=CurveNodes.parse(str(layer.get("FreqCurveNodes", ""))),
             laser_on_delay_ms=float(layer.get("LaserOnDelay", 0.0)),
             gas_type=int(float(layer.get("CutGasType", 0))),
+            laser_off_before_ms=float(layer.get("LaserOffBeforeDelay", 0.0)),
+            laser_off_after_ms=float(layer.get("LaserOffAfterDelay", 0.0)),
         )
 
     def tick_pwm(

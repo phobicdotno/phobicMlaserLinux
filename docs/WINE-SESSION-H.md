@@ -90,8 +90,36 @@ Rules for every artefact:
 4. Write down what you *saw* even when nothing was saved — "Mlaser refused to open it with
    message X" is the answer to half of these questions.
 
-The port side then reads them through a fixture like `src_dir` (`tests/conftest.py`):
-`NEXCUT_SESSION_H=~/mlaser-captures/session-h`, skipping when absent, so CI stays green.
+The port side reads them through the `session_h_dir` fixture in `tests/conftest.py`, next to
+`src_dir`: `NEXCUT_SESSION_H` (default `~/mlaser-captures/session-h`), skipping when the
+directory is absent, so CI stays green.
+
+### 2.1 What the port's tests read (exact names)
+
+`tests/test_session_h.py` consumes the artefacts below. Each test skips on its own when the
+file it needs is missing, so a partly-run session still feeds every test it can; with no
+directory at all the file reports 14 skipped. **Use these names exactly** — a file saved under
+another name is invisible to the tests.
+
+| Path under `session-h/` | Test | What it asserts |
+|---|---|---|
+| `h1-sort/h1-00-unsorted.chf` | `test_vendor_sort_golden[*]` (input), `test_vendor_written_chf_is_rewritten_byte_identically` | the "before" of every sort; re-written by the port byte for byte |
+| `h1-sort/h1-00-left-to-right.chf` … `h1-07-small-first.chf` (the eight names of the H-1 table) | `test_vendor_sort_golden[LEFT_TO_RIGHT … SMALL_FIRST]` | the vendor's graph order, matched back to `h1-00-unsorted.chf` by bounding box, equals `ops.sort.sort_graphs(unsorted, SortType.N).order` |
+| `h1-sort/*.chf`, `h4-crafts/*.chf` (any name) | `test_every_session_h_chf_is_rewritten_byte_identically` | every vendor-written `.chf` survives `read_chf` → `write_chf` unchanged; the failures are listed by file |
+| `h2-m3-gate/h2-vendor-resaved-autosave.chf` | `test_vendor_written_chf_is_rewritten_byte_identically` | as above |
+| `h2-m3-gate/h2-vendor-resaved-BkLayerPara.xml` | `test_vendor_resaved_params_round_trip` | `serialize_params(parse_params(file, "layer"))` is the file |
+| `h2-m3-gate/h2-vendor-resaved-technology-CO2.xml` | `test_technology_preset_matches_vendor_attribute_set` | `serialize_technology(parse_technology(file))` is the file — fails, by name, if the vendor dropped `CutFreq` (the H-2 step 3 verdict) |
+| `h3-x7/h3-tampered.xml` + `h3-x7/h3-after.xml` | `test_x7_port_keeps_unknown_attributes_exactly_when_the_vendor_does` | `NexcutProbe="42"` survives the port's rewrite of `h3-tampered.xml` exactly when it is in `h3-after.xml` |
+
+Some of these may **fail** on the first real run, and then the failure is the finding: a sort
+golden fails wherever `ops/sort.py` orders differently from the vendor; the technology test
+fails if the vendor re-save drops `CutFreq`; the X7 test fails if the vendor *keeps* the probe
+(the port drops it today). If the vendor drops the probe too, the X7 test passes and the strict
+xfail `test_unknown_attribute_survives_rewrite` has to be rewritten by hand as a fidelity
+statement citing `h3-after.xml`. The consumers themselves are checked on synthetic artefacts in
+the same file (and were run once end to end against a synthetic `session-h/` built from the
+package's `autosave.chf` and `BkLayerPara.xml`: 18 passed), so a failure is about the data,
+not the test.
 
 ---
 
@@ -142,7 +170,7 @@ the gate's reference.
 `~/mlaser-captures/session-h/h1-sort/`, and in `notes.md` the parameter values you saw in
 `Options ▸ Sort` (`GRP.SortType`, `GRP.SortIsSmallFirst`, `IGP.AutoSortType`).
 
-**Which port test consumes it.** `tests/test_ops_sort.py` — the graph order of each file
+**Which port test consumes it.** `tests/test_session_h.py::test_vendor_sort_golden` (§2.1) — the graph order of each file
 (`####graph NO:` order, read with `nexcut.io.chf.read_chf`) becomes the golden for
 `sort_graphs(doc, SortType.<N>)`, one parametrised case per row of the table, replacing
 `SORT_UNVERIFIED`'s first two entries. `h1-00-unsorted.chf` also becomes a ninth byte-identity
@@ -269,7 +297,9 @@ five-minute experiment.
 otherwise byte-identical (it tells you whether the vendor rewrites the whole document or edits
 in place), the attribute order, and the XML declaration/encoding of the file it wrote.
 
-**Which port test consumes it.** `tests/test_io_fidelity_review.py::test_unknown_attribute_survives_rewrite`:
+**Which port test consumes it.** `tests/test_session_h.py::test_x7_port_keeps_unknown_attributes_exactly_when_the_vendor_does`
+(§2.1) reads the two files, and `tests/test_io_fidelity_review.py::test_unknown_attribute_survives_rewrite`
+follows the verdict:
 if the vendor preserves the attribute, the strict xfail is removed and `io/params` must keep
 unknown attributes (they belong next to the `ParamDocument` values); if it drops them, the test
 stays but its `reason` becomes a fact with this citation instead of an UNVERIFIED guess — and

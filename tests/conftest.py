@@ -30,6 +30,28 @@ def src_dir() -> Path:
     return path
 
 
+DEFAULT_SESSION_H = Path.home() / "mlaser-captures" / "session-h"
+
+
+def session_h_path() -> Path:
+    """Return the configured Wine session H artefact directory without checking it."""
+    return Path(os.environ.get("NEXCUT_SESSION_H", str(DEFAULT_SESSION_H))).expanduser()
+
+
+@pytest.fixture(scope="session")
+def session_h_dir() -> Path:
+    """Artefacts of Wine session H (``docs/WINE-SESSION-H.md`` §2.1 lists the layout).
+
+    Reads ``NEXCUT_SESSION_H`` (default ``~/mlaser-captures/session-h``) and skips the test
+    when the directory is absent; a test that needs one file skips when that file is absent,
+    so a partly-run session still feeds the tests it can. Like ``src_dir``, never written to.
+    """
+    path = session_h_path()
+    if not path.is_dir():
+        pytest.skip(f"Wine session H artefacts not available at {path} (set NEXCUT_SESSION_H)")
+    return path
+
+
 # --------------------------------------------------------------------------- machine speed
 
 CALIBRATION_REFERENCE_S = 0.052

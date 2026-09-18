@@ -664,3 +664,63 @@ def test_tui_read_block_refusals_and_quit_leave_daemon_running() -> None:
             assert wait_for(lambda: client.call("status")["arm_state"] == "DISARMED", 3.0)
             st = client.call("status")
         assert st["link"] == "CONNECTED"
+
+
+# ---- the footer names only keys of the table (D11, STATUS §5 task 10) ----------------------
+
+
+def _footer_keys(line: str) -> list[tuple[str, list[str]]]:
+    """``[(item, [key names])]`` of one footer line: items are separated by two spaces,
+    and start with a ``/``-separated key word, optionally followed by more single
+    punctuation keys (``[ ] step size``)."""
+    from nexcut.mccd import tui
+
+    words = {
+        "arrows": [tui.LEFT, tui.RIGHT, tui.UP, tui.DOWN],
+        "Shift+arrows": [tui.S_LEFT, tui.S_RIGHT, tui.S_UP, tui.S_DOWN],
+        "PgUp": [tui.PGUP],
+        "PgDn": [tui.PGDN],
+        "Esc": [tui.ESC],
+        "space": [" "],
+    }
+    out = []
+    for item in (i.strip() for i in line.split("  ") if i.strip()):
+        tokens = item.split(" ")
+        head = [tokens[0]]
+        for t in tokens[1:]:
+            if len(t) == 1 and not t.isalnum():
+                head.append(t)
+            else:
+                break
+        keys: list[str] = []
+        for word in head:
+            for part in word.split("/") if len(word) > 1 else [word]:
+                keys.extend(words.get(part, [part]))
+        out.append((item, keys))
+    return out
+
+
+def test_every_footer_key_is_in_the_key_table() -> None:
+    from nexcut.mccd import tui
+
+    c, _ = make()
+    assert tuple(c.lines()[-2:]) == tui.FOOTER_LINES  # the screen shows exactly these
+    seen_actions = set()
+    for line in tui.FOOTER_LINES:
+        for item, keys in _footer_keys(line):
+            assert keys, item
+            for key in keys:
+                b = tui.binding_for(key, tui.MODE_NORMAL)
+                assert b is not None, f"footer {item!r} names key {key!r}, not in KEY_BINDINGS"
+                seen_actions.add(b.action)
+    # and the other way round: every normal-mode / global action is on the footer
+    table = {b.action for b in tui.KEY_BINDINGS if b.mode in (tui.MODE_NORMAL, tui.GLOBAL)}
+    assert table <= seen_actions, table - seen_actions
+
+
+def test_the_footer_parser_catches_a_drift() -> None:
+    from nexcut.mccd import tui
+
+    bad = [k for _, keys in _footer_keys("J jog  m arm") for k in keys]
+    assert bad == ["J", "m"]
+    assert tui.binding_for("J", tui.MODE_NORMAL) is None

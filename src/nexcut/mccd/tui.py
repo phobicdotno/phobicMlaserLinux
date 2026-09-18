@@ -70,6 +70,7 @@ __all__ = [
     "AXIS_BY_NAME",
     "BINDINGS_BY_MODE",
     "DISPLAY_AXES",
+    "FOOTER_LINES",
     "KEY_BINDINGS",
     "KEY_NAMES",
     "STEP_SIZES_MM",
@@ -185,6 +186,17 @@ KEY_BINDINGS: tuple[KeyBinding, ...] = (
     ),  # fmt: skip
 )
 """The complete key table. ``nexcut-mccd tui`` binds nothing that is not listed here."""
+
+
+FOOTER_LINES: tuple[str, str] = (
+    "arrows X/Y step  PgUp/PgDn W step  Shift+arrows hold = continuous jog  [ ] step size",
+    "m arm  d disarm  h home  r read block  a ack E-stop  space/s STOP  Esc/e E-STOP  "
+    "? keys  q quit",
+)
+"""The two hand-written footer lines of the normal screen, short forms of
+:data:`KEY_BINDINGS` (D11). Items are separated by two spaces and start with the key(s);
+``tests/test_mccd_cli_tui.py::test_every_footer_key_is_in_the_key_table`` checks each
+named key against the table, so the footer cannot drift away from it."""
 
 
 def _bindings_by_mode() -> dict[str, dict[str, KeyBinding]]:
@@ -1054,14 +1066,7 @@ class TuiController:
         if self.mode == MODE_HELP:
             out.extend(help_lines(allow_home_all=o.allow_home_all))
             return out
-        out.append(
-            "arrows X/Y step  PgUp/PgDn W step  Shift+arrows hold = continuous jog  "
-            "[ ] step size"
-        )
-        out.append(
-            "m arm  d disarm  h home  r read block  a ack E-stop  space/s STOP  "
-            "Esc/e E-STOP  ? keys  q quit"
-        )
+        out.extend(FOOTER_LINES)
         return out
 
     def backend_busy(self) -> bool:

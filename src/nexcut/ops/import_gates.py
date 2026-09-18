@@ -38,7 +38,8 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
+from itertools import chain
 from typing import Any, Protocol
 
 import numpy as np
@@ -245,9 +246,22 @@ def element_tangents(element: ContourElement) -> tuple[Vec2, Vec2]:
 
 def contour_endpoints(contour: Contour) -> tuple[Vec2, Vec2]:
     """Start of the first and end of the last element (computed, not the cached fields)."""
-    if not contour.elements:
+    els = contour.elements
+    if not els:
         return contour.start, contour.end
-    return element_endpoints(contour.elements[0])[0], element_endpoints(contour.elements[-1])[1]
+    first, last = els[0], els[-1]
+    # Inline form of element_endpoints for plain segments (the bulk of any import).
+    g = first.glyph
+    if type(g) is SegmentGlyph:
+        s = g.p1 if first.direction == -1 else g.p0
+    else:
+        s = element_endpoints(first)[0]
+    g = last.glyph
+    if type(g) is SegmentGlyph:
+        e = g.p0 if last.direction == -1 else g.p1
+    else:
+        e = element_endpoints(last)[1]
+    return s, e
 
 
 _Box = tuple[float, float, float, float]
@@ -410,9 +424,10 @@ def is_closed(contour: Contour, tol: float | None = None) -> bool:
 
     ``precision`` is "used e.g. to decide closure (start==end within this)" (03 §6.1 line 1).
     """
-    if not contour.elements:
+    els = contour.elements
+    if not els:
         return False
-    if all(isinstance(e.glyph, PointGlyph) for e in contour.elements):
+    if isinstance(els[0].glyph, PointGlyph) and all(isinstance(e.glyph, PointGlyph) for e in els):
         return False
     s, e = contour_endpoints(contour)
     return math.dist(s, e) <= (contour.precision if tol is None else tol)
@@ -426,7 +441,44 @@ def reverse_contour(contour: Contour) -> Contour:
     els = [
         ContourElement(e.glyph, -1 if e.direction != -1 else 1) for e in reversed(contour.elements)
     ]
+    if _FAST_CONTOUR_COPY and type(contour) is Contour:
+        # == dataclasses.replace(contour, ...), without its per-field introspection
+        # (25 000 reversals in the nearest sort of X11 spent ~0.2 s there).
+        c = contour
+        return Contour(
+            c.precision,
+            c.length,
+            c.bbox_min,
+            c.bbox_max,
+            c.end,
+            c.start,
+            els,
+            c.layer,
+            c.int58,
+            c.crafts,
+            c.legacy_reserved_glyphs,
+        )
     return replace(contour, elements=els, start=contour.end, end=contour.start)
+
+
+_FAST_CONTOUR_COPY = tuple(f.name for f in fields(Contour)) == (
+    "precision",
+    "length",
+    "bbox_min",
+    "bbox_max",
+    "start",
+    "end",
+    "elements",
+    "layer",
+    "int58",
+    "crafts",
+    "legacy_reserved_glyphs",
+) and all(f.init for f in fields(Contour))
+"""The positional constructor call in :func:`reverse_contour` matches ``Contour``'s fields.
+
+If a field is added to :class:`~nexcut.model.graph.Contour` this turns false and
+:func:`reverse_contour` falls back to :func:`dataclasses.replace` rather than dropping it.
+"""
 
 
 def graph_endpoints(graph: Graph) -> tuple[Vec2, Vec2]:
@@ -520,7 +572,14 @@ class GateReport:
 
 
 def _is_point_contour(c: Contour) -> bool:
-    return bool(c.elements) and all(isinstance(e.glyph, PointGlyph) for e in c.elements)
+    els = c.elements
+    # The first-element test is the all() below short-circuited by hand (no generator
+    # for the usual non-point contour).
+    return (
+        bool(els)
+        and isinstance(els[0].glyph, PointGlyph)
+        and all(isinstance(e.glyph, PointGlyph) for e in els)
+    )
 
 
 def filter_micro_graphs(graphs: Sequence[Graph], gate: float) -> tuple[list[Graph], int]:
@@ -662,17 +721,73 @@ def _split_runs(c: Contour, keep: list[bool]) -> list[Contour]:
     return out
 
 
+_PREFILTER_MIN = 64
+"""Below this many items the gates skip the KD-tree prefilter (it would cost more than it saves)."""
+
+_PREFILTER_SLACK = 1e-6
+"""Relative widening of the prefilter radius: it must be a superset of the exact per-item test."""
+
+
+def _prefilter_radius(gate: float) -> float:
+    return max(gate, 0.0) * (1.0 + _PREFILTER_SLACK) + 1e-9
+
+
 def remove_overlaps(graphs: Sequence[Graph], gate: float) -> tuple[list[Graph], int]:
     """Remove glyphs that duplicate an earlier glyph within ``gate`` mm (``IGP.OverlapGate``).
 
     Scope: top-level contours and group children; a contour losing a middle
     glyph is split into runs.  Direction is irrelevant (a reversed copy is a
     duplicate).  Returns ``(graphs, removed_glyph_count)``.  UNVERIFIED algorithm.
+
+    A glyph can only be a duplicate of, or make a duplicate of, a glyph whose bbox
+    corners are all within ``gate`` of its own (the first test of ``_duplicate``).
+    One KD-tree pass over the ``(lo, hi)`` corners (Chebyshev metric, radius
+    widened by :data:`_PREFILTER_SLACK`) finds every glyph that has such a partner;
+    only those go through the per-glyph grid below, in document order, and every
+    other glyph is kept without being looked at again (STATUS §5 task 7 / X11: the
+    per-glyph path cost ~0.4 s on 50 000 separate ``LINE`` s).  Same result as
+    running every glyph through the grid (``tests/test_ops_gates_equivalence.py``).
     """
     step = max(gate, 0.005)
     cell = max(gate * 4.0, 1e-6)
     grid: dict[tuple[int, int], list[_GlyphInfo]] = {}
     removed = 0
+
+    units: list[Contour] = []
+    for g in graphs:
+        if isinstance(g, Contour):
+            units.append(g)
+        elif isinstance(g, Group) and not isinstance(g, Scan):
+            units.extend(g.children)
+    boxes: list[tuple[float, float, float, float]] = []
+    sampled: dict[int, _GlyphInfo] = {}
+    for c in units:
+        for el in c.elements:
+            gl = el.glyph
+            if type(gl) is SegmentGlyph:  # == glyph_extent(gl)[1], inline for the bulk case
+                (x0, y0), (x1, y1) = gl.p0, gl.p1
+                boxes.append((min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)))
+                continue
+            ext = glyph_extent(gl)
+            if ext is None:
+                info = _glyph_info(el.glyph, step)
+                sampled[len(boxes)] = info
+                boxes.append((info.lo[0], info.lo[1], info.hi[0], info.hi[1]))
+            else:
+                boxes.append(ext[1])
+    n_glyphs = len(boxes)
+    candidate: list[bool] = [True] * n_glyphs
+    if n_glyphs >= _PREFILTER_MIN:
+        corners = np.fromiter(chain.from_iterable(boxes), np.float64, 4 * n_glyphs).reshape(-1, 4)
+        if bool(np.isfinite(corners).all()):
+            mask = np.zeros(n_glyphs, dtype=bool)
+            if gate >= 0.0:
+                pairs = cKDTree(corners, balanced_tree=False, compact_nodes=False).query_pairs(
+                    _prefilter_radius(gate), p=np.inf, output_type="ndarray"
+                )
+                mask[pairs.ravel()] = True
+            candidate = mask.tolist()
+    cursor = 0
 
     def seen_before(info: _GlyphInfo) -> bool:
         kx, ky = int(math.floor(info.lo[0] / cell)), int(math.floor(info.lo[1] / cell))
@@ -685,10 +800,24 @@ def remove_overlaps(graphs: Sequence[Graph], gate: float) -> tuple[list[Graph], 
         return False
 
     def filter_contour(c: Contour) -> list[Contour]:
-        nonlocal removed
+        nonlocal removed, cursor
+        first = cursor
+        cursor += len(c.elements)
+        if cursor - first == 1:
+            if not candidate[first]:
+                return [c]
+        elif not any(candidate[first:cursor]):
+            return [c]
         keep = []
-        for el in c.elements:
-            dup = seen_before(_glyph_info(el.glyph, step))
+        for k, el in enumerate(c.elements, first):
+            if not candidate[k]:
+                keep.append(True)
+                continue
+            info = sampled.get(k)
+            if info is None:
+                b = boxes[k]
+                info = _GlyphInfo(np.array([b[0], b[1]]), np.array([b[2], b[3]]), el.glyph, step)
+            dup = seen_before(info)
             keep.append(not dup)
             removed += dup
         if all(keep):
@@ -734,28 +863,47 @@ def merge_connected(
     needed.  A chain stops growing once its ends meet.  The merged contour keeps
     the seed's crafts and takes the seed's place.  Returns ``(graphs, merges)``.
     UNVERIFIED algorithm (module docstring).
+
+    Only a contour with an endpoint within ``gate`` of an endpoint of *another* open
+    contour can seed a merge or be merged, so one KD-tree pass over all endpoints
+    (radius widened by :data:`_PREFILTER_SLACK`) picks those out and the chaining
+    below runs over them alone, in document order (STATUS §5 task 7 / X11: the
+    per-contour grid and candidate search cost ~0.9 s on 50 000 separate
+    ``LINE`` s that merge nothing).  Same result as chaining over every open contour
+    (``tests/test_ops_gates_equivalence.py``).
     """
     if merge_type == MergeType.NONE:
         return list(graphs), 0
     cell = max(gate, 1e-6)
-    open_ids = [
-        i
-        for i, g in enumerate(graphs)
-        if isinstance(g, Contour)
-        and g.elements
-        and not _is_point_contour(g)
-        and not is_closed(g, gate)
-    ]
+    open_ids: list[int] = []
     ends: dict[int, tuple[Vec2, Vec2]] = {}
+    for i, g in enumerate(graphs):
+        # == isinstance(g, Contour) and g.elements and not _is_point_contour(g)
+        #    and not is_closed(g, gate), with the endpoints computed once.
+        if not isinstance(g, Contour) or not g.elements or _is_point_contour(g):
+            continue
+        se = contour_endpoints(g)
+        if math.dist(se[0], se[1]) <= gate:
+            continue
+        open_ids.append(i)
+        ends[i] = se
+    if len(open_ids) >= _PREFILTER_MIN:
+        flat = chain.from_iterable(chain.from_iterable(ends[i] for i in open_ids))
+        pts = np.fromiter(flat, np.float64, 4 * len(open_ids)).reshape(-1, 2)
+        if bool(np.isfinite(pts).all()):
+            tree = cKDTree(pts, balanced_tree=False, compact_nodes=False)
+            pairs = tree.query_pairs(_prefilter_radius(gate), output_type="ndarray")
+            owners = pairs // 2
+            owners = owners[owners[:, 0] != owners[:, 1]]
+            touching = np.zeros(len(open_ids), dtype=bool)
+            touching[owners.ravel()] = True
+            open_ids = [i for i, t in zip(open_ids, touching.tolist(), strict=True) if t]
     grid: dict[tuple[int, int], set[int]] = {}
 
     def key(p: Vec2) -> tuple[int, int]:
         return int(math.floor(p[0] / cell)), int(math.floor(p[1] / cell))
 
     for i in open_ids:
-        c = graphs[i]
-        assert isinstance(c, Contour)
-        ends[i] = contour_endpoints(c)
         for p in ends[i]:
             grid.setdefault(key(p), set()).add(i)
 

@@ -38,8 +38,8 @@ python3 -m venv .venv
 QT_QPA_PLATFORM=offscreen .venv/bin/pytest -q
 ```
 
-The suite is 1 574 tests (`1571 passed, 3 xfailed` with the vendor package present,
-`1439 passed, 132 skipped, 3 xfailed` without it, which is what CI runs); the three strict
+The suite is 1 736 tests (`1734 passed, 2 xfailed` with the vendor package present,
+`1590 passed, 144 skipped, 2 xfailed` without it, which is what CI runs); the two strict
 xfails are documented gaps, listed in `docs/STATUS.md` §2.
 
 Nothing talks to a real card unless its address is given explicitly with

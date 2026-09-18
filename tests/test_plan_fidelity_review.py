@@ -98,7 +98,7 @@ def test_raw_logs_decode_to_the_committed_frames(src_dir: Path) -> None:
         assert len(raw[fid]) == 297  # every leaked frame closed by the 300-word rule
 
 
-def test_prologue_dwell_is_14_stationary_ticks_in_frames_0x39_0x3a() -> None:
+def test_committed_splice_0x39_0x3a_has_14_stationary_ticks_after_do9_on() -> None:
     """Read 0x39 and 0x3a as one stream: after ``DO9 on`` 14 stationary 4 % ticks, then motion.
 
     NB (A9 §3): the two frames are **not** consecutive - 0x39 was logged at 14:22:17 and 0x3a at
@@ -116,20 +116,20 @@ def test_prologue_dwell_is_14_stationary_ticks_in_frames_0x39_0x3a() -> None:
     assert all(t[2:] == (5000, 4) for t in after)
 
 
-def _vendor_cut_start() -> np.ndarray:
+def _splice_cumulative_x() -> np.ndarray:
     items = FRAMES[0x39] + FRAMES[0x3A]
     i_on = max(i for i, it in enumerate(items) if it.opcode != 3000)
     dx = [-t[0] for t in _ticks(items[i_on + 1 :])]
     return np.cumsum(dx)
 
 
-def test_vendor_cut_start_kinematics_frame_0x3a() -> None:
+def test_frame_0x3a_is_mid_ramp_kinematics_not_a_contour_start() -> None:
     """Quadratic fit of the 99 ticks of frame 0x3a: v0 ~ 6.9 mm/s, a ~ 570 mm/s² (residual below
     one pulse) at its first tick.  A9 §3: this is why 0x3a cannot be the start of a contour - the
     vendor's node list forces ``node[0].v = 0`` (CADModule ``0x100ff8dd``) - and it is instead a
     stretch ~145 ticks into a jerk-limited ramp (pinned by
     ``test_port_cut_start_matches_leaked_frames``)."""
-    c = _vendor_cut_start()[13:]  # cumulative pulses at the end of each tick of frame 0x3a
+    c = _splice_cumulative_x()[13:]  # cumulative pulses at the end of each tick of frame 0x3a
     assert len(c) == 99 and c[-1] == 90
     k = np.arange(1, 100) * DT
     ppm = AxisScale().x_per_mm

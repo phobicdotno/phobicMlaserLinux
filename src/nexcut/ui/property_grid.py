@@ -35,6 +35,7 @@ confirmed cannot be changed and written back to a machine file.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 
@@ -250,6 +251,45 @@ class PropertyRow:
 _ROW_ROLE = Qt.ItemDataRole.UserRole
 _VALUE_COLUMN = 1
 
+INT32_MIN = -(2**31)
+INT32_MAX = 2**31 - 1
+"""Range a ``QSpinBox`` can hold; a wider descriptor range is clipped to it (see
+:meth:`PropertyGrid.editor_range`)."""
+
+_WIDE_RANGE = 1e9
+"""Editor bound for a descriptor whose ``min``/``max`` are ``0/0`` (02 §2.1: unbounded)."""
+
+_QUANTISE_STEPS = 4
+"""How far :meth:`PropertyGrid.editor_range` may step a bound inward before giving up."""
+
+_EPS = 1e-9
+
+
+def _snap(value: float, decimals: int, *, up: bool) -> float:
+    """Round ``value`` to ``decimals``, never away from the range it bounds."""
+    out = round(value, decimals)
+    step = 10.0 ** -decimals
+    if up and out < value - _EPS:
+        return round(out + step, decimals)
+    if not up and out > value + _EPS:
+        return round(out - step, decimals)
+    return out
+
+
+_OPENED_AT = "nexcutOpenedAt"
+"""Qt property holding the value an editor was opened with (see ``_Delegate.setModelData``)."""
+
+
+def _editor_value(editor: QWidget) -> object:
+    """The editor's current value, whatever kind of editor it is."""
+    if isinstance(editor, QComboBox):
+        return editor.currentIndex()
+    if isinstance(editor, QLineEdit):
+        return editor.text()
+    if isinstance(editor, QSpinBox | QDoubleSpinBox):
+        return editor.value()
+    return None
+
 
 class _Delegate(QStyledItemDelegate):
     """Editor per row type: combo for enum/bool, spin box for int/double, line edit for string."""
@@ -274,14 +314,13 @@ class _Delegate(QStyledItemDelegate):
             return box
         if d.storage == "string":
             return QLineEdit(parent)
-        if d.storage == "int":
+        lo, hi = self.grid.editor_range(row)
+        if self.grid.uses_int_spin(row):
             spin = QSpinBox(parent)
-            lo, hi = self.grid.editor_range(row)
             spin.setRange(int(lo), int(hi))
             spin.setSuffix(f" {row.unit.suffix}" if row.unit.suffix else "")
             return spin
         dspin = QDoubleSpinBox(parent)
-        lo, hi = self.grid.editor_range(row)
         dspin.setDecimals(row.unit.decimals)
         dspin.setRange(lo, hi)
         dspin.setSuffix(f" {row.unit.suffix}" if row.unit.suffix else "")
@@ -297,22 +336,34 @@ class _Delegate(QStyledItemDelegate):
         elif isinstance(editor, QLineEdit):
             editor.setText(str(value))
         elif isinstance(editor, QSpinBox):
-            editor.setValue(int(row.unit.to_display(float(value))))
+            editor.setValue(int(round(row.unit.to_display(float(value)))))
         elif isinstance(editor, QDoubleSpinBox):
             editor.setValue(row.unit.to_display(float(value)))
+        if isinstance(editor, QSpinBox | QDoubleSpinBox | QComboBox | QLineEdit):
+            editor.setProperty(_OPENED_AT, _editor_value(editor))
 
     def setModelData(self, editor: QWidget, model: object, index: object) -> None:
         row = self.grid.row_at(index)  # type: ignore[arg-type]
         if row is None:
+            return
+        # An editor that was opened and closed without a change writes nothing.  It is not
+        # an optimisation: display units round (20 000 mm/s2 is 2.0394 G at four decimals,
+        # back 19 999.68) and a bound can differ from the stored value, so writing back an
+        # untouched editor silently edits the file - measured on the vendor BkHardPara /
+        # BkManuPara: 15 rows moved, FCP.MaxAcc by 2 % and GRP.EdgeSeekSensitivity 20 -> 17.
+        opened_at = editor.property(_OPENED_AT)
+        if opened_at is not None and _editor_value(editor) == opened_at:
             return
         if isinstance(editor, QComboBox):
             self.grid.set_value(row.key, editor.currentIndex())
         elif isinstance(editor, QLineEdit):
             self.grid.set_value(row.key, editor.text())
         elif isinstance(editor, QSpinBox):
-            self.grid.set_value(row.key, int(round(row.unit.to_stored(editor.value()))))
+            stored = int(round(row.unit.to_stored(editor.value())))
+            self.grid.set_value(row.key, self.grid.clamp_stored(row, stored))
         elif isinstance(editor, QDoubleSpinBox):
-            self.grid.set_value(row.key, row.unit.to_stored(editor.value()))
+            stored = row.unit.to_stored(editor.value())
+            self.grid.set_value(row.key, self.grid.clamp_stored(row, stored))
 
 
 class PropertyGrid(QTreeWidget):
@@ -346,6 +397,7 @@ class PropertyGrid(QTreeWidget):
         self._get: Callable[[str], Value] = lambda key: 0
         self._set: Callable[[str, Value], None] = lambda key, value: None
         self._cross: Callable[[], list[str]] = list
+        self._option_overrides: dict[str, list[str]] = {}
         self._problems: list[str] = []
         self._updating = False
         self.setColumnCount(2)
@@ -496,9 +548,31 @@ class PropertyGrid(QTreeWidget):
         return f"{text} {row.unit.suffix}".strip()
 
     def option_texts(self, row: PropertyRow) -> list[str]:
-        """Combo-box entries of an enum row (02 §2.5); bools use a checkbox instead."""
+        """Combo-box entries of an enum row (02 §2.5); bools use a checkbox instead.
+
+        An override installed with :meth:`set_option_texts` wins over the
+        descriptor's ``lang.txt`` option ids - the fibre layer page needs it for
+        ``ManuType``, whose descriptor still carries the legacy four-option list
+        while the vendor dialog writes eight codes (A6 §3).
+        """
+        override = self._option_overrides.get(row.key)
+        if override is not None:
+            return list(override)
         labels = enum_labels(row.descriptor, self.t)
         return labels or [str(i) for i in range(int(row.descriptor.max) + 1)]
+
+    def set_option_texts(self, key: str, texts: Sequence[str] | None) -> None:
+        """Override the combo entries of one enum row (``None`` restores the descriptor's).
+
+        Overrides are keyed by row key and survive :meth:`build`, so a page may
+        install them once in its constructor.
+        """
+        if texts is None:
+            self._option_overrides.pop(key, None)
+        else:
+            self._option_overrides[key] = list(texts)
+        if key in self._items:
+            self.refresh()
 
     def tooltip(self, row: PropertyRow) -> str:
         """Full label (both languages), key, unit, range and default of one row."""
@@ -578,12 +652,108 @@ class PropertyGrid(QTreeWidget):
         """The tree item of a row (tests and pages use it to read what is displayed)."""
         return self._items.get(key)
 
-    def editor_range(self, row: PropertyRow) -> tuple[float, float]:
-        """Spin-box range in *display* units (descriptor min/max, or a wide default)."""
+    def stored_bounds(self, row: PropertyRow) -> tuple[float, float]:
+        """The range an edit of this row may land in, in the descriptor's own unit.
+
+        The descriptor's ``min``/``max`` when it has a usable range, widened to contain
+        whatever the row holds **now**.  The widening is what keeps a vendor file intact:
+        :meth:`nexcut.core.schema.Descriptor.validate` says in as many words that vendor
+        data is not guaranteed to satisfy min/max, and this machine's own
+        ``BkManuPara.xml`` proves it (``GRP.EdgeBoardSizeX`` = 5 against a minimum of 50).
+        A bound that excluded the stored value would make merely opening an editor on such
+        a row rewrite it, because ``QAbstractSpinBox`` clamps what it is shown.
+        """
         d = row.descriptor
-        lo, hi = (d.min, d.max) if d.has_range else (-1e9, 1e9)
-        lo, hi = row.unit.to_display(lo), row.unit.to_display(hi)
-        return (lo, hi) if lo <= hi else (hi, lo)
+        lo, hi = (d.min, d.max) if d.has_range else (-_WIDE_RANGE, _WIDE_RANGE)
+        if lo > hi:
+            lo, hi = hi, lo
+        current = self._number(row.key)
+        if current is not None:
+            lo, hi = min(lo, current), max(hi, current)
+        return lo, hi
+
+    def clamp_stored(self, row: PropertyRow, value: Value) -> Value:
+        """Pull an edited value back into :meth:`stored_bounds` (never a rejection).
+
+        The delegate applies it after converting the widget's display value back, because
+        the conversion itself can leave the range: ``9999 mm/s`` shown as ``599.94 m/min``
+        comes back as ``9999.000000000002``, and an ``int`` spin box in a non-SI unit
+        truncates a minimum of ``1`` to ``0``.  Neither is a value the operator asked for.
+        """
+        if isinstance(value, str) or isinstance(value, bool):
+            return value
+        lo, hi = self.stored_bounds(row)
+        out = min(max(float(value), lo), hi)
+        return int(round(out)) if row.descriptor.storage == "int" else out
+
+    def _number(self, key: str) -> float | None:
+        """The row's current value as a float, or ``None`` when it is not a number."""
+        try:
+            value = self._get(key)
+        except Exception:  # noqa: BLE001 - a foreign source must not break the editor
+            return None
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            return None
+        return float(value) if math.isfinite(float(value)) else None
+
+    def uses_int_spin(self, row: PropertyRow) -> bool:
+        """Whether this row gets a ``QSpinBox`` rather than a ``QDoubleSpinBox``.
+
+        Only an ``int`` row shown in its *own* unit does.  An int shown in a converted
+        unit cannot be typed as a whole number - ``FCP.MaxAcc`` = 20 000 mm/s2 is 2.0394 G,
+        and an integer spin box can only offer 2, which stores 19 613 - so it gets the
+        double spin box and :meth:`set_value` rounds the result back to an int.  This is
+        the same rule :meth:`display_text` already uses to decide how to print the value.
+        """
+        return row.descriptor.storage == "int" and row.unit.factor == 1.0
+
+    def editor_range(self, row: PropertyRow) -> tuple[float, float]:
+        """Spin-box range in *display* units, quantised so its end stops are storable.
+
+        Three things beyond converting min/max, each of which was a defect first:
+
+        * the bounds are stepped **inward** to the editor's own resolution and re-checked
+          through :meth:`UnitDisplay.to_stored`, so the value the widget clamps a typed
+          number to is itself inside :meth:`stored_bounds` (02 §2.4: only the *display* is
+          in the operator's unit, the file always keeps SI);
+        * an ``int`` row is clipped to the signed 32-bit window a ``QSpinBox`` can hold -
+          ten descriptors (``SP.MachineID``, ``SOP.JoystickID1..5``, ...) declare a u32
+          range, and ``setRange(0, 4294967295)`` raises ``OverflowError`` out of the
+          delegate.  UNVERIFIED port choice: the vendor writes these with ``%d`` of a
+          signed int (``SOP.JoystickID2 = -684904636`` in this machine's ``BkHardPara.xml``),
+          so the int32 window is the range the file actually uses;
+        * the range always contains the current value (:meth:`stored_bounds`).
+        """
+        lo, hi = self.stored_bounds(row)
+        dlo, dhi = row.unit.to_display(lo), row.unit.to_display(hi)
+        if dlo > dhi:
+            dlo, dhi = dhi, dlo
+        if self.uses_int_spin(row):
+            ilo = max(math.ceil(dlo - _EPS), INT32_MIN)
+            ihi = min(math.floor(dhi + _EPS), INT32_MAX)
+            if ilo > ihi:
+                ilo = ihi
+            # the inverse conversion has to land inside too (a non-SI unit rounds)
+            for _ in range(_QUANTISE_STEPS):
+                if lo - _EPS <= round(row.unit.to_stored(ilo)) or ilo >= ihi:
+                    break
+                ilo += 1
+            for _ in range(_QUANTISE_STEPS):
+                if round(row.unit.to_stored(ihi)) <= hi + _EPS or ihi <= ilo:
+                    break
+                ihi -= 1
+            return float(ilo), float(ihi)
+        step = 10.0 ** -row.unit.decimals
+        dlo, dhi = _snap(dlo, row.unit.decimals, up=True), _snap(dhi, row.unit.decimals, up=False)
+        for _ in range(_QUANTISE_STEPS):
+            if row.unit.to_stored(dlo) >= lo or dlo >= dhi:
+                break
+            dlo = round(dlo + step, row.unit.decimals)
+        for _ in range(_QUANTISE_STEPS):
+            if row.unit.to_stored(dhi) <= hi or dhi <= dlo:
+                break
+            dhi = round(dhi - step, row.unit.decimals)
+        return (dlo, dhi) if dlo <= dhi else (dhi, dlo)
 
     def group_names(self) -> list[str]:
         """Group headers in display order."""

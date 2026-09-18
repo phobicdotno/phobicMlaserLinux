@@ -357,14 +357,23 @@ def test_main_window_hosts_the_layer_dock(tmp_path: Path, qapp: QtWidgets.QAppli
     win.show()
     qapp.processEvents()
     try:
-        assert win.layer_param_dock.widget() is win.layer_page
+        # the dock now holds the layer-file bar over the CO2/fibre tabs, and both pages
+        # edit the same document (ui/pages/layer_file.py, ui/pages/layer_fiber.py)
+        panel = win.layer_param_dock.widget()
+        assert panel is not None and panel.isAncestorOf(win.layer_page)
+        assert panel.isAncestorOf(win.fiber_layer_page)
+        assert panel.isAncestorOf(win.layer_file_bar)
+        assert win.layer_tabs.count() == 2
         assert win.layer_page.document is layer
+        assert win.fiber_layer_page.document is layer
+        assert win.layer_file_bar.document is layer
         win.layer_page.grid.set_value("CutDuty", 55)
         assert layer.get("PCO2LayerParam1", "GP", "CutDuty") == 55
         # the layer list drives the page's slot (list index 0 = slot 1)
         win.layer_tree.setCurrentItem(win.layer_items[2])
         qapp.processEvents()
         assert win.layer_page.slot == 3
+        assert win.fiber_layer_page.slot == 3
         # opening a job fills the read-only crafts box
         job = tmp_path / "job.chf"
         chf.save_chf(_job(), job)

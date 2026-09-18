@@ -398,10 +398,20 @@ branch, where both formulas coincide).
 | `+0x18` | acceleration A (P0), pass 1 (`0x10016a91`) |
 | `+0x20` | cumulative length s_i, pass 1 (`0x10016af2`) |
 
-CADModule's copy (`0x100ff220`, called from the plan copy at `0x1010007b`) adds a `0.99`
-factor (`.rdata:0x101116d0`, used at `0x100ff866`) and the `VelDecc.txt` log (`NodeID:%d V:%f mm/s`
-per node, via `fprintf_s`, only when a flag byte `[ebp-0x49]` is set → `Log/VelDecc.txt` in the
+CADModule's copy of the node builder (`0x100ff220`, called from the plan copy at
+`0x1010007b`) additionally writes the `VelDecc.txt` log (`NodeID:%d V:%f mm/s` per node, via
+`fprintf_s`, only when a flag byte `[ebp-0x49]`/`[ebp-0x60]` is clear → `Log/VelDecc.txt` in the
 package is 0 bytes and dated 2024-06-19, i.e. it has not been rewritten by any 2025 run).
+
+> **Correction (A9 §1, 2026-09-16 re-trace; A9 supersedes this section's earlier reading).**
+> The `0.99` at `.rdata:0x101116d0` read at `0x100ff866` is **not a factor applied to node
+> speeds**. It is the *threshold of that log*: `fcomp [pieces.begin + k·0x48 + 0x40]` compares
+> the per-piece speed factor (the `+0x40` value pass 4 multiplies into `+0x08`, §6.4) against
+> 0.99, and only when the factor is below 0.99 — i.e. when this piece was actually slowed
+> down — and the log flag is clear does `fprintf_s` write the `NodeID:%d V:%f mm/s` line
+> (`0x100ff87a–0x100ff8b6`). It scales nothing, so a port that multiplies node speeds by 0.99
+> is wrong. The surviving open question of §13 / STATUS §3.7 ("what does
+> `CADMODULE_NODE_FACTOR` 0.99 multiply?") is therefore answered: nothing.
 
 ### 7.3 Junction / arc speed formula (EVIDENCE: full listing of `0x100170e0`, args `(a, b, c)`)
 
@@ -434,7 +444,23 @@ node limit is the minimum over the two adjacent pieces. There is no explicit ang
 corner rule — corners are handled by `smoothGly` (blend arcs) so that every junction has a
 finite radius.
 
-### 7.4 Look-ahead core (EVIDENCE: `0x100114d0`, constants and call graph)
+### 7.4 Look-ahead core (EVIDENCE: MotionCtrl `0x100114d0`; **the cut path runs CADModule `0x100fdc50`**)
+
+> **Correction (A9, 2026-09-16 re-trace; A9 supersedes this section's earlier reading).**
+> The addresses in this section are `MotionCtrl.dll`'s build of the core. A cut does **not**
+> run them: `CCADModule` calls its own statically linked copy (§2.1), whose chain is
+> `plan 0x100fffe0` → look-ahead core **`0x100fdc50`** →
+> `0x100fc2e0` (node vector copy) / `0x100fc640` (profile resize) / `0x100fda90` (per-piece
+> profile build) / `0x100fd120` (backward pass) / `0x100fcc30` (forward pass) /
+> `0x100fa6d0` (finalise) — A9 §1 and §1.3. The two builds are the same code compiled twice
+> and have the same shape, so everything below still describes the algorithm correctly; only
+> the addresses belong to the copy that nothing calls (§2.1: nobody imports MotionCtrl.dll).
+> A9 §1.3 adds one fact this section did not state: the core takes exactly five doubles
+> (`{A, J, Ta, P5, Vmax}`, `rep movs` of 10 dwords at `0x100fdc7c`) plus the node list, so
+> there is **no entry-velocity parameter** anywhere in the core; the node list it receives
+> already has `v_0 = v_last = 0` (§7.2, A9 §1.1). A9 §1 also re-confirms the `Ta` clamps and
+> the jerk branch of §7.1 on the build that actually runs, and records that the CADModule
+> `plan` copies **ten** doubles (`P0..P9`), not the eight MotionCtrl's copies.
 
 `core(nodes, params)` = `0x10014870` (pass 1) → `0x10014d20` → `0x100116e0` (backward pass,
 uses 0.05 and the S-curve solver) → `0x10012b20` → `0x10012740` → `0x10014740`. It calls the
@@ -806,6 +832,22 @@ Scratch listings: `mc.asm`/`cad.asm`/`nc.asm` in the session scratchpad.
 | 10 | JumpAddTime.txt readers | `Jump/AddTime/Axis4Freq/Is4Freq/\JumpAddTime.txt` UTF-16 only in MainApp; `Arc2SegVelK/K_X/K_Y/\JumpAddTime.txt` UTF-16 only in CADModule, used at `0x100f5ed8–0x100f5fa6` with `push 0x64` default and `fmul 0.01`; `LimitSamllCircleVel/IsLimit/SlowRatio` in no binary (ASCII and UTF-16, min length 3). **Confirmed.** File uses LF-only line endings. |
 | 11 | .mcf opaque | entropy 7.998 bits/byte; string counts 1485/196/33 for min lengths 4/6/8 (the analyst's "196" is the `-n 6` count). **Confirmed**, with the 20-byte header structure (size field) added. |
 
+### A9 re-trace (2026-09-16) — what it changed here
+
+`docs/analysis/11-static/A9-lookahead-dwell.md` re-traced the velocity planner on the build
+CADModule links statically, and **supersedes this document wherever the two disagree**. Two
+corrections were written into the sections above; both are marked in place:
+
+| § | What this document said | What A9 found (EVIDENCE) |
+|---|---|---|
+| §7.4 | the look-ahead core is `0x100114d0` | that is MotionCtrl.dll's build, which **nothing calls**; a cut runs CADModule's `0x100fdc50`, reached from `plan 0x100fffe0` (A9 §0, §1, §1.3). Same algorithm, different addresses |
+| §7.2 | CADModule's node builder "adds a `0.99` factor" | `0.99` (`.rdata:0x101116d0`, `0x100ff866`) is the **threshold of the `VelDecc.txt` log**, compared against the per-piece speed factor `piece+0x40`; it multiplies nothing (A9 §1) |
+
+A9 also confirms, on that same build, §7.1's `Ta` clamps and jerk branch, §7.2's "both end
+nodes forced to rest" (`0x100ff8dd–0x100ff90c`) and §7.1's slow start as a ceiling that can
+only lower speeds (`0x100ffac0`, A9 §1.2) — and records one difference between the builds:
+CADModule's `plan` copies **ten** doubles `P0..P9`, MotionCtrl's only eight.
+
 ### What was changed in the document
 
 * §2.1: PDB paths decoded; import/delay-load re-check added.
@@ -833,8 +875,12 @@ Scratch listings: `mc.asm`/`cad.asm`/`nc.asm` in the session scratchpad.
 
 ### What remains uncertain
 
-* The look-ahead core (`0x100114d0` and callees) was not re-traced; the "backward/forward,
-  five profile calls, Cardano" description is the analyst's and is rated *plausible*.
+* ~~The look-ahead core (`0x100114d0` and callees) was not re-traced~~ — **re-traced by A9
+  (2026-09-16)**, on the copy a cut actually runs (CADModule `0x100fdc50`, §7.4 correction):
+  the call graph (node-vector copy, profile resize, per-piece profile build, backward pass,
+  forward pass, finalise), the five-double parameter block and the absence of any entry
+  velocity are EVIDENCE now. The *contents* of the backward/forward passes (the Cardano
+  solver, the tolerance constants) are still the analyst's reading and stay *plausible*.
 * The exact UI parameter → P0..P9 mapping (needs MainApp.exe analysis of the caller of the
   `CCADModule` virtual wrapper `0x100dab10`), including whether `AccTime` is divided by 1000
   before it reaches P1 and which value feeds P4/P5/P8/P9.

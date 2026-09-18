@@ -117,14 +117,26 @@ The guided M1 bench session (`tools/m1_session.py`) is a separate IPC client; re
 QT_QPA_PLATFORM=offscreen .venv/bin/nexcut render job.dxf -o job.png --bed --start
 ```
 
-`--layer` opens the first schema-driven property editor (`ui/property_grid.py`,
-`ui/pages/layer_co2.py`): pick a layer in the layer tree and the dock shows that layer's CO2
-parameters: rows grouped by the `Group.Item` half of their `lang.txt` label, display units
-chosen by `UN.SpeedUnit` / `UN.AccUnit` / `UN.GasPressureUnit`, descriptor min/max validation
-plus the `lp19` cross-check, and UNVERIFIED rows shown read-only. *Load* / *Save* exchange the
-slot with a vendor technology preset (`Technology/CO2/*.xml`, 02 §6.1) through `io/params.py`.
-Other pages (hardware, machining, software, the fibre layer, the curve and crafts editors) are
-not built yet, and the dock does not write `BkLayerPara.xml` back.
+The parameter docks are schema-driven property editors over `ui/property_grid.py`: rows grouped
+by the `Group.Item` half of their `lang.txt` label, display units chosen by `UN.SpeedUnit` /
+`UN.AccUnit` / `UN.GasPressureUnit`, descriptor min/max validation, page cross-checks, and
+UNVERIFIED rows shown read-only.
+
+| Dock (View menu) | Module | Document | Opened by |
+|---|---|---|---|
+| Layer parameters, CO2 + Fiber tabs | `ui/pages/layer_co2.py`, `ui/pages/layer_fiber.py` | `BkLayerPara.xml` | `--layer` |
+| Hardware | `ui/pages/param_pages.py` (`HardwarePage`) | `BkHardPara.xml` | `--hard` |
+| Machining / Software / Graph rules | `ui/pages/param_pages.py` | `BkManuPara.xml` | `--manu` |
+| Crafts (per-contour lead-in/out, cool points) | `ui/pages/crafts.py` | the loaded job | any job file |
+| Power/frequency curve editor (inside the Fiber tab) | `ui/curve_editor.py` | `PWMCurveNodes` / `FreqCurveNodes` of the layer slot | `--layer` |
+
+*Load* / *Save* on a layer page exchange the slot with a vendor technology preset
+(`Technology/CO2/*.xml`, `Technology/Fiber/*.xml`, 02 §6.1) through `io/params.py`; the file bar
+above the tabs (`ui/pages/layer_file.py`) writes `BkLayerPara.xml` itself, and the four parameter
+pages save back to the file `--manu` / `--hard` / `--layer` named (`ui/app.py` passes those paths
+into `MainWindow(param_paths=…)`; a page opened without one asks for a path). Every write goes
+through the atomic verify-on-read-back path of `io/params.write_params`, so a vendor file is
+re-emitted byte for byte unless a value actually changed.
 
 UI strings come from the vendor `Lang/lang.txt` (`--lang-txt`, `$NEXCUT_LANG_TXT`, or
 `$NEXCUT_SRC/Lang/lang.txt`); without it the built-in default labels are shown. The viewer never
@@ -143,13 +155,28 @@ Writes register-0x66 FIFO frames as text (`40 66 <count> <id> <words...>`, the `
 the vendor logs) and prints frames/ticks/duration. Duty is 0 and laser DO/PWM records are left out
 unless `--laser-records` is given; the file is never sent anywhere.
 
+The planner **streams**: `plan.__main__.stream_job()` yields one `PackedFrame` at a time and the
+CLI writes each frame as it is produced (`mcc/fifo.write_frame_file` consumes the iterator lazily
+and puts the totals in a footer), so a job's frames never have to fit in memory — a 100 000-contour
+job is 218 M words, gigabytes as Python objects. `build_job()` is the same work with the frames
+collected into a list and is what the goldens and the fidelity tests still use;
+`mccd.feeder.JobFeeder` already took a lazy source. The tick → item → word → frame path itself is
+numpy array work (`plan/items.carry_cells`, `plan/items.tick_words`, `mcc/fifo.FrameStream`), with
+a scalar reference path kept for short runs and pinned cell-for-cell against it by
+`tests/test_plan_vectorised_equivalence.py`.
+
 ### Other tools
 
 ```sh
 .venv/bin/python -m nexcut.io.chf FILE.chf --json out.json --svg out.svg --check
 .venv/bin/python -m nexcut.io.chf FILE.chf --rewrite out.chf       # reader -> writer round trip
 .venv/bin/python -m nexcut.mcc.dissector Log/*.log --summary-only  # decode vendor logs / pcaps
+tools/wine_session_h.sh --dry-run                                  # Wine session H capture kit
 ```
+
+`tools/wine_session_h.sh` prepares and collects the artefacts of the vendor-tool-under-Wine
+session (`docs/WINE-SESSION-H.md`, STATUS §3.6); `--dry-run` creates nothing and never writes
+into the vendor package, which `tests/test_wine_kit.py` checks.
 
 ## Running the tests and linter
 
@@ -157,7 +184,7 @@ Run from the repository root (`/home/karstein/phobicMlaserLinux`):
 
 ```sh
 .venv/bin/ruff check src tests tools/m1_session.py  # lint (CI: `ruff check . tools/m1_session.py`)
-.venv/bin/ruff format --check src tests             # formatting (not enforced in CI)
+.venv/bin/ruff format --check src tests             # formatting: NOT a gate (24 files differ today)
 NEXCUT_SRC=/home/karstein/Documents/CF1390-250715-1084-0973/Mlaser-v0.0.0.52 \
     QT_QPA_PLATFORM=offscreen .venv/bin/pytest -q   # full suite incl. golden tests against SRC
 NEXCUT_SRC=/nonexistent QT_QPA_PLATFORM=offscreen \
@@ -165,14 +192,15 @@ NEXCUT_SRC=/nonexistent QT_QPA_PLATFORM=offscreen \
 .venv/bin/pytest -q tests/test_mcc_simulator.py     # one file
 ```
 
-Expected on the owner's machine (2026-09-16, Python 3.14): `1302 passed, 4 xfailed in 186.21s`
-with `NEXCUT_SRC` set (or unset: the fixture default is the owner's copy); with
-`NEXCUT_SRC=/nonexistent`, which is what CI does, `1187 passed, 115 skipped, 4 xfailed in
-174.12s` — the SRC-dependent tests skip instead. The 4
-strict xfails (X6, X7 in `tests/test_io_fidelity_review.py`, X11 in
-`tests/test_import_ui_fidelity_review.py`, X13 in `tests/test_perf_planner.py`) are documented
-gaps listed in `docs/STATUS.md` §2, not regressions. The UI tests need
-`QT_QPA_PLATFORM=offscreen` when no display is available.
+Expected on the owner's machine (2026-09-16, Python 3.14, 1 574 tests in 64 files):
+`1571 passed, 3 xfailed in 212.81s` with `NEXCUT_SRC` set (or unset: the fixture default is the
+owner's copy); with `NEXCUT_SRC=/nonexistent`, which is what CI does,
+`1439 passed, 132 skipped, 3 xfailed in 199.39s` — the SRC-dependent tests skip instead. With
+every core busy the same suite is `1571 passed, 3 xfailed in 332s`. The 3 strict xfails (X7 in
+`tests/test_io_fidelity_review.py`, X11 in `tests/test_import_ui_fidelity_review.py`, X13 in
+`tests/test_perf_planner.py`) are documented gaps listed in `docs/STATUS.md` §2, not regressions
+— X6 was closed by decision D14. The UI tests need `QT_QPA_PLATFORM=offscreen` when no display is
+available.
 
 ### Performance gates (PORT-PLAN §8.3)
 
@@ -186,7 +214,23 @@ NEXCUT_JITTER_SECONDS=600 .venv/bin/pytest -q -s tests/test_perf_streaming.py   
 # planner throughput: 100 k contours in < 30 s (currently a strict xfail, X13)
 .venv/bin/pytest -q -s tests/test_perf_planner.py
 NEXCUT_PLAN_CONTOURS=1000 .venv/bin/pytest -q -s tests/test_perf_planner.py     # bigger sample
+NEXCUT_PLAN_MEM_CONTOURS=100000 .venv/bin/pytest -q -s tests/test_perf_planner.py \
+    -k memory                                                 # the streaming-memory measurement
 ```
+
+Measured on the owner's laptop on 2026-09-16, idle, by the integrator of this phase (rerun the
+commands above to reproduce; `docs/STATUS.md` §0 keeps the authoritative record):
+
+| Gate | Measurement |
+|---|---|
+| planner, 250 contours | 2.00 ms/contour, 2.97 µs/tick → **200 s** projected for 100 k, budget 30 s |
+| planner, 1 000 contours | 1.95 ms/contour, 2.73 µs/tick → **195 s**; 675–716 ticks/contour at every size, so the extrapolation is linear |
+| planner memory, 300 contours | streaming **+0.0 MB** RSS against **+18.1 MB** for the same job materialised as frames |
+| jitter, 250 µs tick, 120 s job | 4 848 frames, DONE, 0 re-sends, 0 starvation, queue low water 4 552 items; interval p50 27.7 / p90 32.8 / p99 36.3 / max 46.5 ms |
+| jitter, 1 ms tick, 120 s job | 1 212 frames, DONE, 0 re-sends, 0 starvation, queue low water 4 696 items; p50 91.0 / p90 121.9 / p99 125.2 / max 134.7 ms (cadence 99.0) |
+
+The 120 s runs above are the short form; the 600 s numbers behind the `JITTER-GATE` marker in
+`docs/STATUS.md` §0 are the gate as PORT-PLAN §8.3 words it.
 
 The jitter test runs `nexcut-mccd` and `CardSimulator` in one process and reads the *producer*
 stall out of the frame intervals: at a 1 ms simulated tick a frame is 99 ms of machine time, so
@@ -225,6 +269,17 @@ follow, and that a new test must follow too:
   (`JobFeeder.finished`) means the producer has no more frames; the closing `0x67` pair and the
   token hand-back happen afterwards (`JobFeeder.closed`, `join()`), and the simulated card may
   still be executing items it already holds. Wait for the thing you are about to assert on.
+* Every wall-clock budget goes through `budget_s()` / `speed_factor()`. A raw `assert elapsed <
+  3.0` measures the runner; three of them survived in
+  `tests/test_import_ui_fidelity_review.py` until the 2026-09-16 integration sweep and failed
+  under load while every scaled budget in the same file passed.
+* If an assertion depends on *when* a poll lands relative to a simulated event, fix the
+  simulator, not the deadline. `CardSimulator._advance` used to raise the FIFO starvation alarm
+  only when it had tick budget left over after emptying the queue, so
+  `test_a_starvation_alarm_at_the_end_of_the_drain_still_counts_as_done` passed or failed
+  depending on whether a status read landed inside the one tick in which the queue emptied
+  exactly. The card reports "FIFO empty" the instant it consumes the last item (11 §7 step 8),
+  which is both more faithful and deterministic.
 
 To reproduce CI conditions locally, load every core and run without the cache plugin:
 
@@ -237,9 +292,15 @@ QT_QPA_PLATFORM=offscreen .venv/bin/pytest -q -p no:cacheprovider
 wait
 ```
 
+Always bound the busy loops (the `+900` above) and kill them when the sweep ends: an orphaned
+spin loop silently corrupts every timing gate in the suite for whoever runs it next. The sweep
+the project runs before landing a phase is that loop plus **two full suites and five repeats of
+the timing-sensitive files** (`tests/test_mccd_*.py`, `tests/test_perf_*.py`).
+
 `pytest-xdist` is not a declared dependency; `pip install pytest-xdist` then
 `pytest -q -p xdist -n 4` also works and is a useful shake-out for order and isolation bugs —
-the suite passes under it (`1302 passed, 4 xfailed in 70.50s` on 2026-09-16), and it is how the
+the suite passed under it (`1302 passed, 4 xfailed in 70.50s`, 2026-09-16, before this phase's
+tests landed), and it is how the
 `test_r1_stop_reaches_card_after_long_comm_loss_despite_refreshing_client` ordering race was
 found.
 
@@ -266,11 +327,14 @@ framing + registers -> fifo
 commands + safety + transaction + registers -> mccd (gate, status, daemon) -> ipc -> tui, cli
 fifo + commands + safety -> mccd.feeder (job streaming) -> mccd.daemon
 model (glyph, graph, flatten) -> ops.import_gates -> io (chf, dxf, plt, gcode)
+io.dxf_stream -> io.dxf (fast path; the geometry helpers live in io.dxf and are shared)
 core.schema -> io.params -> plan.params
 model -> plan.contour_fit -> plan.lookahead (+ junction, scurve) -> plan.sampler
 fifo + commands -> plan.items;  plan.* + io.chf + io.params -> plan.__main__ (nexcut-plan)
 io + ops.import_gates + model -> ui (loader, scene, render, canvas, main_window, app)
-core.schema + io.params -> ui.property_grid -> ui.pages.layer_co2 -> ui.main_window
+core.schema + io.params -> ui.property_grid -> ui.pages.{layer_co2, layer_fiber, param_pages}
+                                            -> ui.curve_editor, ui.pages.{crafts, layer_file}
+                                            -> ui.main_window
 ```
 
 * Wire encoding/decoding (`encode_vector`, `read_reply`, CRC order) lives only in
@@ -286,7 +350,14 @@ core.schema + io.params -> ui.property_grid -> ui.pages.layer_co2 -> ui.main_win
 * Only `mccd/feeder.py` writes register 0x66 and the `0x67` program controls in the port's
   live path; it goes through the safety gate like every other write, and the daemon is what
   owns a feeder (`MccDaemon.load_job_frames`).
-* `io/chf.py` reads and writes the `nexcut.model` dataclasses; it has no private model.
+* `io/chf.py` reads and writes the `nexcut.model` dataclasses; it has no private model. Bytes it
+  cannot model are kept rather than dropped: a non-empty v2-v4 reserved line goes into
+  `ChfDocument.legacy_reserved` and is re-emitted verbatim (D14, closes X6).
+* `io/dxf_stream.py` is a parser only. It declines (`StreamUnsupported`) whenever a file needs
+  the full reader — binary DXF, `INSERT`, text-to-curves, a tilted OCS, any structural anomaly —
+  and `io/dxf.read_dxf(reader="auto")` then runs ezdxf; `DxfImportResult.reader` /
+  `fallback_reason` record which path ran. Both readers must build the *same* `ChfDocument`,
+  which is what `tests/test_io_dxf_stream.py` cross-checks on randomised corpora.
 * `tests/test_integration_consistency.py` pins these relations, including an end-to-end
   planner -> safety strip -> `FifoFeeder` -> simulator run.
 
@@ -305,7 +376,8 @@ src/nexcut/
   mccd/   driver daemon, IPC, job feeder, TUI; console script `nexcut-mccd` (§2.3, §3.4)
   ui/     PySide6 viewer + property pages (§3.1, M2/M3); console script `nexcut`
 tests/    pytest suite; conftest.py holds the SRC fixture
-tools/    standalone scripts (m1_session.py bench session, chf_parse.py, token_usage.py)
+tools/    standalone scripts (m1_session.py bench session, wine_session_h.sh, chf_parse.py,
+          token_usage.py); only m1_session.py is linted (pyproject excludes tools/)
 docs/     PORT-PLAN.md, analysis/, this file
 .scratch/ gitignored scratch space (disassemblies etc.)
 ```

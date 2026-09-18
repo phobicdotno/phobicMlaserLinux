@@ -297,6 +297,8 @@ How it prompts:
 * `[Enter]`: do the physical action first, then press Enter. The tool timestamps the moment.
 * Free-text questions: type what you saw, with measured numbers where you have them. Enter leaves
   the answer blank.
+* `Arm again and continue this step? [y/N]`: only asked after the link to the daemon dropped and
+  came back. The machine is stopped and disarmed at that moment — §11 says what to check first.
 * Ctrl-C at any time sends `stop` + `disarm`, marks the report `interrupted` and exits.
 
 Each step also sends a harmless marker read `READ 1000/1` at its start and end. The daemon never
@@ -754,7 +756,7 @@ cp -a "/home/karstein/Documents/CF1390-250715-1084-0973/Mlaser-v0.0.0.52/." ~/.w
 | Motion refused `busy: axis status not refreshed…` | Normal right after a motion. Repeat the step with `--steps N` |
 | Motion refused `refused: axis … not homed …` | The D1 rule: un-homed steps up to 10 mm, continuous jog at ≤ 20 mm/s |
 | Motion refused `… (state DISARMED); arming ends with the connection that asked for it` | D9. Arm on the same connection: use `nexcut-mccd jog --arm` / `home --arm`, or let the session tool arm |
-| Motion refused `arming: … needs MOTION_ARMED armed on this connection (another connection holds the arming)` | D9 again, the other half: something *is* armed, but not your connection — normally the session tool. Move from the tool, or stop it first. Stops and `disarm` are never refused this way |
+| Motion refused `arming: … needs MOTION_ARMED armed on this connection (another connection holds the arming)` | D9 again, the other half: something *is* armed, but not your connection — normally the session tool. The TUI status line says `MOTION_ARMED (another client)` in exactly this case, and `MOTION_ARMED (this session)` when it is yours (`mccd/tui.arm_text`). Move from the tool, or stop it first. Stops and `disarm` are never refused this way |
 | `run-job` refused `busy: axis status not refreshed since the last motion command` | The FIFO start waits for a 2000/50 poll newer than the last motion write (~90 ms). Wait a moment and run it again; the CLI does not retry yet |
 | `run-job` fails `no frame fits the card FIFO after 0x67 ← [1] (reg 1016 = …)` | The card still holds a program, or reg 1016 is not what the port assumes. Send `stop`, check `job-status --json`, and record reg 1016 — this is one of the numbers step 8 exists to settle |
 | Daemon start refused `another nexcut-mccd is already driving the card …` | D12. `ps -p <pid>` names the holder; stop it. Do not delete the lock file by hand |
@@ -772,11 +774,23 @@ cp -a "/home/karstein/Documents/CF1390-250715-1084-0973/Mlaser-v0.0.0.52/." ~/.w
   nature. Step 8's FIFO stream is no longer deferred in software — `nexcut-mccd run-job` streams a
   planned frame file — but it has only been exercised against the simulator, so the vendor variant
   stays the primary way to get the tick period.
-* **A link blip ends the arming.** `tools/m1_session.py` reconnects to the daemon lazily, and a
-  reconnect is a *new* connection: it inherits neither the arming nor the right to move (D9, and the
-  R12 amendment). If a step fails with an `arming:` refusal after a hiccup, re-run just that step
-  with `--steps N` — the tool arms again at the next motion prompt. Nothing moves in the meantime,
-  which is the intended direction of the failure.
+* **A link blip stops the machine, and re-arming after one is a question, not a repair.**
+  `tools/m1_session.py` reconnects to the daemon lazily, and a reconnect is a *new* connection: it
+  inherits neither the arming nor the right to move (D9, and the R12 amendment). Every motion
+  command goes through `_motion_call`, which notices the new connection before it sends anything.
+  What you will see, and what to do:
+
+  1. the tool prints that the arming did not survive the reconnect — which means **the daemon has
+     already stopped and disarmed the machine**, and the axis need not be where this step left it;
+  2. it then asks `Arm again and continue this step? [y/N]` — **the default is No** (D9 amendment,
+     2026-09-16). Look at the machine before you answer: your earlier `y` was consent for a motion
+     on a machine that no longer exists in that state;
+  3. on `y` it re-runs *this step's* arming and confirms with `status` that the daemon agrees
+     (`arm_owner_is_self`) before sending anything. On `n`, or if the re-arming or the confirmation
+     fails, the step ends with `ArmingLost` and **nothing is sent** (`rearm_declined` in the
+     report); re-run just that step with `--steps N`.
+
+  Nothing moves in the meantime, which is the intended direction of the failure.
 * **Jog-while-moving (step 3)** is refused PC-side by the daemon (D8), so the card's exception 3
   shows only in the vendor capture.
 * **Continuous jog speed (step 5)** is 20 mm/s natively; 50 mm/s only via the vendor variant.

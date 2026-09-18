@@ -14,19 +14,32 @@ else from the descriptor defaults.  The recent-file list is kept in
 ``QSettings`` (10 entries - port choice; the vendor keeps ``RecentFile`` per
 layer and ``MSC.LatestFilePath``, whose use is not traced).
 
-The "Layer parameters" dock (``lp0``) is the schema-driven CO2 layer page of
-:mod:`nexcut.ui.pages.layer_co2`; it edits the ``layer`` parameter document
-passed as ``layer=`` (descriptor defaults when absent) and exchanges slots with
-the vendor technology library.
+The "Layer parameters" dock (``lp0``) holds the file bar of
+:mod:`nexcut.ui.pages.layer_file` over two tabs: the CO2 layer page
+(:mod:`nexcut.ui.pages.layer_co2`, 21 attributes) and the fibre layer page
+(:mod:`nexcut.ui.pages.layer_fiber`, 164 attributes with the pierce stages and
+the power/frequency curves).  Both edit the *same* ``layer`` parameter document -
+the one passed as ``layer=``, descriptor defaults when absent - and the bar reads
+and writes it as ``BkLayerPara.xml``, so an edit in the dock reaches the file and
+not only the technology library.
+
+Four more parameter docks come from :mod:`nexcut.ui.pages.param_pages`
+(hardware, machining, software, graph rules), each over the ``hard`` or ``manu``
+document, and a "Crafts" dock (:mod:`nexcut.ui.pages.crafts`) edits the lead
+line, cool points and micro joints of the loaded job's contours.  ``param_paths``
+tells the docks which files to save to; without it Save asks for a path.
 
 SAFETY (PORT-PLAN §8): this window has no machine control.  The "Machine" dock
 is a disabled placeholder for the later ``mccd`` IPC client; nothing here opens
-a socket or talks to the card.  The layer page edits files only.
+a socket or talks to the card.  Every parameter page edits files only - in
+particular the hardware dock never pushes anything to the controller (11 §3.3
+denies 59600+ writes).
 """
 
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
 
 from PySide6.QtCore import QSettings, Qt, Signal
@@ -40,6 +53,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QTabWidget,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -52,7 +66,16 @@ from nexcut.ui.canvas import CanvasWidget, bed_from_hardware, canvas_style
 from nexcut.ui.i18n import Translator, get_translator
 from nexcut.ui.layers import LAYER_COUNT, layer_color, layer_name
 from nexcut.ui.loader import LoadedDocument, LoadError, load_document, save_document
+from nexcut.ui.pages.crafts import CraftsEditor
 from nexcut.ui.pages.layer_co2 import Co2LayerPage
+from nexcut.ui.pages.layer_fiber import FiberLayerPage
+from nexcut.ui.pages.layer_file import LayerFileBar
+from nexcut.ui.pages.param_pages import (
+    GraphRulePage,
+    HardwarePage,
+    MachiningPage,
+    SoftwarePage,
+)
 from nexcut.ui.render import ViewFlags
 from nexcut.ui.scene import SceneData
 
@@ -145,6 +168,7 @@ class MainWindow(QMainWindow):
         manu: object | None = None,
         hard: object | None = None,
         layer: object | None = None,
+        param_paths: Mapping[str, str | os.PathLike[str]] | None = None,
         settings: QSettings | None = None,
         interactive: bool = True,
         parent: QWidget | None = None,
@@ -152,7 +176,11 @@ class MainWindow(QMainWindow):
         super().__init__(parent)
         self.t = translator or get_translator()
         self.manu = manu
+        self.hard_params = hard
         self.layer_params = layer
+        self.param_paths: dict[str, Path] = {
+            k: Path(v) for k, v in dict(param_paths or {}).items()
+        }
         self.interactive = interactive
         self.settings = settings or QSettings("nexcut", "nexcut")
         self.document: ChfDocument | None = None
@@ -219,11 +247,59 @@ class MainWindow(QMainWindow):
             document=self.layer_params,  # type: ignore[arg-type]
             manu=self.manu,
         )
+        self.fiber_layer_page = FiberLayerPage(
+            translator=t,
+            document=self.layer_page.document,
+            manu=self.manu,
+        )
+        self.layer_file_bar = LayerFileBar(
+            self.layer_page.document,
+            translator=t,
+            path=self.param_paths.get("layer"),
+        )
+        self.layer_file_bar.documentReloaded.connect(self._on_layer_document_reloaded)
+        self.layer_tabs = QTabWidget()
+        self.layer_tabs.addTab(self.layer_page, t.tr("A241024_1", "CO2"))
+        self.layer_tabs.addTab(self.fiber_layer_page, t.tr("A241024_0", "Fiber"))
+        layer_panel = QWidget()
+        layer_layout = QVBoxLayout(layer_panel)
+        layer_layout.addWidget(self.layer_file_bar)
+        layer_layout.addWidget(self.layer_tabs, 1)
         self.layer_param_dock = QDockWidget(t.tr("lp0", "Layer Parameters"), self)
         self.layer_param_dock.setObjectName("layerParamDock")
-        self.layer_param_dock.setWidget(self.layer_page)
+        self.layer_param_dock.setWidget(layer_panel)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.layer_param_dock)
         self.layer_tree.currentItemChanged.connect(self._on_layer_row_selected)
+
+        self.param_pages: dict[str, object] = {}
+        self.param_docks: dict[str, QDockWidget] = {}
+        for page_class, document_key, object_name in (
+            (HardwarePage, "hard", "hardwareDock"),
+            (MachiningPage, "manu", "machiningDock"),
+            (SoftwarePage, "manu", "softwareDock"),
+            (GraphRulePage, "manu", "graphRuleDock"),
+        ):
+            document = self.hard_params if document_key == "hard" else self.manu
+            page = page_class(
+                translator=t,
+                document=document,  # type: ignore[arg-type]
+                manu=self.manu,
+                path=self.param_paths.get(document_key),
+            )
+            dock = QDockWidget(t.tr(page.spec.title_id, page.spec.title_default), self)
+            dock.setObjectName(object_name)
+            dock.setWidget(page)
+            self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+            dock.hide()  # four more panes would bury the canvas; the View menu opens them
+            self.param_pages[page.spec.page_id] = page
+            self.param_docks[page.spec.page_id] = dock
+
+        self.crafts_editor = CraftsEditor()
+        self.crafts_dock = QDockWidget(t.tr("newLang40", "Crafts"), self)
+        self.crafts_dock.setObjectName("craftsDock")
+        self.crafts_dock.setWidget(self.crafts_editor)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.crafts_dock)
+        self.crafts_dock.hide()
 
         machine = QWidget()
         lay = QVBoxLayout(machine)
@@ -314,7 +390,14 @@ class MainWindow(QMainWindow):
             tools.addAction(a)
             view_menu.addAction(a)
         view_menu.addSeparator()
-        for dock in (self.layer_dock, self.property_dock, self.layer_param_dock, self.machine_dock):
+        for dock in (
+            self.layer_dock,
+            self.property_dock,
+            self.layer_param_dock,
+            *self.param_docks.values(),
+            self.crafts_dock,
+            self.machine_dock,
+        ):
             view_menu.addAction(dock.toggleViewAction())
 
     def _toggle(self, menu: QMenu, text: str, checked: bool, slot: object) -> QAction:
@@ -354,6 +437,7 @@ class MainWindow(QMainWindow):
         self.path = loaded.path if loaded.kind == "chf" else None
         scene = self.canvas.set_document(loaded.document)
         self.layer_page.set_job(loaded.document)
+        self.crafts_editor.set_document(loaded.document)
         self._update_layers(scene)
         self.canvas.zoom_to_fit()
         self._add_recent(loaded.path)
@@ -450,6 +534,13 @@ class MainWindow(QMainWindow):
         index = item.data(0, Qt.ItemDataRole.UserRole)
         if isinstance(index, int):
             self.layer_page.set_slot(index + 1)
+            self.fiber_layer_page.set_slot(index + 1)
+
+    def _on_layer_document_reloaded(self, document: object) -> None:
+        """The layer file was re-read: both layer pages follow the new document."""
+        self.layer_params = document
+        self.layer_page.set_document(document)  # type: ignore[arg-type]
+        self.fiber_layer_page.set_document(document)  # type: ignore[arg-type]
 
     def _on_layer_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
         if column != 0:

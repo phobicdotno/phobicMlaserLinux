@@ -88,7 +88,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ParamFileError as exc:
         print(f"nexcut: {exc}", file=sys.stderr)
         return 2
-    win = MainWindow(translator=translator, manu=manu, hard=hard, layer=layer)
+    # The parameter docks save back to the file they were opened from (M3, ui/pages/*): without
+    # the paths, Save in the layer/hardware/machining/software docks would ask for one even
+    # though --layer/--manu/--hard named it.
+    win = MainWindow(
+        translator=translator,
+        manu=manu,
+        hard=hard,
+        layer=layer,
+        param_paths={
+            key: path
+            for key, path in (("manu", args.manu), ("hard", args.hard), ("layer", args.layer))
+            if path is not None
+        },
+    )
     win.show()
     if args.file is not None:
         win.open_path(args.file)

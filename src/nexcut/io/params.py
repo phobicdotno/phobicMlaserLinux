@@ -36,6 +36,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import stat
 import tempfile
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable, Mapping
@@ -46,6 +47,7 @@ from typing import Literal
 from nexcut.core.schema import Descriptor, Layout, Schema, SchemaError, Value, load_schema
 
 __all__ = [
+    "BACKUP_SUFFIX",
     "FILE_SETS",
     "LoadResult",
     "ParamDocument",
@@ -364,16 +366,51 @@ def serialize_params(doc: ParamDocument) -> bytes:
     )
 
 
-def _atomic_write(path: Path, data: bytes) -> None:
-    """Write via temp file + fsync + rename in the target directory (PORT-PLAN §3 ParaModule row)."""
+def _fsync_dir(directory: Path) -> None:
+    """Make a rename in ``directory`` durable.
+
+    ``os.replace`` is atomic with respect to a *reader*, but the new directory entry is
+    only on disk once the directory itself is synced. Without this, a power loss between
+    the backup copy and the primary write can lose the copy while keeping the new primary
+    - the one ordering :func:`write_params` promises cannot happen. Best effort: a
+    filesystem that refuses ``O_DIRECTORY`` or ``fsync`` on a directory is not an error.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        fd = os.open(directory, flags)
+    except OSError:  # pragma: no cover - platform dependent
+        return
+    try:
+        os.fsync(fd)
+    except OSError:  # pragma: no cover - some filesystems refuse it
+        pass
+    finally:
+        os.close(fd)
+
+
+def _atomic_write(path: Path, data: bytes, *, mode: int | None = None) -> None:
+    """Write via temp file + fsync + rename + directory fsync (PORT-PLAN §3 ParaModule row).
+
+    The permission bits of the file being replaced are carried over: ``mkstemp`` creates
+    ``0600``, and a rename would otherwise silently tighten a vendor file that the owner
+    (or a Wine prefix shared with another account) had left group-readable.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+    if mode is None:
+        try:
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+        except OSError:
+            mode = None
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
+        if mode is not None:
+            os.chmod(tmp, mode)
         os.replace(tmp, path)
+        _fsync_dir(path.parent)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -382,15 +419,60 @@ def _atomic_write(path: Path, data: bytes) -> None:
         raise
 
 
-def write_params(path: str | os.PathLike[str], doc: ParamDocument, *, verify: bool = True) -> None:
-    """Atomically write ``doc`` to ``path``; with ``verify`` read it back and compare."""
+BACKUP_SUFFIX = ".bak"
+"""Suffix of the previous generation kept by ``write_params(backup_suffix=...)``.
+
+Port choice (UNVERIFIED): the vendor's own second generation is a *differently named
+file* (``SecondBkManuPara.xml``, 01 §0.3/§5) and exists for ``ManuPara`` only, so there
+is no vendor spelling for "the previous ``BkLayerPara.xml``". ``ParamStore.save``
+reproduces the vendor scheme; this suffix is what a single-file editor uses instead.
+"""
+
+
+def write_params(
+    path: str | os.PathLike[str],
+    doc: ParamDocument,
+    *,
+    verify: bool = True,
+    backup_suffix: str | None = None,
+) -> Path | None:
+    """Atomically write ``doc`` to ``path``; with ``verify`` read it back and compare.
+
+    With ``backup_suffix`` (e.g. :data:`BACKUP_SUFFIX`) the file that is already
+    there is copied to ``<name><suffix>`` **before** the new content is renamed over
+    it, and that path is returned; nothing is written to the target until the backup
+    is on disk, so a crash between the two leaves either the old file or the old file
+    plus its copy. This is the single-file form of the vendor's own "primary and
+    backup are written in the same operation, each verified by read-back" flow
+    (01 §0.3; strings ``MainFrm saveManuParam read failed`` / ``... backup read
+    failed`` at 0x45c1ed / 0x45c4d5). Returns ``None`` when no backup was made
+    (no ``backup_suffix``, or nothing was there yet).
+    """
     p = Path(path)
     data = serialize_params(doc)
+    backup: Path | None = None
+    if backup_suffix:
+        previous = p.with_name(p.name + backup_suffix)
+        try:
+            old = p.read_bytes()
+            old_mode: int | None = stat.S_IMODE(os.stat(p).st_mode)
+        except FileNotFoundError:
+            old, old_mode = None, None
+        if old is not None:
+            # the copy carries the permissions of what it is a copy *of*, not of the
+            # previous generation of the backup file (which may not exist at all)
+            _atomic_write(previous, old, mode=old_mode)
+            backup = previous
     _atomic_write(p, data)
     if verify:
         back = p.read_bytes()
         if back != data:
-            raise ParamFileError(f"{p}: read-back verification failed")
+            # The rename has already happened, so the operator needs to be told where the
+            # previous generation is - the vendor says only "MainFrm saveManuParam read
+            # failed" (0x45c1ed) and leaves them to find it.
+            where = f"; the previous file is at {backup}" if backup is not None else ""
+            raise ParamFileError(f"{p}: read-back verification failed{where}")
+    return backup
 
 
 # ------------------------------------------------------------------------ technology

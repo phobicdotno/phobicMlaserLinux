@@ -417,3 +417,109 @@ def test_label_write_uses_11_section_8_names() -> None:
         "jog absolute"
     )
     assert m1.label_write([0x40, 0x67, 1, 2]).startswith("FIFO start")
+
+
+# ------------------------------------------------- reconnect mid-step (D9/R12, STATUS §5.10)
+
+
+def _session(path: Path, out: Path, op: ScriptedOperator) -> Any:
+    ns = m1._parser().parse_args(argv_for(path, out, "--no-dissector"))
+    return m1.M1Session(m1.options_from_args(ns), op)
+
+
+def _break_all_ipc_connections(daemon: MccDaemon) -> None:
+    """Drop every server-side IPC connection - a link blip, as far as a client can tell."""
+    server = daemon.server
+    assert server is not None
+    for conn in list(server._conns.values()):
+        conn.close()
+
+
+def test_reconnect_mid_step_rearms_before_the_motion(tmp_path: Path) -> None:
+    """A reconnect drops arming and the right to move (D9/R12); the tool arms again.
+
+    Forced exactly where it hurts: the step arms, the link blips, an idempotent call
+    (``status``, retried by ``DaemonLink``) reconnects, and only then does the motion go out.
+    Before this, that motion was refused with a bare ``arming:`` message.
+    """
+    out = tmp_path / "m1"
+    with daemon_on_sim() as (daemon, sim, path):
+        s = _session(path, out, ScriptedOperator())
+        rec = m1.StepRecord(m1.STEPS[2])  # step 3, the X jog
+        s._current = rec
+        s._arm(rec)
+        first_generation = s.link.generation
+        assert daemon.gate.arming.state is ArmState.MOTION_ARMED
+        assert s.link.call("status")["arm_owner_is_self"] is True
+
+        _break_all_ipc_connections(daemon)
+        assert wait_for(lambda: daemon.gate.arming.state is ArmState.DISARMED, 5.0)
+        s.link.call("status")  # idempotent: reconnects on a new connection
+        assert s.link.generation == first_generation + 1
+
+        res = s._motion_call(rec, "jog_step", slot=0, mm=1.0, speed=5.0)
+        assert res.get("words")
+        kinds = [e["kind"] for e in rec.data["events"]]
+        assert "arming_lost" in kinds and "arming_restored" in kinds
+        assert kinds.count("arm_motion") == 2
+        assert s._arm_generation == s.link.generation
+        assert s.link.call("status")["arm_owner_is_self"] is True
+        assert [k for k, _ in jogs_and_homes(sim)] == ["jog"]
+        s.link.close()
+
+
+def test_motion_step_refuses_to_continue_when_arming_cannot_be_restored(tmp_path: Path) -> None:
+    """If re-arming fails the step stops there: ``ArmingLost``, and nothing is sent."""
+    out = tmp_path / "m1"
+    with daemon_on_sim() as (daemon, sim, path):
+        s = _session(path, out, ScriptedOperator())
+        rec = m1.StepRecord(m1.STEPS[2])
+        s._current = rec
+        s._arm(rec)
+
+        _break_all_ipc_connections(daemon)
+        sim.inject_alarm(alarm1=1 << 30)  # E-stop: the daemon refuses to arm again
+        assert wait_for(lambda: daemon.gate.arming.estop_latched, 5.0)
+        s.link.call("status")  # reconnect
+
+        with pytest.raises(m1.ArmingLost):
+            s._motion_call(rec, "jog_step", slot=0, mm=1.0, speed=5.0)
+        assert jogs_and_homes(sim) == []
+        assert not s._armed
+        assert any(e["kind"] == "arming_lost" for e in rec.data["events"])
+        assert not any(e["kind"] == "arming_restored" for e in rec.data["events"])
+        sim.inject_alarm(alarm1=0)
+        s.link.close()
+
+
+def test_motion_prompt_records_the_lost_arming_and_marks_the_step_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_motion`` turns an unrecoverable ``ArmingLost`` into a recorded, harmless outcome."""
+    out = tmp_path / "m1"
+    with daemon_on_sim() as (_daemon, sim, path):
+        op = ScriptedOperator()
+        s = _session(path, out, op)
+        rec = m1.StepRecord(m1.STEPS[2])
+        s._current = rec
+
+        def boom(_rec: Any, what: str) -> None:
+            raise m1.ArmingLost(f"link reconnected and re-arming failed ({what})")
+
+        monkeypatch.setattr(s, "_ensure_armed", boom)
+        entry = s._motion(
+            rec,
+            "jog_x",
+            "Jog X +1 mm",
+            [],
+            "X moves",
+            lambda e: s._motion_call(rec, "jog_step", slot=0, mm=1.0, speed=5.0),
+        )
+        assert entry is not None
+        assert entry["outcome"].startswith("arming lost:")
+        assert entry["error"]["code"] == "arming"
+        assert rec.incomplete
+        assert jogs_and_homes(sim) == []
+        assert any("Re-run this step on its own with --steps 3" in t for t in op.said)
+        s._disarm(rec, "test end")
+        s.link.close()

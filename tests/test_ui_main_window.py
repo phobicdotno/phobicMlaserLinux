@@ -413,3 +413,47 @@ def test_app_main_runs_event_loop(
     assert rc == 0
     assert any(t.startswith("1.chf") for t in seen)
     assert list((tmp_path / "cache" / "nexcut").glob("lang-*.json"))
+
+
+def test_app_main_hands_the_parameter_paths_to_the_docks(
+    tmp_path: Path, qapp: QtWidgets.QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--manu/--hard/--layer`` also name the file the M3 docks save *back* to.
+
+    ``MainWindow(param_paths=...)`` is what ``ui/pages/param_pages.LayerFileBar`` and the four
+    parameter pages use as the target of their Save button (02 §6.1); without it Save asks for
+    a path the operator already gave on the command line.  Integration gap found when the M3
+    pages landed: ``ui/app.py`` built the window without the mapping.
+    """
+    from PySide6.QtCore import QTimer
+
+    from nexcut.io.params import default_document, write_params
+    from nexcut.ui import app
+    from nexcut.ui import main_window as mw
+
+    paths = {}
+    for key in ("manu", "hard", "layer"):
+        p = tmp_path / f"Bk{key.capitalize()}Para.xml"
+        write_params(p, default_document(key))
+        paths[key] = p
+
+    seen: dict[str, object] = {}
+
+    class FakeWindow:
+        def __init__(self, **kwargs: object) -> None:
+            seen.update(kwargs)
+
+        def show(self) -> None:
+            # Quit from *inside* the loop: quit() before exec() would never return.
+            QTimer.singleShot(0, lambda: QtWidgets.QApplication.quit())
+
+    monkeypatch.setattr(mw, "MainWindow", FakeWindow)
+    rc = app.main(
+        [
+            "--manu", str(paths["manu"]),
+            "--hard", str(paths["hard"]),
+            "--layer", str(paths["layer"]),
+        ]  # fmt: skip
+    )
+    assert rc == 0
+    assert seen["param_paths"] == paths

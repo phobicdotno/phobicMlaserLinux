@@ -32,6 +32,9 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
+from numpy.typing import NDArray
+
 from nexcut.mcc.framing import FUNC_WRITE, REG_FIFO_DATA
 from nexcut.mcc.registers import (
     FIFO_MARGIN_EMPTY,
@@ -48,6 +51,7 @@ __all__ = [
     "FifoFrameLost",
     "FillResult",
     "FramePacker",
+    "FrameStream",
     "PackedFrame",
     "count_frame_file",
     "fifo_queued_bytes",
@@ -128,22 +132,43 @@ class PackedFrame:
         return [FUNC_WRITE, REG_FIFO_DATA, self.count, *self.payload(frame_id)]
 
 
-class FramePacker:
-    """Item builder flush rule (VM slot 121, A3 §4.1).
+class FrameStream:
+    """The item-builder flush rule as a stream: each frame is handed back the moment it closes.
 
-    Call :meth:`add_record` with the item word lists produced by one record, then
-    :meth:`end_batch` when the batch of records handed to the builder ends (the vendor flushes
-    at the last record).  Closed frames accumulate in :attr:`frames`.
+    The rule is the vendor's - close at ``PREFIX_WORDS + data >= FLUSH_WORDS`` after a *record*,
+    and at the end of the batch - and :class:`FramePacker` is this class with the frames kept in
+    a list.  A job of production size cannot keep them: PORT-PLAN §8.3's 100 000-contour gate is
+    67.5 M ticks = 202 M words, several GB as Python tuples, so the planner yields each frame and
+    forgets it (``docs/STATUS.md`` §5 task 6, strict xfail X13).
+
+    Two entry points:
+
+    * :meth:`push_record` is the scalar path, word for word what
+      :meth:`FramePacker.add_record` does (one record, one or more items);
+    * :meth:`push_uniform` is the vectorised bulk path for a run of *equal-length* records -
+      the 3-word opcode-3000 tick that is almost every item of a job (11 §5.2).  The whole run
+      arrives as one numpy word array and is split into frames with array slicing, so no
+      Python object is built per tick.
+
+    Both feed the same open frame, so a job may interleave them freely; the frame boundaries
+    are identical to :class:`FramePacker`'s (pinned by
+    ``tests/test_plan_vectorised_equivalence.py``).
     """
 
     def __init__(self) -> None:
-        self.frames: list[PackedFrame] = []
         self._data: list[int] = []
         self._laser = 0
         self._items = 0
 
-    def add_record(self, items: Iterable[Sequence[int]], laser_items: int = 0) -> None:
-        """Append the items of one record; close the frame when it reaches 300 words."""
+    @property
+    def pending_words(self) -> int:
+        """Data words of the open frame."""
+        return len(self._data)
+
+    def push_record(
+        self, items: Iterable[Sequence[int]], laser_items: int = 0
+    ) -> list[PackedFrame]:
+        """One record; returns the frame it closed (0 or 1 frames)."""
         for words in items:
             if not words:
                 raise ValueError("empty item")
@@ -154,23 +179,115 @@ class FramePacker:
             self._items += 1
         self._laser += laser_items
         if PREFIX_WORDS + len(self._data) >= FLUSH_WORDS:
-            self._close()
+            return [self._close()]
+        return []
 
-    def end_batch(self) -> None:
-        """Last record of the batch: close a non-empty frame (flush ``|| last record``)."""
-        if self._data:
-            self._close()
+    def push_uniform(
+        self,
+        words: NDArray[np.uint32],
+        per_record: int,
+        laser: NDArray[np.bool_] | None = None,
+    ) -> Iterator[PackedFrame]:
+        """Yield the frames closed by a run of ``len(words) // per_record`` equal-length records.
 
-    def _close(self) -> None:
-        self.frames.append(PackedFrame(tuple(self._data), self._laser, self._items))
+        ``words`` is the flat word array (one item per record, ``per_record`` words each, header
+        first); ``laser`` marks the records that carry light (PORT-PLAN §8.2) - **one flag per
+        record**, or the frames would be charged the wrong laser count - and is summed per frame
+        into :attr:`PackedFrame.laser_items`.  The tail that does not fill a frame stays open for
+        the next push, exactly as in the scalar path.
+
+        The frames are produced in blocks (:data:`_UNIFORM_BLOCK_FRAMES` at a time) so that even
+        a single million-tick move never materialises more than a block of frames at once.
+        """
+        if per_record < 1:
+            raise ValueError("per_record must be >= 1")
+        if words.size % per_record:
+            raise ValueError(
+                f"{words.size} words is not a whole number of {per_record}-word records"
+            )
+        n = words.size // per_record
+        if laser is not None and laser.size != n:
+            raise ValueError(f"{laser.size} laser flags for {n} records")
+        if n == 0:
+            return
+        if np.any((words[::per_record] >> 16) // WORD_BYTES != per_record - 1):
+            raise ValueError(f"item header does not match {per_record - 1} payload words")
+        cum = None
+        if laser is not None and laser.any():
+            cum = np.concatenate(([0], np.cumsum(laser, dtype=np.int64)))
+
+        def lasers(a: int, b: int) -> int:
+            return 0 if cum is None else int(cum[b] - cum[a])
+
+        capacity = FLUSH_WORDS - PREFIX_WORDS  # data words that close a frame
+        per_frame = -(-capacity // per_record)  # records in a frame of its own (99 ticks)
+        need = capacity - len(self._data)
+        i = min(n, -(-need // per_record)) if need > 0 else 0
+        if i:  # top up the frame that is already open
+            self._data.extend(words[: i * per_record].tolist())
+            self._items += i
+            self._laser += lasers(0, i)
+            if PREFIX_WORDS + len(self._data) < FLUSH_WORDS:
+                return  # the whole run fitted in the open frame
+            yield self._close()
+        while i + per_frame <= n:
+            k = min(_UNIFORM_BLOCK_FRAMES, (n - i) // per_frame)
+            block = words[i * per_record : (i + k * per_frame) * per_record]
+            rows = block.reshape(k, per_frame * per_record).tolist()
+            for r, row in enumerate(rows):
+                yield PackedFrame(
+                    tuple(row), lasers(i + r * per_frame, i + (r + 1) * per_frame), per_frame
+                )
+            i += k * per_frame
+        if i < n:  # tail: stays in the open frame
+            self._data.extend(words[i * per_record :].tolist())
+            self._items += n - i
+            self._laser += lasers(i, n)
+
+    def flush(self) -> list[PackedFrame]:
+        """End of the batch: close a non-empty frame (0 or 1 frames)."""
+        return [self._close()] if self._data else []
+
+    def _close(self) -> PackedFrame:
+        frame = PackedFrame(tuple(self._data), self._laser, self._items)
         self._data = []
         self._laser = 0
         self._items = 0
+        return frame
+
+
+_UNIFORM_BLOCK_FRAMES = 64
+"""Frames :meth:`FrameStream.push_uniform` converts per ``tolist()`` call - one conversion for
+64 frames amortises the numpy call overhead without holding a long run in memory."""
+
+
+class FramePacker:
+    """Item builder flush rule (VM slot 121, A3 §4.1).
+
+    Call :meth:`add_record` with the item word lists produced by one record, then
+    :meth:`end_batch` when the batch of records handed to the builder ends (the vendor flushes
+    at the last record).  Closed frames accumulate in :attr:`frames`.
+
+    It is :class:`FrameStream` with the frames kept instead of handed back, so the two cannot
+    drift apart; a job of production size uses the stream (PORT-PLAN §8.3).
+    """
+
+    def __init__(self) -> None:
+        self.frames: list[PackedFrame] = []
+        self._stream = FrameStream()
+
+    def add_record(self, items: Iterable[Sequence[int]], laser_items: int = 0) -> None:
+        """Append the items of one record; close the frame when it reaches 300 words."""
+        self.frames.extend(self._stream.push_record(items, laser_items))
+
+    def end_batch(self) -> None:
+        """Last record of the batch: close a non-empty frame (flush ``|| last record``)."""
+        self.frames.extend(self._stream.flush())
 
     @property
     def pending_words(self) -> int:
         """Data words of the open frame."""
-        return len(self._data)
+        return self._stream.pending_words
 
 
 def pack_records(records: Iterable[Sequence[Sequence[int]]]) -> list[PackedFrame]:
@@ -329,9 +446,18 @@ def parse_frame_line(line: str) -> tuple[int, list[int]] | None:
 
 
 def write_frame_file(
-    path: str | Path, frames: Iterable[tuple[int, PackedFrame]], header: Sequence[str] = ()
+    path: str | Path,
+    frames: Iterable[tuple[int, PackedFrame]],
+    header: Sequence[str] = (),
+    footer: Sequence[str] | Callable[[], Sequence[str]] = (),
 ) -> int:
-    """Write ``# header`` lines and one frame per line; returns the number of frames."""
+    """Write ``# header`` lines and one frame per line; returns the number of frames.
+
+    ``frames`` is consumed lazily, one frame at a time, so a streamed job is never held in
+    memory (PORT-PLAN §8.3).  ``footer`` may be a callable, evaluated *after* the last frame:
+    a streamed job only knows its totals once it has been planned, so the summary lines go
+    below the frames instead of into the header.
+    """
     n = 0
     with open(path, "w", encoding="utf-8", newline="\n") as fh:
         for h in header:
@@ -339,6 +465,8 @@ def write_frame_file(
         for fid, frame in frames:
             fh.write(format_frame_line(fid, frame) + "\n")
             n += 1
+        for line in footer() if callable(footer) else footer:
+            fh.write(f"# {line}\n")
     return n
 
 

@@ -1,51 +1,118 @@
 # STATUS: where the port stands
 
-Snapshot date: **2026-09-16** (second adversarial-review pass). Written from the working tree at
-that date. **Nothing has been run on the machine.** It covers what exists, which PORT-PLAN §4/§8.3
+Snapshot date: **2026-09-16** (third adversarial-review pass: the vectorised streaming planner, the
+streaming DXF reader, and the M3 UI / safety / UX surfaces). Written from the working tree at that
+date, and **every number in §0 was re-measured for this report** on the owner's idle laptop.
+**Nothing has been run on the machine.** This file covers what exists, which PORT-PLAN §4/§8.3
 gates pass, and what is still assumed.
 
 Section references follow the analysis docs: `11 §7` means `docs/analysis/11-static-findings.md` §7,
 `A3 §8` means `docs/analysis/11-static/A3.md` §8, and `D9` means `docs/DECISIONS.md` D9.
 
 Rule for this file: a gate counts as **met** only if it was actually run and passed. A gate that
-passes on relaxed criteria, or on the simulator only, says so in the same sentence.
+passes on relaxed criteria, or on the simulator only, says so in the same sentence. A number that
+was **not** re-measured for this report says whose run it comes from.
+
+---
+
+## How to pick this up (a fresh session, ten minutes)
+
+**Read these three, in this order.**
+
+1. **This file** — §0 (the measured numbers), §1 (what each milestone actually is), §5 (the next
+   ten tasks, in priority order and split by whether they need the owner). Everything else here is
+   the evidence behind those three sections.
+2. **`docs/analysis/11-static-findings.md`** — the protocol truth, and it **supersedes `04` and
+   `00`** wherever they disagree (0x65 sub-command 1 is STOP, 2 is HOME, 3 is jog — the older
+   naming is wrong). §2 is the command vectors, §3 the allow/deny lists, §4 the registers, §5 the
+   FIFO frame grammar, §7 the bench-session script the port is built around.
+3. **`docs/DECISIONS.md`** — D1…D15. Fourteen are decided and enforced in code; **D13 (laser
+   arming) is `proposed` and unsigned**, and no M5 code may exist until the owner signs it.
+   `LASER_ARMED` is unreachable from any client today and three tests fail the moment that stops
+   being true (§1.6).
+
+Then, according to what you are about to do: `docs/PORT-PLAN.md` §4 (milestone gates), §8
+(safety and the performance gates) and §9 (the deliverable checklist); `docs/M1-BENCH-SESSION.md`
+if the owner is at the machine; `docs/WINE-SESSION-H.md` if the owner is at a Wine prefix;
+`docs/DEVELOPING.md` §"Writing tests that survive CI" before adding any timing-sensitive test.
+
+**Run this before changing anything** (~8 minutes wall clock on the owner's laptop):
+
+```sh
+cd ~/phobicMlaserLinux
+NEXCUT_SRC=~/Documents/CF1390-250715-1084-0973/Mlaser-v0.0.0.52 QT_QPA_PLATFORM=offscreen \
+    .venv/bin/pytest -q -p no:cacheprovider     # 1676 passed, 3 xfailed, ~3 min 45 s
+NEXCUT_SRC=/nonexistent QT_QPA_PLATFORM=offscreen \
+    .venv/bin/pytest -q -p no:cacheprovider     # what CI runs: the vendor-golden tests skip
+.venv/bin/ruff check . tools/m1_session.py      # All checks passed!
+```
+
+The three PORT-PLAN §8.3 performance gates are **not** part of those runs except as a pass/fail —
+their numbers only appear with `-s`:
+
+```sh
+.venv/bin/pytest -q -s tests/test_perf_planner.py                       # throughput + memory, ~5 s
+NEXCUT_JITTER_SECONDS=120 .venv/bin/pytest -q -s tests/test_perf_streaming.py    # jitter, 4 min
+QT_QPA_PLATFORM=offscreen .venv/bin/pytest -q -s \
+    tests/test_import_ui_fidelity_review.py -k 50k                      # the X11 import budget
+```
+
+**Three xfails are expected, and all three are strict** (X7, X11, X13 — §2). A strict xfail that
+starts passing *fails* the suite; that is deliberate, so a divergence cannot quietly rot. Never
+weaken one to make a run green.
+
+**The single most valuable next action is §5 task 1 — the M1 bench session at the machine.**
+It is the only activity that produces the first packet capture of *this* card, and that one
+artefact closes M0's last open gate item, the whole of §3.1–§3.3, D2 and the M1 hardware sign-off
+together. No desk work substitutes for it; tasks 2 and 3 are the same sitting, and M4's gate 1(a),
+M5 and M6 all wait behind the artefacts it produces.
+*If the owner cannot be at the machine:* task 4 (Wine session H) needs them at a keyboard only and
+unblocks three gates at once. *If nobody but you is available:* start at task 7 — tasks 7–10 need
+neither the owner nor the machine.
 
 ---
 
 ## 0. Numbers at a glance
 
+Every row was measured on the owner's laptop on **2026-09-16**, idle unless it says otherwise,
+except the two rows that name an earlier run.
+
 | Item | Value |
 |---|---|
-| Full suite, `NEXCUT_SRC=…/Mlaser-v0.0.0.52 QT_QPA_PLATFORM=offscreen .venv/bin/pytest -q -p no:cacheprovider` | **1330 passed, 4 xfailed (all strict), 0 failed, 0 skipped** in 197.8 s |
-| Same suite with `NEXCUT_SRC=/nonexistent` (what CI runs) | **1214 passed, 116 skipped, 4 xfailed** in 182.8 s |
-| Tests collected | **1334 in 56 files** (+ `conftest.py`) |
+| Full suite, `NEXCUT_SRC=…/Mlaser-v0.0.0.52 QT_QPA_PLATFORM=offscreen .venv/bin/pytest -q -p no:cacheprovider` | **1676 passed, 3 xfailed (all strict), 0 failed, 0 skipped** in 224.44 s |
+| Same suite with `NEXCUT_SRC=/nonexistent` (what CI runs) | **1540 passed, 136 skipped, 3 xfailed** in 212.00 s |
+| Same suite with every core busy | **not re-run for this report.** The last load sweep was the previous phase's tree (1571 tests): **1571 passed, 3 xfailed** twice, 332.08 s and 332.19 s against 212.8 s idle (1.56x), and the timing-sensitive files green five times over under the same load (§6). The 172 tests added since have no sleeps, no wall-clock budgets and no periodic-event assertions; re-running the sweep is §5 task 10 |
+| Tests collected | **1679 in 67 files** (+ `conftest.py`) |
 | `.venv/bin/ruff check . tools/m1_session.py` | **All checks passed!** |
-| CI (`.github/workflows/ci.yml`) | ruff + pytest on Python 3.12/3.13/3.14, offscreen Qt, `-p no:cacheprovider --durations=15`. `SRC` is absent there, so the 116 vendor-golden tests skip |
-| `UNVERIFIED` markers in `src/` + `tools/m1_session.py` | **247 lines** (grep), inventoried in §3 |
+| CI (`.github/workflows/ci.yml`) | ruff + pytest on Python 3.12/3.13/3.14, offscreen Qt, `-p no:cacheprovider --durations=15`. `SRC` is absent there, so the 136 vendor-golden tests skip |
+| `UNVERIFIED` markers in `src/` + `tools/m1_session.py` | **261 lines** (grep), inventoried in §3 |
 | Hardware sessions run | **0**. No pcap capture of this machine exists |
-| Console scripts | `nexcut` (viewer, layer property page), `nexcut-mccd` (`serve`/`run`, `tui`, `status`, one-shots, `jog`, `home`, `run-job`, `job-status`, `ctl`), `nexcut-plan` (offline planner → frame file) |
-| PORT-PLAN §8.3 streaming jitter gate (**simulator only**) | <!-- JITTER-GATE: rerun with `NEXCUT_JITTER_SECONDS=600 QT_QPA_PLATFORM=offscreen .venv/bin/pytest -q -s tests/test_perf_streaming.py` (≈20 min for both ticks); the suite default is an 8 s job --> **met** (2026-09-16, re-measured for this report after the feeder review; **both ticks, a full 600 s job each**, `nexcut-mccd` + `CardSimulator` in one process). **250 µs tick** (cadence 24.8 ms/frame): 24 242 frames in 600.2 s — DONE, every tick consumed, **0 re-sends, 0 starvation events**, queue low water **4 162 items** (card) / 4 395 (reg 1016) against the `FifoAlarmNum` = 30 floor; frame interval p50 **26.4 ms**, p90 **39.2**, p99 **55.8**, max **80.2** — a producer stall of 31.0 ms (p99) / 55.4 ms (max) on top of the cadence. **1 ms tick** (cadence 99.0 ms/frame): 6 061 frames in 600.3 s, low water **4 688 / 4 698 items**, p50 **91.6 ms**, p90 **121.6**, p99 **125.8**, max **139.4** — stall 26.8 / 40.4 ms. Limits on this run: p99 < 106 ms, max < 532 ms (§8.3's 100 / 500 ms × `conftest.speed_factor()` = 1.06 here). Only the two *time* limits are scaled; the stream criteria — DONE, every tick consumed, 0 re-sends, 0 starvation, the queue floor — never are. 20 min 01 s for the pair |
-| PORT-PLAN §8.3 planner throughput gate | <!-- PLANNER-GATE: rerun with `.venv/bin/pytest -q -s tests/test_perf_planner.py` --> **not met** (2026-09-16, re-measured for this report), strict xfail **X13**. 250 contours planned in 1.15 s = **4.61 ms/contour**, 168 756 ticks, **6.82 µs/tick** → **461 s for 100 000 contours** against a 30 s budget (15x over; earlier runs measured 478–507 s, so read it as ~460–510 s). Linearity re-checked in the same run: 4.86 ms/contour at 62 contours, 4.69 at 250, **675 ticks/contour** throughout, so the extrapolation is sound. Dominated by per-tick object construction in `plan/items.py` + `mcc/fifo.py`; geometry alone is ~1.35 ms/contour ≈ 135 s, also over budget. Such a job cannot be held in memory as frames either (202 M words), so the fix is a streaming, numpy-vectorised item path — not a constant factor |
+| Console scripts | `nexcut` (viewer; CO2 + fibre layer, hardware, machining, software and graph-rule pages, curve and crafts editors), `nexcut-mccd` (`serve`/`run`, `tui`, `status`, one-shots, `jog`, `home`, `run-job`, `job-status`, `ctl`), `nexcut-plan` (offline planner → frame file) |
+| PORT-PLAN §8.3 streaming jitter gate (**simulator only**) | <!-- JITTER-GATE: `NEXCUT_JITTER_SECONDS=120 QT_QPA_PLATFORM=offscreen .venv/bin/pytest -q -s tests/test_perf_streaming.py` is the 4-minute short form; the full gate is the same command with 600 --> **met** (re-measured for this report at **120 s of machine time per tick**, 4 min for the pair, `nexcut-mccd` + `CardSimulator` in one process). **250 µs tick** (cadence 24.8 ms/frame): 4 848 frames in 120.2 s — DONE, every tick consumed, **0 re-sends, 0 starvation events**, queue low water **4 559 items** (card) / 4 596 (reg 1016) against the `FifoAlarmNum` = 30 floor; frame interval p50 **27.6 ms**, p90 **32.9**, p99 **36.0**, max **44.8** — a producer stall of 11.2 ms (p99) / 20.0 ms (max) on top of the cadence. **1 ms tick** (cadence 99.0 ms/frame): 1 212 frames in 120.2 s, low water **4 695 / 4 703**, p50 **91.1**, p90 **121.5**, p99 **125.7**, max **126.7** — stall 26.7 / 27.7 ms. Limits on this run: p99 stall < 103 ms, max stall < 513 ms (§8.3's 100 / 500 ms × `conftest.speed_factor()` = 1.03 here), and at the 250 µs tick the absolute p99 < 103 / max < 513 are asserted as well. Only the two *time* limits are scaled; the stream criteria — DONE, every tick consumed, 0 re-sends, 0 starvation, the queue floor — never are. **The full 600 s form was last run in the previous phase** and is recorded there: 24 242 frames in 600.2 s at the 250 µs tick with p99 55.8 / max 80.2 ms, and 6 061 frames at 1 ms with p99 125.8 / max 139.4 — the same picture over 5x the duration |
+| PORT-PLAN §8.3 planner throughput gate | <!-- PLANNER-GATE: `.venv/bin/pytest -q -s tests/test_perf_planner.py` --> **not met**, strict xfail **X13**. 250 contours in 0.49 s = **1.94 ms/contour**, 168 756 ticks, **2.88 µs/tick** → **194 s for 100 000 contours** against the 30 s budget; 1.93 ms/contour at 62 contours and 675 ticks/contour at every size, so the extrapolation is linear. It was 4.61 ms/contour = 461 s (earlier runs 478–520 s) before the vectorised item path. **The memory half of this gate is closed** (next row). What is left is per-contour numpy dispatch in the geometry stages, itemised in §2 |
+| Planner peak memory | **solved, re-measured for this report** in a fresh interpreter: a 3 000-contour job (2 147 816 ticks, 21 877 frames, 6 491 455 words) grows the RSS by **+2.6 MB while streaming** against **+197.7 MB** materialised as a frame list — 76x, and the gap widens with every contour. The previous phase measured the full 100 000-contour job (72.0 M ticks, 733 756 frames, 218 M words) at a **140.3 MB peak**, of which 135.3 MB is the `.chf` document itself: planning and writing cost **4.9 MB, flat in job size**, where a frame list would need ~8 GB |
+| Import budget (PORT-PLAN §4 M2, `speed_factor` 1.03 → 3.08 s) | 50 000-segment path, open + fit + paint: DXF lwpolyline **0.39 s**, G-code **0.83 s**, PLT **0.36 s**, `.chf` **0.41 s**; 50 000 separate `.chf` contours **2.38 s**; 50 000 separate contours on the canvas **1.02 s**. **50 000 separate DXF `LINE`s: 5.18 s — not met, strict xfail X11**, of which the streaming reader is **0.80 s** and `ops/import_gates` + `ops/sort` are **3.39 s** |
 
-Tests per area (collected, 1334 total):
+Tests per area (collected, 1679 total):
 
 | Area | Tests | Largest files |
 |---|---|---|
+| `plan` | 473 | `test_plan_junction` 175, `test_plan_scurve` 97, `test_plan_vectorised_equivalence` 52, `test_plan_vectorisation_review` 32 |
+| `ui` | 325 | `test_import_ui_fidelity_review` 54, `test_ui_safety_review` 52, `test_ui_curve_editor` 37, `test_ui_param_pages` 30 |
 | `mcc` (framing, CRC, dissector, simulator, commands, registers, transaction, fifo, safety) | 299 | `test_mcc_safety` 79, `test_mcc_protocol_fidelity` 44, `test_mcc_safety_adversarial` 37 |
-| `mccd` + `core/config` + `tools/m1_session.py` | 186 | `test_mccd_safety_review` 55, `test_mccd_job` 32, `test_mccd_cli_tui` 29 |
-| `plan` | 389 | `test_plan_junction` 175, `test_plan_scurve` 97 |
-| `io` + `.chf` | 223 | `test_io_gcode` 53, `test_io_dxf` 41, `test_chf_writer` 37 |
-| `ui` | 156 | `test_import_ui_fidelity_review` 53, `test_ui_scene` 29 |
-| `ops` | 28 | `test_ops_sort` 17 |
+| `io` + `.chf` | 293 | `test_io_gcode` 53, `test_io_dxf_stream` 46, `test_io_dxf` 41, `test_chf_writer` 37, `test_io_dxf_stream_review` 21 |
+| `mccd` + `core/config` + `tools/` (`m1_session.py`, `wine_session_h.sh`) | 206 | `test_mccd_safety_review` 55, `test_mccd_job` 32, `test_mccd_cli_tui` 29, `test_m1_session` 14 |
+| `ops` | 28 | `test_ops_sort` 17, `test_ops_scan` 11 |
+| integration + smoke | 22 | `test_smoke` 11, `test_integration_consistency` 11 |
 | `core/schema` | 18 | — |
 | cross-cutting stream/plan review | 9 | `test_stream_plan_fidelity_review` |
-| integration + smoke | 22 | — |
-| performance gates | 4 | `test_perf_streaming` 2, `test_perf_planner` 2 |
+| performance gates | 6 | `test_perf_planner` 4, `test_perf_streaming` 2 |
 
-Adversarial review suites, counted inside the areas above: 245 tests in 7 files
-(`test_mcc_protocol_fidelity` 44, `test_mcc_safety_adversarial` 37, `test_mccd_safety_review` 55,
-`test_io_fidelity_review` 24, `test_import_ui_fidelity_review` 53, `test_plan_fidelity_review` 23,
-`test_stream_plan_fidelity_review` 9).
+Adversarial review suites, counted inside the areas above: **354 tests in 10 files**
+(`test_mccd_safety_review` 55, `test_import_ui_fidelity_review` 54, `test_ui_safety_review` 52,
+`test_mcc_protocol_fidelity` 44, `test_mcc_safety_adversarial` 37, `test_plan_vectorisation_review` 32,
+`test_io_fidelity_review` 27, `test_plan_fidelity_review` 23, `test_io_dxf_stream_review` 21,
+`test_stream_plan_fidelity_review` 9) — 105 of them added by this phase's three reviews.
 
 ---
 
@@ -53,12 +120,12 @@ Adversarial review suites, counted inside the areas above: 245 tests in 7 files
 
 | M | Title | State | Gate — what was actually run |
 |---|---|---|---|
-| M0 | Foundations, passive instrumentation | **done**, one gate item waiting for the first capture | golden tests green ✔ · dissector on the package logs ✔ (805 transactions, 22 frames, 0 remainder) · dissector on a real tcpdump capture ✘ — **no capture exists** |
-| M1 | Hello machine: jog/home on the real card | **software complete, hardware not run** | simulator rehearsal ✔ (`tools/m1_session.py`, 11 tests) · ruler/homing/exception gate ✘ — needs the owner at the machine (11 §7 steps 1–10) |
-| M2 | File load and render | **partial** | "renders identically" ✔ only on the relaxed metric (IoU ≥ 0.9 + chamfer 1.000; pixel-identical on 2 of 8) · `ManuContour` order via `SortType=4` ✘ — the gate's premise is wrong (§1.3) |
-| M3 | Layers, parameters, hardware config | **partial**: file layer complete, 1 of ~6 property pages | XML round-trip ✔ on every vendor file · Wine load of port-written files ✘ — not run |
-| M4 | Job streaming, dry run | **partial**: end to end into the simulator, never onto the card | raster geometry ✔ · vendor item-stream diff ✘ (no vendor capture) · §8.3 jitter gate ✔ **simulator only** · §8.3 planner throughput ✘ (X13) · machine dry run ✘ |
-| M5 | Live CO2 cutting | **not started, deliberately** — there is no way to reach `LASER_ARMED` | — (needs D13 first) |
+| M0 | Foundations, passive instrumentation | **done**, one gate item waiting for the first capture | golden tests green ✔ · dissector on the package logs ✔ (805 transactions, 22 frames, 0 remainder) · dissector on a real tcpdump capture ✘ — **no capture of this machine exists** (§5 task 1) |
+| M1 | Hello machine: jog/home on the real card | **software complete and through three safety reviews; hardware not run** | simulator rehearsal ✔ (`tools/m1_session.py`, 14 tests; a re-arm after a link blip now needs its own operator `y`) · ruler/homing/exception gate ✘ — needs the owner at the machine (11 §7 steps 1–10) |
+| M2 | File load and render | **partial** | "renders identically" ✔ only on the relaxed metric (IoU ≥ 0.9 + chamfer 1.000; pixel-identical on 2 of 8) · `ManuContour` order via `SortType=4` ✘ — the gate's premise is wrong (§1.3) · the 50 k-`LINE` import budget ✘ (X11: 5.18 s against 3.08 s) |
+| M3 | Layers, parameters, hardware config | **partial**: file layer complete, six property pages + the curve and crafts editors, write-back wired — and since the UI review the pages no longer move a value the operator did not edit | XML round-trip ✔ on every vendor file · every editor on every page opened and committed over the real `BkHardPara.xml` / `BkManuPara.xml` without changing a byte ✔ (§1.4) · Wine load of port-written files ✘ — not run (§5 task 4) |
+| M4 | Job streaming, dry run | **partial**: end to end into the simulator, never onto the card; the planner streams, the memory ceiling is gone, and the *production* stream path now reproduces vendor frames byte for byte | raster geometry ✔ · 3 leaked vendor frames re-encoded byte-identically through `JobFrameStream` + `push_uniform` ✔ (new, §1.5) · vendor item-stream diff ✘ (no vendor capture) · §8.3 jitter gate ✔ **simulator only** · §8.3 planner throughput ✘ (X13, 194 s against 30 s) · machine dry run ✘ |
+| M5 | Live CO2 cutting | **not started, deliberately** — `LASER_ARMED` is unreachable from any client, and D13 is written but unsigned | — (needs D13 signed off: §5 task 5) |
 | M6 | Fibre path | **not started** — fibre cutting is refused in `mcc/safety.py` until capture G | — |
 | M7 | Nesting, scan, pendant, packaging | **not started**, two pieces present: `ops/scan.py` geometry and the 11-language i18n loader | — |
 
@@ -89,13 +156,16 @@ Gate run for this report:
 * **`mcc/transaction.py`** — the vendor retry ladder. 27 tests.
 * **`mcc/safety.py`** — allow/deny lists of 11 §3, arming states, deadman leases, soft limits, laser-record strip. 79 + 37 tests.
 * **`mccd/`** (daemon, gate, IPC, status, CLI, TUI) + `core/config.py` — 186 tests.
-* **`tools/m1_session.py`** — the guided 10-step session with a capture wrapper, per-step census and safety checklist. 11 tests.
+* **`tools/m1_session.py`** — the guided 10-step session with a capture wrapper, per-step census and safety checklist. 14 tests.
 * **`docs/M1-BENCH-SESSION.md`** — the operator runbook, re-checked against the code for this report (§5 of that file, the flag tables and the job commands).
 
-**Two adversarial safety reviews have now run over this code.** The first closed D9/D11/D12
+**Three adversarial safety reviews have now run over this code.** The first closed D9/D11/D12
 (R1–R11). The second (R12–R21, 23 new tests in `tests/test_mccd_safety_review.py`, 55 in the file)
 found five more defects, three of which could move the machine or hand the card to a second master.
-Every fix has a test that failed first:
+The third (2026-09-16, lens *ui-safety-ux*, `tests/test_ui_safety_review.py`) re-derived D13's
+unreachability and `arm_owner`'s contents and found nothing wrong with either, but did find **M1**
+below — the one place where the tool could put the machine back under power without asking. Every
+fix has a test that failed first:
 
 | # | Defect | Effect before the fix | Fix |
 |---|---|---|---|
@@ -130,8 +200,17 @@ Known limits of the native path (`docs/M1-BENCH-SESSION.md` §11):
   simulator, so the vendor variant stays the primary source of the tick period and O6's FIFO half
   stays open;
 * the native continuous jog is capped at 20 mm/s by D1;
-* `tools/m1_session.py` reconnects lazily, and a reconnect drops the arming (D9) **and** the right
-  to move (D9/R12): a step interrupted by a link loss must be restarted with `--steps N`.
+* `tools/m1_session.py` reconnects lazily, and a reconnect is a new IPC connection that owns
+  neither the arming (D9) nor the right to move (D9/R12). Since 2026-09-16 the tool notices this
+  itself: every motion command goes through `_motion_call`, which re-runs *this step's* arming on
+  the new connection and confirms with `status` (`arm_owner_is_self`) that the daemon agrees, and
+  otherwise raises `ArmingLost` and **sends nothing**. Only a blip it cannot repair ends the step,
+  which is then restarted with `--steps N`.
+* **Finding M1 of the UI/safety review, fixed:** that repair used to happen on a printed line
+  alone. But per D9 the daemon has already *stopped and disarmed* the machine by then, and the axis
+  need not be where the step left it — so the operator's earlier `y` was consent for a motion on a
+  machine that no longer exists. `_ensure_armed` now asks its own `op.confirm("s<n>.rearm.<cmd>")`,
+  defaulting to **No**; a `no` records `rearm_declined`, raises `ArmingLost` and sends nothing.
 
 PORT-PLAN §9 wording "capture sessions A–D dissected; `11-capture-findings.md`": not started; that
 file does not exist.
@@ -168,12 +247,29 @@ Gate measured 2026-09-16 (render each sample, compare ink masks against `tools/o
   serpentine, `GRP.Array*`), not a sort result. No sort type reproduces it (NEAREST →
   `0,4,8,9,7,5,…`; BOTTOM_TO_TOP → `0,1,2,5,4,3,…`; all others differ too). The sample holds no
   sorted job, so the vendor sort algorithms cannot be checked at all. The gate needs a new
-  reference: a vendor-sorted job produced under Wine (§5 task 5).
-* **Performance.** 50 k one-segment contours open in < 3 s for DXF lwpolyline, G-code, PLT and CHF
-  (the 50 k-contour `.chf` in 1.84–2.10 s since the vectorised token reader closed X12). 50 k
-  *separate* DXF `LINE` entities still take ≈ 8.2 s: strict xfail X11, dominated by the ezdxf parse.
+  reference: a vendor-sorted job produced under Wine (§5 task 4).
+* **Performance, re-measured for this report** (idle laptop, `speed_factor` 1.03 → budget 3.08 s
+  where PORT-PLAN asks 3 s): a 50 000-segment path opens, fits and paints in **0.39 s** (DXF
+  lwpolyline), **0.83 s** (G-code), **0.36 s** (PLT) and **0.41 s** (`.chf`); 50 000 *separate*
+  contours from a `.chf` in **2.38 s**; 50 000 separate contours on the canvas in **1.02 s**.
+  50 000 *separate* DXF `LINE` entities take **5.18 s** and are still strict xfail X11 — but no
+  longer because of the parse: `io/dxf_stream.py` reads the `ENTITIES` section tag by tag without
+  ever building an ezdxf document (**0.80 s** for those 50 000 `LINE`s in this run, against
+  3.22–3.63 s through ezdxf), and `read_dxf(reader="auto")` falls back to ezdxf for anything the
+  fast path will not vouch for (binary DXF, `INSERT`, text-to-curves, a tilted OCS, any structural
+  anomaly), recording which reader ran in `DxfImportResult.reader` / `fallback_reason`. **What is
+  left of X11 is `ops/import_gates` + `ops/sort`: 3.39 s of the 5.18 s in this run** (§2).
+* **The streaming reader survived an adversarial review** (2026-09-16, lens *silent divergence
+  between the two readers*, `tests/test_io_dxf_stream_review.py`, 21 tests): **no finding of
+  substance**. cp936 layer names resolved through the `LAYER` table, nested and block-local
+  `INSERT` (the fallback fires for the first and correctly does not for the second), five spline
+  flavours including closed/periodic and fit-points-with-tangents, bulge extremes, and a hostile
+  tag corpus (repeated codes, a leading bulge, a wrong vertex count, colour 0/−3/257, `XLINE`/`RAY`,
+  degenerate `SOLID`/`3DFACE`) all give an identical `ChfDocument`, an identical layer assignment
+  and identical counters — or a clean `StreamUnsupported`. Plus 240 random corpora × both
+  `read_color` states: 0 disagreements.
 
-### 1.4 M3 — partial (file layer complete, one property page of about six)
+### 1.4 M3 — partial (file layer complete, six property pages, no Wine cross-check yet)
 
 * **`io/params.py` + `core/schema.py`.** Typed parameter documents, missing-attribute defaults,
   atomic write with verify; technology preset parse/serialise (`P…Param11` wrapper), preset ↔ layer
@@ -189,15 +285,54 @@ Gate measured 2026-09-16 (render each sample, compare ink masks against `tools/o
   technology presets. Process type, pierce stages, lead lines and cool points are read-only because
   A6 §3 leaves it UNVERIFIED whether the CO2 process reads the `ManuType` the vendor dialog writes
   into the fibre table. 20 tests. Reachable as `nexcut --layer BkLayerPara.xml`.
-* **Absent.** The hardware, machining, software and graph-rule pages; the fibre layer page (164
-  attributes, real pierce-stage editing, the `A250607_*` fibre/CO2 selector warning); the
-  power/frequency curve editor behind `PWMCurveNodes`/`FreqCurveNodes`; the crafts editor for
-  per-contour lead-in/out and cool points; writing `BkLayerPara.xml` back from the dock (only
-  preset exchange is wired); hardware-page read-back of 50000/50200/59600+ (the daemon reads
-  50000/26 only, for K, the bus cycle and ZFType).
-* **Gate.** XML round-trip ✔. "The Windows tool (under Wine) loads files saved by the port" ✘ —
-  not run. The technology XML the page writes is byte-identical to a vendor preset except for the
-  `CutFreq` the 13 shipped CO2 presets lack, so it is the first candidate for Wine session H.
+* **`ui/pages/param_pages.py`, `ui/pages/layer_fiber.py`, `ui/pages/layer_file.py`,
+  `ui/curve_editor.py`, `ui/pages/crafts.py`** (previous phase, 2 132 lines + 1 461 lines of tests,
+  115 new tests). Six property pages instead of one — CO2 layer, fibre layer (164 attributes,
+  pierce stages, the `A250607_*` fibre/CO2 selector warning), hardware (446 attributes),
+  machining (331), software and graph rules — plus the `PWMCurveNodes`/`FreqCurveNodes` curve
+  editor with a preview, and the crafts editor for per-contour lead-in/out and cool points. The
+  main window has 9 docks instead of 4. `BkLayerPara.xml` is written back from the dock
+  (`layer_file.LayerFileBar`), and `ui/app.py` passes the `--layer/--manu/--hard` paths through
+  as the Save target. Vendor round-trips held byte for byte through the editors: `BkHardPara.xml`,
+  `BkManuPara.xml` (3 pages), `BkLayerPara.xml` (11 slots × 5 pierce stages × both layer pages),
+  3 `.chf` files through the crafts editor, and every fibre technology preset.
+**A fourth adversarial review (lens *ui-safety-ux*, `tests/test_ui_safety_review.py`, 52 tests)
+went through the property pages, the write-back and the two operator tools. It found twelve
+defects, and the four that matter are all the same defect in different clothes: the editor changed
+a value nobody edited.** Every fix has a test that failed first:
+
+| # | Defect | Effect before the fix | Fix |
+|---|---|---|---|
+| U1 | `editor_range` handed a u32 descriptor range straight to a `QSpinBox` | `createEditor` raised **`OverflowError`** for **ten editable Hardware-page rows** (`SP.MachineID`, `SP.DataCardID`, `SP.CommandID`, `SOP.JoystickID1..5`, `SOP.MonitorStartID/EndID`, all min 0 max 4294967295): a double-click threw out of a Qt delegate callback, so those rows were not editable at all | int rows are clipped to the spin box's own window (`INT32_MIN/INT32_MAX`). An **UNVERIFIED port choice** (§3.8), justified by the vendor writing these signed — `SOP.JoystickID2 = "-684904636"` in this machine's `File/BkHardPara.xml` |
+| U2 | the editor's own end stop stored a value `Descriptor.validate` rejects once the display unit ≠ the descriptor unit | **82 distinct (row, display unit) pairs**: `ZF.ZFFollowSpeed` max 9999 → `9999.000000000002` (m/min), `MC.ManuAcc` min 500 → `499.999` (inch/s²), `FCP.MaxAcc` min 1 → **0** (G, int truncation) | bounds are quantised *inward* to the editor's resolution and re-checked through `to_stored`, and `clamp_stored` runs on write |
+| U3 | a vendor value outside the descriptor range could not be represented, so opening and closing the row wrote the clamp back | **the file changed with no edit, no prompt and no undo**: `GRP.EdgeBoardSizeX/Y` hold `5.0` in this machine's `File/BkManuPara.xml` against a descriptor min of `50` → 5 became **50**, a 10× change. `Descriptor.validate`'s own docstring says vendor data is not guaranteed to satisfy min/max | new `PropertyGrid.stored_bounds` widens the range to contain the value the row already holds: the file is preserved, never "corrected" |
+| U4 | display rounding moved a value on a no-op open/commit | **15 rows of the real vendor files moved**: `MAC.Acceleration` 20000 → 19999.68 (G, 4 dp), `MC.XFastMoveAcc` 6000 → 5999.71; worst, an int row in a converted unit is unrepresentable — `FCP.MaxAcc` 20000 mm/s² = 2.0394 G, an int spin box can only offer `2` → **19613** (−2 %) | an editor closed without a change writes nothing (`_OPENED_AT`), and an int row in a converted unit gets a `QDoubleSpinBox` — the rule `display_text` already used |
+| W1–W3 | `io/params._atomic_write` | no directory `fsync` after `os.replace` (so a crash could lose exactly the ordering `write_params`'s docstring promises); `mkstemp`'s `0600` was carried onto the vendor file on **every save**, and the `.bak` took the temp file's mode rather than its source's; the verify refusal named no recovery path | `_fsync_dir` after every replace; the replaced file's mode is carried over and the backup inherits its source's; the refusal names the `.bak` |
+
+Re-derived in the same review and **found sound, now pinned**: `write_params` under a disk-full
+mid-write (old file *and* backup intact, no temp left behind), two saves in a row, a concurrent
+editor, and the vendor `BkLayerPara.xml` round-tripping byte-identically through `LayerFileBar`;
+the crafts editor leaving `compensate_type/width`, `pwm_enable`, `double170`, `double188` and the
+legacy lines untouched; the curve editor clamping a typed coordinate, locking on an unparsable
+curve and sorting a non-monotonic curve through the same code path the stream uses
+(`plan.pwm_schedule.CurveNodes.parse`), so the preview cannot diverge from what is streamed.
+
+*Residual, reported and deliberately not changed:* `LayerFileBar.save` / `ParamPage.save` do not
+surface `document.validate()` before writing. Blocking would be wrong — vendor files already
+violate their own schema, which is the whole of U3 — but a "N values outside their range" line on
+save would be an improvement (§5 task 10).
+
+* **Absent.** Hardware-page read-back of 50000/50200/59600+ (the daemon reads 50000/26 only, for
+  K, the bus cycle and ZFType); the vendor's `CSelectTechnologyDlg` preset browser over
+  `Technology/Fiber` and `Technology/CO2` (the pages use a plain file dialog; `list_technology`
+  already exists in `io/params`); a document-modified flag, so an edited job has to be saved
+  through File > Save (that belongs with the editing work of M2).
+* **Gate.** XML round-trip ✔. **New since the UI review:** opening and committing *every* editor
+  on *every* page over this machine's real `BkHardPara.xml` and `BkManuPara.xml` now leaves both
+  files byte-identical — before it, 15 values moved and two were changed by 10 % and −2 %.
+  "The Windows tool (under Wine) loads files saved by the port" ✘ — still not run. The technology
+  XML the page writes is byte-identical to a vendor preset except for the `CutFreq` the 13 shipped
+  CO2 presets lack, so it is the first candidate for Wine session H (§5 task 4).
 * **Known fidelity gap:** unknown attributes are dropped on rewrite (X7). X8/X9 (boost `nan`/`inf`
   spelling and the whole-literal number grammar) were closed on 2026-09-16.
 
@@ -258,9 +393,54 @@ the 750 mm/s ceiling of 48.4 pulses per 250 µs tick, so no overflow path is rea
   `LaserOnDelay = 0`, one `2001[t,3000]` wait record when it is not, and the gas delay as its own
   one-shot wait record — never the stationary ticks the port used to emit; and no start-from-rest
   profile at layer-2 parameters can put 4 pulses in 9 ticks at any carry.
-* **Still open:** the planner throughput gate (100 k contours in < 30 s) is **not met** — strict
-  xfail X13, numbers in §0. `build_job` also materialises every frame, so a job that size does not
-  fit in memory as frames at all.
+* **The planner streams** (previous phase). `plan.__main__.stream_job()` yields one `PackedFrame`
+  at a time and `build_job()` is a thin materialising wrapper over it, so every existing caller and
+  golden keeps working; `nexcut-plan` writes each frame as it is produced and `mccd.feeder.JobFeeder`
+  already took a lazy source. The tick → item → word → frame path is numpy array work
+  (`plan/items.carry_cells`, `plan/items.tick_words`, `mcc/fifo.FrameStream.push_uniform`) with a
+  scalar reference path below 256 ticks, held against the scalar loop over 1.1 M random ticks
+  (`tests/test_plan_vectorised_equivalence.py`) and against the vendor `autosave.chf` re-planning
+  to its recorded 1 277 frames / 126 089 ticks.
+  * **How close the two paths really are** — corrected by review finding R-V4, and this file used
+    to overstate it. They are **not** cell-for-cell identical. With *random* increments the grid
+    roundings are random and the running sums wander as √n, which is all the existing fuzz could
+    ever see; with a **constant** increment — a straight line at constant speed, the commonest
+    geometry there is — every tick gets the same rounding and the sums separate *linearly*:
+    **2 cells of 40 000 differ on a 1 m line, 372 on a 10⁶-tick diagonal**. What is guaranteed, and
+    now pinned, is the bound and not identity: the emitted position never differs from the scalar
+    loop by more than **one pulse (3.9 µm)** at any tick — a pulse displaced by one 250 µs cycle,
+    never dropped or duplicated — the totals are exactly equal, and the residual carry stays inside
+    `n · max|increment| · 2⁻⁴⁷`. That is smaller than the difference between this float64 model and
+    the vendor's own x87 80-bit arithmetic. Making the increments exact costs 74.7 → 166.7 ms per
+    10⁶ two-axis ticks (≈ +6.6 s on X13's projection) and was deliberately not taken.
+  * **Memory, re-measured for this report** in a fresh interpreter: a 3 000-contour job
+    (2 147 816 ticks, 21 877 frames, 6 491 455 words) grew the RSS by **+2.6 MB while streaming**
+    against **+197.7 MB** for the same job materialised as a frame list — a 76x gap that widens
+    with every contour. The previous phase measured the full 100 000-contour job (72.0 M ticks,
+    733 756 frames, 218 M words) streamed to `/dev/null` at a peak of **140.3 MB RSS**, of which
+    135.3 MB is the `.chf` document built before the run: planning and writing added **4.9 MB,
+    flat in job size**, where a frame list would need ~8 GB.
+
+**The streaming planner was then reviewed adversarially** (lens *silent numerical drift*,
+`tests/test_plan_vectorisation_review.py`, 32 tests). Two defects and one coverage hole, all
+closed; the drift itself is R-V4 above:
+
+| # | Defect | Effect before the fix | Fix |
+|---|---|---|---|
+| R-V1 | `JobFrameStream.motion` emitted the records the wrapped builder had queued **after** the ticks | a caller that writes the prologue and then asks for the move got `3000 3000 3000 …` where the scalar path gives `3001 3002 3000 3001 9999 103 2001 …`: the `3002` mode word, the gas/laser `9999` DO records, the ZF `103` cut-height move and its `2001` follow wait all landed *behind* the cut they must precede — with `laser_records=True`, the laser switched on after the contour was cut. Not reachable from `_job_frames`, which drains explicitly, but it is public API | `yield from self._drain()` at the head of `motion` |
+| R-V2 | `tick_words` named a different tick and a different axis from `tick_item` for the same overflowing run | both raise `ValueError`, so diagnostic only — but "which tick overflowed" must not depend on which path ran | earliest offending tick, dY before dX, hot path unchanged |
+| R-V3 | `FrameStream.push_uniform` accepted a laser mask of the wrong length | too short → `IndexError` out of `np.cumsum`; too long → frames charged `laser_items` from the wrong records (metadata only: safety re-derives laser content from the words) | `ValueError("<k> laser flags for <n> records")` |
+| R-V5 | **coverage hole**: no vendor byte had ever been compared against the *production* path | `tests/test_plan_items_golden.py` re-encodes the 22 leaked frames through `JobStreamBuilder` + `FramePacker` — the *definition* path. What a job actually streams is `JobFrameStream` + `push_uniform`, and the goldens would have stayed green straight through R-V1 | frames 0x1f8, 0x39 and 0x279 now reproduce **byte-identically through the production path**; all three failed before the R-V1 fix, and no tolerance was widened anywhere |
+
+Re-derived independently in that review with **no defect found**: pulse totals on a 1 m line, a
+10 000-segment polyline, a 10⁶-tick diagonal and a 10⁶-tick reversal (each exactly
+`trunc(net_mm · pulses_per_mm)`, and cutting one move into 10 000 separate quantiser calls gives
+identical cells); a 1.5 M-tick differential fuzz over ten shape families with an independent
+generator and seeds (0 mismatches); the 300-word rule for record widths 1…300 with partial laser
+masks; and 200 random jobs through `JobFrameStream` versus `JobStreamBuilder.frames`.
+* **Still open:** the planner *throughput* gate (100 k contours in < 30 s) is **not met** — strict
+  xfail X13, numbers in §0. It is **194 s** in this report's run instead of 461–520 s, and the
+  remaining cost is per-contour numpy dispatch in the geometry stages, not the item path (§2).
 * **Port-only safety rules added by the plan review:** glyph gaps > 0.01 mm raise an error; runs of
   dropped segments are filled from the global clock.
 
@@ -277,41 +457,44 @@ the 750 mm/s ceiling of 48.4 pulses per 250 µs tick, so no overflow path is rea
 
 ---
 
-## 2. Strict xfails (4)
+## 2. Strict xfails (3)
 
 Each documents a known divergence. Fixing one turns the test into an XPASS failure, which forces the
-marker to be removed — so this list cannot rot.
+marker to be removed — so this list cannot rot. **Never relax one to make a run green**; a strict
+xfail is the project's record that a gate is not met.
 
-Nine of the original thirteen were closed on 2026-09-16 and are ordinary passing tests now: **X1**,
+Ten of the original thirteen were closed on 2026-09-16 and are ordinary passing tests now: **X1**,
 **X2** (the A9 re-trace of the dwell builder and the look-ahead core), **X3**, **X4**, **X5** (D9,
-D11, D12 decided and implemented), **X8**, **X9** (boost double spelling and the whole-literal
-number grammar), **X10** (spline sampling honours the chord step), **X12** (vectorised `.chf` token
-reader). What remains:
+D11, D12 decided and implemented), **X6** (D14: a non-empty v2–v4 reserved line is kept in
+`ChfDocument.legacy_reserved` and re-emitted verbatim), **X8**, **X9** (boost double spelling and
+the whole-literal number grammar), **X10** (spline sampling honours the chord step), **X12**
+(vectorised `.chf` token reader). What remains:
 
-| # | Test | Sharpened reason | Resolved by |
+| # | Test | Sharpened reason, with this report's numbers | Resolved by |
 |---|---|---|---|
-| X6 | `test_io_fidelity_review::test_legacy_reserved_lines_with_content_are_not_lost` | `.chf` v2–v4 reserve one line per graph that the reader skips unread (03 §9). No shipped sample puts content there, so it is not known whether the vendor ever writes any — the port silently drops what it cannot model. This is a **design choice waiting to be made**, not a missing measurement: keep the bytes in a model slot, or reject such a file loudly | a decision (§4 `.chf`-legacy), optionally informed by a Wine write test |
-| X7 | `test_io_fidelity_review::test_unknown_attribute_survives_rewrite` | Unknown XML attributes are dropped on rewrite. ParaModule's set-value path (`0x10010cdf` FindElem/AddElem/SetAttrib) keeps a CMarkup DOM and *may* preserve them — UNVERIFIED, and it decides whether a file round-tripped through the port loses data a future vendor version added | Wine session H: add an attribute, load and re-save in Mlaser, diff |
-| X11 | `test_import_ui_fidelity_review::test_open_50k_separate_dxf_lines` | 50 k separate `LINE` entities take ≈ 8.2 s against a 3 s budget, of which ≈ 4.5 s is the ezdxf document build alone. No amount of tuning the port's own gates gets under the budget; it needs a reader that never builds an ezdxf document | performance work: a streaming DXF entity reader (§5 task 7) |
-| X13 | `test_perf_planner::test_100k_contour_job_plans_in_under_30_s` | PORT-PLAN §8.3: 100 k contours project to 478–507 s against 30 s, measured linearly at 62/250/1000 contours (675 ticks/contour throughout). Dominated by per-tick object construction in `plan/items.py` + `mcc/fifo.py` at **7.08 µs/tick** (67.5 M ticks = 4.7 h of machine time); geometry alone is 1.35 ms/contour ≈ 135 s, also over budget. A second, harder limit: 202 M words of frames cannot be held in memory, so the fix is a streaming, numpy-vectorised item path — not a constant factor | performance work (§5 task 6) |
+| X7 | `test_io_fidelity_review::test_unknown_attribute_survives_rewrite` | **The only one of the three that is a fidelity gap rather than a speed gap, and the only one no amount of work here can close.** Unknown XML attributes are dropped on rewrite. ParaModule's set-value path (`0x10010cdf` FindElem/AddElem/SetAttrib) keeps a CMarkup DOM and *may* preserve them — which decides whether a file round-tripped through the port loses data a future vendor version added. It cannot be settled by reading the disassembly further: the answer is a diff of two files the vendor tool wrote | **§5 task 4, Wine session H, question H-3**: add an attribute, load and re-save in Mlaser, diff. One afternoon, no machine |
+| X11 | `test_import_ui_fidelity_review::test_open_50k_separate_dxf_lines` | **Not a DXF problem any more.** 50 000 separate `LINE`s open + fit + paint in **5.18 s** against the 3.08 s budget (3 s × `speed_factor` 1.03). Of that: `ops/import_gates.apply_import_gates` + `ops/sort` **3.39 s (65 %)** — `sort._nearest` ~45 %, `merge_connected` ~27 %, `remove_overlaps` ~10 % of the gate time; the canvas build/fit/paint ~1.0 s (~19 %); the streaming parse **0.80 s (15 %)**, down from ezdxf's 3.22–3.63 s. The `.chf` control case in the same run (50 000 separate contours, 2.38 s) passes, which is the proof that the machine was at budget speed | **§5 task 7**: the same vectorise-the-per-item-Python-path treatment the reader just had, applied to `ops/import_gates.py` + `ops/sort.py`. No capture, no owner |
+| X13 | `test_perf_planner::test_100k_contour_job_plans_in_under_30_s` | PORT-PLAN §8.3: 100 k contours project to **194 s** against 30 s, i.e. **6.5x**, down from 461–520 s (**15–17x**). The *memory* half of this entry is **closed** — the planner streams, so a job of any size costs ~2.6 MB of frames instead of the ~8 GB `build_job` used to demand — and so is the item path, which is 5.4x faster and now costs 47 s of the 194. What is left is **per-contour numpy call overhead in the geometry stages**: the inter-contour rapid plan 55 s, `lookahead.plan_velocity` 30 s, the rapid stream 25 s, `sampler.sample_plan` 18 s, everything else 24 s. A one-segment contour is ~675 ticks and each stage makes tens of small array calls on it at ~1–3 µs each whatever the length, so the next factor has to come from planning **many contours in one array pass** | **§5 task 8**: batch `plan/lookahead.py`, `plan/junction.py`, `plan/scurve.py` and the rapid planner. No capture, no owner |
 
 ---
 
 ## 3. UNVERIFIED inventory, grouped by what resolves each item
 
-247 `UNVERIFIED` lines live in `src/` and `tools/m1_session.py`. They fall into seven groups, and the
-only thing that matters operationally is **which single activity clears each group**:
+**261 `UNVERIFIED` lines** live in `src/` and `tools/m1_session.py`. They fall into eight groups,
+and the only thing that matters operationally is **which single bench or Wine step clears each
+group** — so the table below is sorted by that, and the last column points at the §5 task that
+does it. Five of the eight groups are cleared by exactly two sessions.
 
-| Group | Activity that resolves it | Needs the owner? | Needs the machine? | Blocks |
-|---|---|---|---|---|
-| §3.1 | **M1 bench session**, native steps 1–7 and 10 (`tools/m1_session.py` + `docs/M1-BENCH-SESSION.md`) | yes | yes | M1 sign-off, D2, D7-open, homed soft limits |
-| §3.2 | **M1 bench session, step 8** — FIFO tick period (vendor dry run preferred; native `run-job` optional) | yes | yes | M4 gate 2, O1, reg-1016 units |
-| §3.3 | **M1 bench session, step 9** — vendor Pause/Continue/Stop, and the A/B item stream | yes | yes | N2, planner fidelity, M4 gate 1 |
-| §3.4 | **Session E** — a real cut with the laser on, after M1 and D13 | yes | yes | M5 |
-| §3.5 | **Capture G** — fibre source and height follower | yes | yes | M6 |
-| §3.6 | **Wine session H** — vendor tool under Wine, **machine not needed** | yes (their Wine prefix) | no | M2 sort gate, M3 gate, X7, most import/XML questions |
-| §3.7 | **Static re-trace** — disassembly, desk work, anyone can do it | no | no | planner fidelity details |
-| §3.8 | **Port choices** — no capture settles them; they are design parameters | no | no | nothing; revisit as design |
+| Group | The step that resolves it | Needs the owner? | Needs the machine? | Blocks | §5 task |
+|---|---|---|---|---|---|
+| §3.1 | **M1 bench session**, native steps 1–7 and 10 (`tools/m1_session.py` + `docs/M1-BENCH-SESSION.md`) | yes | yes | M0's last gate item, M1 sign-off, D2, D7-open, homed soft limits | **1** |
+| §3.2 | **M1 bench session, step 8** — FIFO tick period (vendor dry run preferred; native `run-job` optional) | yes | yes | M4 gate 2, O1, reg-1016 units, O6's FIFO half | **2** |
+| §3.3 | **M1 bench session, step 9** — vendor Pause/Continue/Stop, and the A/B item stream | yes | yes | N2, planner fidelity, M4 gate 1(a) | **2** |
+| §3.6 | **Wine session H** — the vendor tool under Wine, **machine not needed**; the largest group and the cheapest to run | yes (their Wine prefix) | no | M2 sort gate, M3 gate, X7, most import/XML questions | **4** |
+| §3.4 | **Session E** — a real cut with the laser on, after M1 *and* a signed-off D13 | yes | yes | M5 | after 1–3, 5 |
+| §3.5 | **Capture G** — fibre source and height follower | yes | yes | M6 | after 1–3 |
+| §3.7 | **Static re-trace** — disassembly, desk work, anyone can do it | no | no | planner fidelity details | 10 |
+| §3.8 | **Port choices** — no capture settles them; they are design parameters | no | no | nothing; revisit as design | — |
 
 ### 3.1 M1 bench session, native steps 1–7 and 10
 
@@ -450,6 +633,14 @@ fixes the broken M2 gate reference** (§1.3).
 
 **UI** (screenshots): layer colours, marker look and sizes, canvas bed 1300×900 at the origin, background colour.
 
+**Property-page editor bounds** (new, from the UI review): whether the vendor's own editor for a
+u32 row (`SP.MachineID`, `SP.DataCardID`, `SP.CommandID`, `SOP.JoystickID1..5`,
+`SOP.MonitorStartID/EndID`) accepts a value above 2³¹−1, or writes it signed as
+`SOP.JoystickID2 = "-684904636"` in this machine's file suggests. The port clips those editors to
+the `QSpinBox` window (§3.8) and preserves whatever the file holds; the vendor's behaviour decides
+whether that clip is right. Also: what the vendor does when a file holds a value outside a
+descriptor's own min/max (the port keeps it, U3).
+
 **i18n:** first duplicate id wins; English as the fallback column; a merge-recovered record loses (`ui/i18n.py`).
 
 **Planner parameter defaults:** AddTime/Is4Freq when absent; the `p9` ctor default; the node-string `"0,48,…"` parsing and the empty-string rule (`plan/params.py`, `pwm_schedule.py`).
@@ -457,18 +648,21 @@ fixes the broken M2 gate reference** (§1.3).
 ### 3.7 Static re-trace — disassembly, desk work
 
 * Rapid planner call (A6 §1.4).
-* What `CADMODULE_NODE_FACTOR` 0.99 multiplies.
 * S-curve `0x1000eeb0` with no speed change; last-phase evaluation past T; sample order (`plan/scurve.py`).
 * x87 precision control of `round_half_away` (53-bit assumed).
 * HAL address-filter interval ends (`registers.vendor_would_send`).
 * Dissector ladder grouping heuristics (`LADDER_GAP_S`, `max_rung`).
 * Gating of `[9999,16]` (N6). DENY until then.
-* **Done in this phase:** the look-ahead core (A9) and the dwell builder `0x4427e0` (A9 §2). Two
-  corrections they produced still have to be written into `docs/analysis/05-motion-pipeline.md`:
-  §7.4 names `0x100114d0`, which is MotionCtrl.dll's build of the core and **not** the one a cut
-  runs (the cut path is CADModule `0x100fdc50`, reached from plan `0x100fffe0`), and §7.2's "0.99
-  factor" is a `VelDecc.txt` logging filter on the per-piece speed factor, not a multiplier on node
-  speeds.
+* **Done in this phase:** the look-ahead core (A9) and the dwell builder `0x4427e0` (A9 §2), and
+  both corrections they produced are now **written into** `docs/analysis/05-motion-pipeline.md`
+  (previous phase): §7.4 says the cited `0x100114d0` is MotionCtrl.dll's build of the core and that a
+  cut runs CADModule's `0x100fdc50` (reached from plan `0x100fffe0`), and §7.2 carries a marked
+  correction block saying the `0.99` at `.rdata:0x101116d0` is the **threshold of the
+  `VelDecc.txt` log**, compared against the per-piece speed factor — it multiplies nothing. The
+  open question "what does `CADMODULE_NODE_FACTOR` multiply?" is therefore answered and gone from
+  the list above; `plan/lookahead.py` says so at the constant. One small fidelity gap is left
+  and documented there: `format_veldecc()` writes a line per node, while the vendor writes one
+  only for a node whose piece factor is below 0.99.
 
 ### 3.8 Port choices — no capture resolves them
 
@@ -479,6 +673,13 @@ discovery.
 * **D4:** timeouts of 150 ms; poll periods 90 ms / 1 s / 1 s / 10 s.
 * **D6:** deadman 200 ms; pendant silence 1040 ms.
 * **D12:** the 1 s card-lock re-assert period (`_CARD_LOCK_RECHECK_S`, added by review R13).
+* **`ui/property_grid.INT32_MIN` / `INT32_MAX` as the editor bound for a u32 descriptor** (UI
+  review U1). A value above 2³¹−1 in a vendor file is still *preserved* and *shown* — `stored_bounds`
+  widens the range to contain it — but it cannot be typed in. Settle in Wine session H (§3.6).
+* **`ui/property_grid._QUANTISE_STEPS = 4`** — how far a descriptor bound may be stepped inward to
+  become representable in the editor's own resolution (UI review U2). Bounded by construction.
+* **`tools/wine_session_h.sh` `WINE_USER` fallback chain** (`$USER` → `$LOGNAME` → `id -un`).
+  Cosmetic: it only builds a log-path hint.
 * Timers: supervisor/service period 20 ms; `home_timeout_ms` 120 s; reconnect period.
 * TUI key-repeat windows (`--hold-initial-ms` 700, `--repeat-gap-ms` 150).
 * `m1_session` bounds: step ≤ 10 mm, speed ≤ 50 mm/s, hold ≤ 3 s.
@@ -493,10 +694,12 @@ discovery.
 
 ## 4. Design decisions: what is closed, what is still open
 
-### 4.1 Closed and enforced (`docs/DECISIONS.md` D1–D12)
+### 4.1 Closed and enforced (`docs/DECISIONS.md` D1–D12, D14, D15)
 
-All twelve entries are **decided**. Three of them were the open ones a phase ago (D9, D11, D12) and
-are closed in code; five carry amendments written by the safety reviews of this phase.
+Fourteen of the fifteen entries are **decided**; **D13 (laser arming) is written but `proposed`
+and unsigned**, see §4.2 — it is the only one of the fifteen that blocks a milestone. Three of the
+decided ones were the open questions a phase ago (D9, D11, D12) and are closed in code; five carry
+amendments written by the safety reviews, and D15 is new this phase.
 
 | Id | Decision, in one line | Amended this phase |
 |---|---|---|
@@ -512,104 +715,148 @@ are closed in code; five carry amendments written by the safety reviews of this 
 | D10 | Motion epoch: nothing queued before a stop may be sent after it | — |
 | D11 | **No letter key starts motion; the key table is data** | survived an exhaustive re-review (112 keys × 4 modes × case) unchanged |
 | D12 | **One master per card: an advisory lock keyed by the card address** | yes — **R13** re-assert every 1 s, **R14** directory/file ownership, **R15** address normalisation, and the cases a lock provably cannot see |
+| D14 | **`.chf` v2–v4 reserved lines are kept verbatim in a model slot; nothing is rejected** | decided 2026-09-16, implemented in `io/chf.py` + `model/graph.py` (`legacy_reserved*`), closes strict xfail X6 |
+| D15 | **A parameter file changes only where the operator changed it**: an editor that is opened and closed writes nothing, a bound is never allowed to store what the schema rejects, and a vendor value outside its own descriptor range is preserved rather than "corrected" | **new — decided 2026-09-16** by the UI review (U1–U4, W1–W3); implemented in `ui/property_grid.py` and `io/params.py` (§1.4) |
 
 ### 4.2 Still open
 
 | Id | Question | Blocks | What decides it |
 |---|---|---|---|
-| **D13** | Laser arming: the IPC shape, the job token it must quote, the operator confirmation, the auto-disarm rule. D5 says `LASER_ARMED` needs its own entry | **all of M5** | write the entry first — this is the one open decision that gates a whole milestone, and no measurement is needed to make it |
+| **D13** | Laser arming: the IPC shape, the job token it must quote, the operator confirmation, the auto-disarm rule. D5 says `LASER_ARMED` needs its own entry | **all of M5** | **written 2026-09-16 and marked "proposed — needs the owner's sign-off before implementation"** (`docs/DECISIONS.md` D13). No M5 code exists or may exist until it is signed off; §4 of the entry also depends on the audit-log bound of §5 task 9 (a laser-arming incident review needs a log that can be kept). Signing it off is §5 task 5 |
 | D7-open | May the operator jog off a pressed hard limit while `alarm_1 ≠ 0`? The gate refuses all non-ALWAYS writes in that state | M1 step 7 sign-off | 11 §7 step 7: press each limit, read 1006 and 2000+10·slot, then decide |
 | D2-follow | Set `position_counts_per_mm` and flip `position_scale_verified` | homed soft limits, absolute moves | measured values from steps 3/4 only |
-| M2-gate | The `ManuContour`/`SortType=4` gate has a wrong premise and must be replaced by a vendor-sorted reference | M2 sign-off | Wine session H: Sort, save, commit the order as a golden |
-| M2-render | Accept "IoU ≥ 0.9 **and** chamfer = 1.0 against an asymmetric control" as the meaning of "renders identically" | M2 sign-off | amend PORT-PLAN §4 M2 wording, or build a DDA reference rasteriser |
+| M2-gate | The `ManuContour`/`SortType=4` gate has a wrong premise and must be replaced by a vendor-sorted reference | M2 sign-off | Wine session H (§5 task 4): Sort, save, commit the order as a golden; then rewrite the gate (§5 task 6) |
+| M2-render | Accept "IoU ≥ 0.9 **and** chamfer = 1.0 against an asymmetric control" as the meaning of "renders identically" | M2 sign-off | amend PORT-PLAN §4 M2 wording, or build a DDA reference rasteriser (§5 task 6) |
 | Daemon language (R8) | Keep the Python `mccd`, or move it to Rust/C++ | R8 retirement | **provisionally answered "keep Python"**: the §8.3 jitter gate passes on the simulator with margin (§0). Re-open only if the real card's tick period turns out much shorter than 250 µs (O1, step 8) |
-| Streaming planner | `build_job` materialises every frame; 100 k contours need a generator (X13) | M4 at production sizes | vectorise the tick → item → word → frame path and yield frames into `JobFeeder`, which already takes a generator. The shape is decided; the work is not done |
-| `.chf` legacy (X6) | Keep non-empty v2–v4 reserved lines in a model slot, or reject such a file | interchange | a decision; no measurement will make it for us |
 | D9 residual | Close the `_release_arming` window (a new client can arm between `_arm_owner = None` and `_disarm_and_stop`), or keep it | nothing — the failure direction is fail-safe | closing it needs card I/O under `MccDaemon._lock`; deliberately not done |
 
 ---
 
-## 5. Next 10 tasks, in priority order
+## 5. The next ten tasks, in priority order
 
-### Needs the owner at the machine
+**What the last phase closed**, so nobody repeats it: the streaming, numpy-vectorised planner item
+path (old task 6 — memory solved, 2.4x end to end, X13 still open on the geometry stages); the
+streaming DXF reader (old task 7 — the parse is 4–5.8x faster, X11 still open on the import gates);
+D13 written and marked *proposed* (old task 8); the five remaining M3 property pages plus the curve
+and crafts editors (old task 9); the A9 doc corrections, D14/X6, `arm_owner` in the status snapshot
+and the m1-session re-arm (old task 10).
 
-1. **Run the M1 confirmation session, native steps 1–7 and 10** (`tools/m1_session.py`,
-   `docs/M1-BENCH-SESSION.md`). Laser PSU key off, gantry mid-bed, hand on the E-stop, tcpdump
-   running. Settles K, the bus cycle, block 5000, O6's jog half, bit 31, the stop profile, the home
-   vector, O8 polarity and exception 2 — the whole of §3.1. The only prerequisite left is a
-   simulator rehearsal (`M1-BENCH-SESSION.md` §2); D9/D11/D12 are closed in code and the runbook
-   matches the code as of this report.
-2. **Steps 8 and 9 with the vendor tool, in the same session.** The dry-run 100 mm X move with reg
-   1015/1016 read before and after the first frame gives the tick period (O1) and the reg-1016 units;
-   Pause/Continue/Stop gives N2. **Save the vendor frame stream of a drawing that also exists as
-   `.chf`** — that single artefact is what turns M4 gate 1 from "geometry matches" into a real item
-   diff, and it is the only thing §3.3 cannot get any other way. Optionally run `nexcut-mccd run-job`
-   natively too: it closes O6's FIFO half, and it is the first time the port streams onto the card.
-3. **Measure the M1 gate itself:** a 100 mm X move against a ruler (0.1 mm), homing repeatability,
-   and read-back counts/mm — then set `position_counts_per_mm` and `position_scale_verified` (D2).
-   Without this, homed soft limits and absolute moves stay unavailable by design.
-4. **Dissect the captures into `docs/analysis/11-capture-findings.md`**, then push the results into
-   `mcc/registers.py`, the simulator, `core/config.py` and §3.1–3.3 of this file. The dissecting is
-   desk work; only the pcaps need the machine. This also closes the **last open M0 gate item**
-   ("the dissector decodes the first tcpdump capture"), which is the cheapest tick on the board.
+Three adversarial reviews then went over all of it, each with its own lens, and **every defect they
+found is fixed with a test that failed first**: twelve in the UI, write-back and operator tools
+(§1.4, plus the m1-session re-arm in §1.2 and the two Wine-kit fixes in task 4), three in the streaming planner plus one overstated
+claim and one coverage hole (§1.5), and **none at all** in the streaming DXF reader (§1.3) — which
+is itself a result, since that reader is the one that silently decides which of two code paths
+reads a customer's drawing.
 
-### Can be done without the machine
+The ten below are sorted by value, and grouped by **who has to be in the room**. A session with
+nobody but an agent starts at task 7; tasks 7–10 need neither the owner nor the machine and can run
+in any order.
 
-5. **Wine session H** — needs the vendor tool under Wine, **not the machine**, and it is the single
-   highest-yield desk task: it unblocks three separate gates at once.
-   * Sort `autosave.chf` with `SortType=4` and save it → a valid M2 sort reference (the current gate
-     is unmeetable as written, §1.3).
+### Needs the owner at the machine (tasks 1–3 — one bench session, about half a day)
+
+These three are one sitting, not three. They are the highest-value work in the project by a wide
+margin: between them they close M0's last gate item, the M1 sign-off, D2, D7-open and the whole of
+§3.1–§3.3, and they are the only source of the artefact task 2 produces. Everything else in this
+list is worth less than the first hour of this session.
+
+1. **Run the M1 confirmation session — native steps 1–7 and 10, tcpdump running.**
+   `tools/m1_session.py`, runbook `docs/M1-BENCH-SESSION.md`. Laser PSU key off, gantry mid-bed,
+   hand on the E-stop. The only prerequisite left is a simulator rehearsal (that runbook §2);
+   D9/D11/D12 are closed in code and the runbook was re-checked against the code for this report.
+   *Settles* K, the bus cycle, block 5000, O6's jog half, bit 31, the stop profile, the home vector,
+   O8 polarity, exception 2 — the whole of §3.1. *Produces* the first pcap of this machine, which
+   is also the last open M0 gate item.
+   **New since the last runbook read:** if the link to the daemon blips mid-step, the tool now asks
+   its own `y/N` before re-arming (the daemon has already stopped and disarmed the machine, D9), and
+   a `no` ends the step with nothing sent. Re-run just that step with `--steps N`.
+2. **Steps 8 and 9 in the same session, with the vendor tool.** The dry-run 100 mm X move with reg
+   1015/1016 read before and after the first frame gives the tick period (**O1**, the single most
+   load-bearing UNVERIFIED number in the planner) and the reg-1016 units; Pause/Continue/Stop gives
+   N2. **Save the vendor frame stream of a drawing that also exists as `.chf`.** That one artefact
+   is what turns M4 gate 1(a) from "the geometry matches" into a real item diff, and §3.3 cannot be
+   got any other way. Optionally run `nexcut-mccd run-job` natively too: it closes O6's FIFO half
+   and is the first time the port streams onto the card.
+3. **Measure the M1 gate itself, then dissect what the session recorded.** A 100 mm X move against
+   a ruler (0.1 mm), homing repeatability, read-back counts/mm → set `position_counts_per_mm` and
+   flip `position_scale_verified` (D2); without it, homed soft limits and absolute moves stay
+   unavailable *by design*. Step 7's limit readings answer D7-open. Then, at the desk (no machine,
+   no owner): write `docs/analysis/11-capture-findings.md` and push the results into
+   `mcc/registers.py`, `mcc/simulator.py`, `core/config.py` and §3.1–§3.3 of this file.
+
+### Needs the owner at the keyboard, but not at the machine (tasks 4–6)
+
+4. **Wine session H.** The single highest-yield desk task: the vendor tool under Wine, an
+   afternoon, and it unblocks three gates at once.
+   * Sort `autosave.chf` with `SortType=4` and save it → a valid M2 sort reference. The current
+     gate is unmeetable as written (§1.3), so this replaces the reference rather than passing it.
    * Load port-written `.chf`, `Bk*.xml` and technology files → the M3 gate. Start with the
-     technology XML the CO2 page writes; it differs from a vendor preset only by `CutFreq`.
-   * Add an unknown attribute, load, re-save, diff → X7.
-   * Save the variants that answer the rest of §3.6 (import, XML, crafts, scan, i18n).
-6. **X13 — a streaming, numpy-vectorised planner item path.** Vectorise tick → item → word → frame
-   (`plan/items.py` + `mcc/fifo.FramePacker`) so `build_job` *yields* frames instead of
-   materialising a list. `mccd/feeder.JobFeeder` already consumes a generator, so this closes the
-   PORT-PLAN §8.3 planner gate **and** removes the multi-GB memory ceiling in one change. It is the
-   only thing between the port and a production-sized job, and it does not depend on any capture.
-7. **X11 — a streaming DXF reader.** 50 k separate `LINE` entities take ≈ 8.2 s against a 3 s
-   budget, ≈ 4.5 s of it inside ezdxf. Needs a reader that never builds an ezdxf document.
-8. **Write D13 (laser arming) before any M5 code exists.** The IPC shape, the job token it has to
-   quote, the operator confirmation, the auto-disarm rule. `mccd/feeder.py` already refuses to load
-   a job while `LASER_ARMED`; that refusal is the placeholder D13 replaces. Writing the decision
-   before the code is the whole point of the D-series, and M5 is blocked on it either way.
-9. **The rest of the M3 property pages**, on top of `ui/property_grid.py`: hardware, machining,
-   software and graph-rule pages; the fibre layer page (164 attributes, real pierce-stage editing,
-   the `A250607_*` fibre/CO2 selector warning); the power/frequency curve editor
-   (`PWMCurveNodes`/`FreqCurveNodes`); the crafts editor for per-contour lead-in/out and cool
-   points; and writing `BkLayerPara.xml` back from the dock, not only preset exchange.
-10. **The correctness and hygiene backlog** — each item is small, and each is a real gap:
-    * **Doc corrections from the A9 re-trace** (§3.7): `docs/analysis/05-motion-pipeline.md` §7.4
-      (the look-ahead core address a cut actually runs) and §7.2 (the 0.99 factor is a logging
-      filter, not a multiplier).
-    * **Decide X6** (`.chf` v2–v4 reserved lines: model slot or strict rejection).
-    * **`StatusSnapshot.arm_owner`**, so the TUI can say "ARMED (this session)" versus "ARMED
-      (another client)" — with R12 that distinction is now the difference between "you can move"
-      and "you cannot", and nothing surfaces it.
-    * **Re-arm after a reconnect in `tools/m1_session.py`.** `DaemonLink` reconnects lazily; a
-      reconnect silently drops both the arming and the right to move (D9/R12), so a step interrupted
-      by a link blip fails with an `arming` refusal the operator has to decode.
+     technology XML the CO2 page writes: it differs from a vendor preset only by `CutFreq`.
+   * Add an unknown attribute, load, re-save, diff → **X7**, the only strict xfail that is a
+     fidelity gap rather than a speed gap.
+   * Answer the rest of §3.6 (import, XML, crafts, scan, i18n) and the two new editor-bound
+     questions the UI review raised.
+
+   The kit is written and tested: `docs/WINE-SESSION-H.md` and `tools/wine_session_h.sh` (prepares
+   the prefix, `--dry-run` creates nothing, never writes into the vendor package — 11 tests). Since
+   the UI review the script also recovers from an interrupted copy and no longer aborts when `$USER`
+   is unset. What is missing is the session itself.
+5. **Sign off, amend or reject D13 (laser arming).** It is written (`docs/DECISIONS.md` D13) and
+   marked *proposed*; **no M5 code exists or may exist until the owner signs it**, and M5 is the
+   milestone the machine actually exists for. Reading it takes twenty minutes; §2's eight checks and
+   §3's eleven auto-disarm events are where the argument is. Note that §4 of that entry depends on
+   task 9 (the audit log has to be boundable before an arming incident can be reviewed).
+6. **Settle the two M2 gate wordings** (`docs/PORT-PLAN.md` §4 M2, and §4.2 of this file). One is a
+   decision only the owner can make — accept "IoU ≥ 0.9 **and** chamfer 1.000 against an asymmetric
+   control" as the meaning of "renders identically", or pay for a DDA reference rasteriser. The
+   other falls out of task 4: with a vendor-sorted job in hand, rewrite the `ManuContour` /
+   `SortType=4` half of the gate against a reference that exists.
+
+### Can be done without the owner and without the machine (tasks 7–10)
+
+7. **X11 — vectorise `ops/import_gates.py` and `ops/sort.py`.** The 50 000-`LINE` import is 5.18 s
+   against a 3.08 s budget and **3.39 s of it is these two modules** (§2). `sort._nearest` is ~45 %
+   of that, `merge_connected` ~27 %, `remove_overlaps` ~10 %. It is the same work the DXF reader
+   just had — one array pass instead of one Python object at a time — and the 50 000-contour `.chf`
+   control case (2.38 s, passing) is the ready-made check that a change did not simply move the
+   cost. Closing this closes the last performance item in M2.
+8. **X13 — plan many contours in one array pass.** 194 s against 30 s (§2), and the item path is
+   already done: what is left is the inter-contour rapid plan (55 s), `lookahead.plan_velocity`
+   (30 s), the rapid stream (25 s) and `sampler.sample_plan` (18 s), all of it per-contour numpy
+   *call* overhead in `plan/lookahead.py`, `plan/junction.py`, `plan/scurve.py` and the rapid
+   planner. Larger and riskier than task 7 — these are the files the vendor goldens pin — so do it
+   after task 7, and keep every golden byte-identical.
+9. **Bound the audit log and the simulator's request list.** `SafeMccClient.write_log` keeps a
+   298-word tuple plus the 1 206 frame bytes for every FIFO frame (~10 kB each) and is trimmed only
+   opportunistically by the daemon watchdog, so a streaming job sits at tens of MB; a compact record
+   for `0x66`, or a cap inside `safety.py`, is the fix. **D13 §4 depends on this** — a laser-arming
+   incident review needs a log that can be kept. `CardSimulator.requests` grows the same way
+   (~60 MB over a ten-minute gate run); a ring buffer makes long simulator runs cheap.
+10. **The correctness and hygiene backlog.** Small, independent, each worth doing when passing by:
+    * **Re-run the under-load sweep** on this tree (§6): the last one was the previous phase's
+      1 571 tests, and 172 have been added since.
     * **Give `nexcut-mccd run-job` a retry for one poll period.** Two runs in quick succession are
       refused with `busy: axis status not refreshed since the last motion command`: `_require_ready`
       wants a 2000/50 poll newer than the last motion write, and a FIFO program start is not a jog.
-      Either exempt `start_job` from that particular gate or retry in the CLI, as
+      Either exempt `start_job` from that gate or retry in the CLI, as
       `tests/test_mccd_job.start_job()` already does.
+    * **Warn on save when values are outside their range.** `LayerFileBar.save` / `ParamPage.save`
+      do not surface `document.validate()`. Blocking would be wrong (vendor files already violate
+      it — that is U3), but a "N values outside their range" line would be an improvement.
     * **A test that every key named in the TUI's two hand-written footer lines is in
-      `KEY_BINDINGS`.** Only the `?` overlay is generated from the table today, so the footer can
-      drift away from D11's single source of truth.
-    * **Bound the audit log.** `SafeMccClient.write_log` keeps a 298-word tuple plus the 1206 frame
-      bytes per FIFO frame (~10 kB each) and is trimmed only opportunistically by the daemon
-      watchdog, so a streaming job sits at tens of MB. A compact record for `0x66`, or a cap inside
-      `safety.py`, is the fix.
-    * **`CardSimulator.requests` grows without bound** (~60 MB over a 10-minute gate run); a ring
-      buffer makes long simulator runs cheap.
+      `KEY_BINDINGS`.** Only the `?` overlay is generated from the table, so the footer can drift
+      away from D11's single source of truth.
     * **Expose `LaserOffBeforeDelay` / `LaserOffAfterDelay` on `plan/pwm_schedule.LayerLaser`** —
       both are absent from this machine's CO2 XML, so `build_job` passes 0 today, and the schema
       already carries them (pd137/pd138).
     * **Rename the two tests in `tests/test_plan_fidelity_review.py` that still carry splice wording
       in their names** (`test_prologue_dwell_is_14_stationary_ticks_in_frames_0x39_0x3a`,
       `test_vendor_cut_start_kinematics_frame_0x3a`); their docstrings are already corrected.
+    * **`plan/lookahead.format_veldecc()`** writes a line per node; the vendor writes one only for a
+      node whose piece speed factor is below 0.99 (A9 §1). Documented at the function, not fixed.
+    * **The consumers session H's artefacts need** (`docs/WINE-SESSION-H.md`): the `SortType`
+      goldens in `tests/test_ops_sort.py`, the vendor-re-saved files as byte-identity samples, the
+      X7 verdict, and a `session_h_dir` fixture (`NEXCUT_SESSION_H`, skip when absent) beside
+      `src_dir`. Write these *before* task 4, so the session's output has somewhere to land.
 
 ---
 
@@ -658,20 +905,57 @@ got `[1, 2]`, deterministically red — the closing `0x67 ← [3]` / `[1]` are s
 | `test_r1_stop_reaches_card_after_long_comm_loss_despite_refreshing_client` snapshotted the healthy-refresh count *after* observing `LINK_LOST` | The snapshot is taken before the link is cut, which is healthy by construction |
 | `test_watchdog_simulator_drop_disarms_and_stops` asserted `DISARMED` the instant it saw `LINK_LOST` | Wait for `DISARMED` with a 3 s deadline |
 | The `.chf` open budget still missed by 11 ms under load: the pure-interpreter calibration reported 2.32x while the Qt + file-I/O path had slowed by 3.2x | `LOAD_HEADROOM = 1.5` in `tests/conftest.py`, applied to the *excess* over 1.0, so a machine at the reference speed still gets the exact 3 s gate |
-| `start_job` for a second job right after the first is refused until the next 2000/50 poll (~90 ms) lands | `tests/test_mccd_job.start_job()` retries while the daemon answers `busy`, which is what a real client has to do. The CLI does **not** yet — §5 task 10 |
+| `start_job` for a second job right after the first is refused until the next 2000/50 poll (~90 ms) lands | `tests/test_mccd_job.start_job()` retries while the daemon answers `busy`, which is what a real client has to do. The CLI does **not** yet — §5 task 10 (hygiene backlog) |
 
 Under that sweep the suite was run three times end to end with every core busy and once under
 `pytest-xdist -n 4`, plus five repeats of the sixteen timing-sensitive files. The under-load
 slowdown those runs saw was 2.3x on the pure-interpreter calibration and up to 3.2x on the Qt +
 file-I/O paths.
 
+The integration sweep of 2026-09-16 repeated it on the merged tree with four spin loops on four
+cores: the full suite **1571 passed, 3 xfailed** twice (332.08 s and 332.19 s against 212.8 s
+idle, 1.56x), and `tests/test_mccd_*.py` + `tests/test_perf_*.py` **186 passed, 1 xfailed** five
+times (114.50 / 116.69 / 114.14 / 116.89 / 116.26 s). Nothing flaked in those seven runs after
+the three fixes in the table above.
+
+### What the 2026-09-16 integration sweep changed
+
+The four parallel tasks of this phase landed in one tree; the integration pass re-ran everything,
+swept it under load again and fixed what moved. Three defects, all of them in the "measures the
+runner, not the port" family except the last, which was a real race in the simulator:
+
+| Finding | Fix |
+|---|---|
+| Three wall-clock budgets in `tests/test_import_ui_fidelity_review.py` were still raw `assert elapsed < 3.0` (`test_import_of_many_circles_is_fast`, and `test_nearest_sort_is_not_quadratic` twice) while every other budget in the file went through `budget_s()`. They passed idle and failed with the cores busy | They go through `budget_s()` now and print their raw seconds next to the scaled budget, like the rest of the file |
+| `tests/test_mccd_job.py::test_a_starvation_alarm_at_the_end_of_the_drain_still_counts_as_done` failed once in a full CI-mode run: `drain_starvation_alarm` was `False`. **Not a test bug** — `CardSimulator._advance` raised the FIFO starvation alarm only when it had tick *budget left over* after emptying the queue, so whether the card alarmed at all depended on a status read landing inside the one 0.2 ms tick in which the queue emptied exactly | The simulator alarms when the running queue is empty after a step, which is what the card does ("FIFO empty at the instant it consumes the last item", 11 §7 step 8) and what `mccd/feeder._note_depth` already documents. Deterministic, and one tick earlier than before |
+| `ui/app.py` built `MainWindow` without `param_paths`, so Save in the five M3 docks asked for a path even when `--layer/--manu/--hard` had named one — an integration gap between the new pages and the CLI that no test covered | `app.main` passes the three paths through; `tests/test_ui_main_window.py::test_app_main_hands_the_parameter_paths_to_the_docks` pins it |
+
+### What this report's runs showed (2026-09-16, third review pass)
+
+Everything in §0 was re-run for this report on an idle laptop, one thing at a time, so no gate
+number is contaminated by another gate: the full suite with the vendor package (**1676 passed,
+3 xfailed, 224.44 s**), the same suite in CI mode (**1540 passed, 136 skipped, 3 xfailed,
+212.00 s**), `ruff` (**All checks passed!**), then `tests/test_perf_planner.py`, the 120-second
+form of `tests/test_perf_streaming.py` and the import budgets of
+`tests/test_import_ui_fidelity_review.py` separately. Nothing flaked in any of them.
+
+**What was *not* re-run: the under-load sweep.** The numbers in §0's third row are the previous
+phase's tree, 172 tests ago. The three review suites added since (`test_plan_vectorisation_review`,
+`test_io_dxf_stream_review`, `test_ui_safety_review`) contain no sleeps, no wall-clock budgets and
+no periodic-event assertions — they are pure computation, Qt-offscreen widget work and subprocess
+calls under the existing 120 s timeout — so nothing in them *should* be load-sensitive. "Should" is
+not "was measured", which is why the sweep is an explicit item in §5 task 10.
+
 ### One flake to watch
 
-`tests/test_m1_session.py::test_full_session_all_steps_on_sim` failed once during this phase, in a
-full run that shared the laptop with three other live pytest processes, and then passed 15/15 in
-isolation and at file level. `tools/m1_session.py` does not touch `JobFeeder`, so it is unrelated to
-the feeder changes — but it is the one test in the suite that has failed without a diagnosed cause,
-and it should be watched rather than assumed benign.
+`tests/test_m1_session.py::test_full_session_all_steps_on_sim` failed once in the previous phase, in
+a full run that shared the laptop with three other live pytest processes, and then passed 15/15 in
+isolation and at file level. It failed once more during this phase, in a run one reviewer made while
+another agent was writing `src/nexcut/plan/items.py` and the test files in the same tree — an
+explanation, not a diagnosis. It passed in every run made for this report, including both full
+suites. `tools/m1_session.py` does not touch `JobFeeder`, so it is unrelated to the feeder changes —
+but it remains the one test in the suite that has failed without a diagnosed cause, and it should be
+watched rather than assumed benign.
 
 `.github/workflows/ci.yml` runs `pytest -q -p no:cacheprovider --durations=15`, so a slow runner
 names the tests that ate the time instead of just timing out.

@@ -184,7 +184,7 @@ Current state per milestone, with the gate results actually measured, is in `doc
 ### M1 — "Hello machine": prove end-to-end control (smallest real-hardware step)
 Scope: connect over UDP, read version/status, decode positions, **jog one axis a few millimetres**, home. No laser, no job.
 
-*State (2026-09-16): every item below exists in software and passes against the card simulator; nothing has been run on the machine. See `docs/STATUS.md` §1.2 for the evidence and for the two adversarial safety reviews this code has been through.*
+*State (2026-09-16): every item below exists in software and passes against the card simulator; nothing has been run on the machine. See `docs/STATUS.md` §1.2 for the evidence and for the three adversarial safety reviews this code has been through. The last of them added one rule to the bench tool: after a link blip the operator is asked again before the tool re-arms, because the daemon has already stopped and disarmed the machine (D9 amendment).*
 1. Capture session first: the **M1-confirmation session** (`docs/analysis/11-static-findings.md` §7; replaces §6 sessions A–C). The jog/home/stop vectors and units are already recovered statically (§6.0); the capture confirms K, bit 31, the stop profile, firmware licence gating and limit polarity before the port drives an axis on its own.
 2. `mccd` v0: open socket, `READ 1000 n=2` (version ≥ `MinHardwareVer`), status poll, `READ 2000` positions, show alarm/DI/DO words raw.
 3. Jog / stop / home with the statically recovered vectors (`docs/analysis/11-static-findings.md` §2; A1). Units: speed and distance × K (K = reg 50017, expected 1000 → µm/s, µm), acceleration plain mm/s², jerk = 10·a. After connect, send `0x65 ← [9999, 5, 0, 0]` as the vendor does.
@@ -202,6 +202,7 @@ Scope: connect over UDP, read version/status, decode positions, **jog one axis a
 * DXF via ezdxf, `.chf` v4/v5, PLT, G-code → model; canvas with layers, start points, direction arrows, index numbers; measurement tool; open/save `.chf` (byte-identical re-save).
 * Import gates and one-key planning steps (sort strategies, lead-in defaults, auto micro-joint) as pure geometry.
 * Gate: all `Graph/Work*` and `File/autosave.chf` render identically to `tools/out/*.png`; a 24-contour job sorts to the same order as `ManuContour.dat` when using `GRP.SortType=4`.
+* *Gate status (2026-09-16, `docs/STATUS.md` §1.3): the render half passes on a **relaxed** metric (IoU >= 0.9 on all 8 samples with chamfer 1.000 against an asymmetric control; pixel-identical on 2 of 8 — Qt's rasteriser differs from the reference tool's integer DDA). The sort half is **unmeetable as written**: `ManuContour.dat` is `24, 0..23`, the array-copy order of `autosave.chf` (`GRP.Array*`), not a sort result, and no sort type reproduces it. Both halves are open decisions in `docs/STATUS.md` §4.2 and are settled by §5 tasks 4 and 6, not by more code. A third, unstated half turned out to matter as much: 50 000 separate DXF `LINE`s open, fit and paint in 5.18 s against the 3 s budget (strict xfail X11), and 3.39 s of that is `ops/import_gates` + `ops/sort`, not the reader.*
 
 ### M3 — Layers, parameters, hardware configuration
 * Schema-driven property grids (hardware, machining, software, layer fibre/CO2, graph rules) with units (`UN.*` display conversion), validation (`lp19`), enum labels from `lang.txt`.
@@ -212,7 +213,7 @@ Scope: connect over UDP, read version/status, decode positions, **jog one axis a
 ### M4 — Full job streaming in dry run
 * Planner (`plan/*`) producing ticks; `mcc/fifo.py` producing frames; `mccd` streaming with flow control; contour prologue/epilogue per 08 §4.4; break-point files; report rows; estimate dialog (`gp2000/2001`).
 
-*State (2026-09-16): the planner, the frame packer, `nexcut-plan` and `nexcut-mccd run-job` exist and stream a planned job into the simulator end to end under reg 1015/1016 flow control; break-point files, report rows, the estimate dialog and any UI job control do not. Two limits are open and both are in `docs/STATUS.md`: the §8.3 planner throughput gate fails by ~16x (X13, and a job that size cannot be held in memory as frames), and no vendor item stream of the same drawing exists to diff against.*
+*State (2026-09-16): the planner, the frame packer, `nexcut-plan` and `nexcut-mccd run-job` exist and stream a planned job into the simulator end to end under reg 1015/1016 flow control; break-point files, report rows, the estimate dialog and any UI job control do not. Two limits are open and both are in `docs/STATUS.md`: the §8.3 planner throughput gate fails by **~6.5x** (X13 — 194 s against 30 s, down from 461–520 s), and no vendor item stream of the same drawing exists to diff against. The **memory** half of that first limit is closed: the planner streams (`plan.__main__.stream_job`), so a job of any size costs a couple of MB of frames instead of the ~8 GB a frame list needed, and the streaming path now reproduces three leaked vendor frames byte for byte.*
 * **Dry-run semantics (as the original's 空走):** every tick carries duty 0, no `9999[2,0x100,·]` laser-enable record, gas records optional; the hardware laser interlock (§8.2) is additionally open.
 * Gate 1 (simulator), in two halves: **(a)** identical item stream for the 24-segment raster as decoded in 05 §5–6 (1506.62 mm, 46 toggles) — the geometry and the toggle ratios match, but "identical item stream" cannot be judged until a vendor capture of that raster exists (11 §7 step 9), so this half is **partial**; **(b)** the jitter test of §8.3 — **passes, against the simulator only**, with the measured numbers recorded in `docs/STATUS.md` §0. The throughput half of §8.3 (100 k contours in < 30 s) **fails** and is tracked as X13.
 * Gate 2 (machine, laser interlocked): the 200 × 200 mm test square of 08 runs at 50 mm/s without FIFO starvation; measured time ≈ planner estimate; frame-id / space-margin behaviour logged.
@@ -384,19 +385,29 @@ ticked only when the deliverable *and* its gate were actually run and passed.
       order, not a sort result — and needs a vendor-sorted reference produced under Wine.
   - [x] import DXF, `.chf` v1–v5, PLT, G-code; canvas, layers, markers, measurement tool
   - [x] byte-identical `.chf` re-save on every sample
+  - [x] a streaming DXF reader with an ezdxf fallback, cross-checked against it on the vendor
+        drawing, 240+ randomised corpora and the full entity zoo at R12/R2000/R2018
+  - [ ] the 3 s import budget for 50 000 separate `LINE`s (X11: 5.18 s, of which 3.39 s is
+        `ops/import_gates` + `ops/sort`)
   - [ ] render gate on the strict metric, or an agreed relaxed one (open decision, STATUS §4.2)
   - [ ] a valid sort reference, and any editing operation at all
 - [ ] **M3: parameter/layer/technology editors round-trip vendor files.** The file layer is
       complete — every vendor XML and technology file round-trips byte for byte, with the preset
-      wrapper, the fallback chain and atomic writes. The **first property editors exist**: a
-      schema-driven property grid (`ui/property_grid.py`) and the CO2 layer page
-      (`ui/pages/layer_co2.py`, 21 editable attributes with the `lp19` cross-check and preset
-      exchange). **Not done**: the hardware/machining/software/graph-rule pages, the fibre layer
-      page, the PWM/frequency curve editor, the crafts editor, writing `BkLayerPara.xml` back from
-      the dock, and the Wine load check that is the gate.
+      wrapper, the fallback chain and atomic writes. **All six property pages now exist** (CO2
+      layer, fibre layer, hardware, machining, software, graph rules) together with the
+      PWM/frequency curve editor, the crafts editor and `BkLayerPara.xml` write-back from the dock;
+      the main window has 9 docks. The UI/safety review then closed the gap between "the page
+      exists" and "the page is safe to use": ten Hardware rows threw `OverflowError` on a
+      double-click, and opening-and-closing an editor moved 15 values of the owner's real files
+      (one by 10 %, one by −2 %). It does not any more (D15). **Not done**: hardware-page read-back
+      of 50000/50200/59600+, the vendor's technology-preset browser, a document-modified flag, and
+      the Wine load check that is the gate.
   - [x] byte-for-byte round-trip of every `Bk*.xml` and technology file
   - [x] schema-driven property grid + CO2 layer page
-  - [ ] the remaining five pages and the curve/crafts editors
+  - [x] the remaining five pages, the curve editor and the crafts editor
+  - [x] `BkLayerPara.xml` written back from the dock, with `--layer/--manu/--hard` as the target
+  - [x] every editor on every page opened and committed over the vendor `BkHardPara.xml` and
+        `BkManuPara.xml` without changing a byte (D15)
   - [ ] gate: the Windows tool under Wine loads files written by the port
 - [ ] **M4: dry-run job streaming on the machine (laser interlocked).** The whole chain exists and
       runs **into the simulator**: planner → items → frames (`nexcut-plan`), then
@@ -409,7 +420,13 @@ ticked only when the deliverable *and* its gate were actually run and passed.
   - [x] planner, frame packer, offline `nexcut-plan` (never opens a socket — enforced by an audit hook)
   - [x] streaming feeder with flow control, re-send, clean stop and arming/token rules
   - [x] §8.3 **jitter** gate — passed, **simulator only**, numbers in STATUS §0
-  - [ ] §8.3 **throughput** gate — fails by ~16x (X13); needs a streaming, vectorised item path
+  - [x] a job of any size streams without being held in memory as frames (+2.6 MB at 3 000
+        contours against +197.7 MB materialised; the 100 k-contour job peaks at 140.3 MB, of
+        which 135.3 MB is the document)
+  - [x] the *production* stream path re-encodes leaked vendor frames byte-identically (the
+        goldens used to cover only the definition path)
+  - [ ] §8.3 **throughput** gate — fails by ~6.5x (X13: 194 s against 30 s); needs the geometry
+        stages planned in one array pass, not a faster item path
   - [ ] gate 1(a): item-stream diff against a vendor capture of the same drawing (needs 11 §7 step 9)
   - [ ] gate 2: the 200 × 200 mm dry run on the machine
 - [ ] **M5: first CO2 cut; reports; break-point resume.** Not started, deliberately: `LASER_ARMED`

@@ -63,6 +63,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
+from nexcut.mcc.safety import ArmState
 from nexcut.mccd.ipc import IpcError, MccdClient
 
 __all__ = [
@@ -84,6 +85,7 @@ __all__ = [
     "ScriptedKeys",
     "TuiController",
     "TuiOptions",
+    "arm_text",
     "binding_for",
     "format_status",
     "help_lines",
@@ -752,6 +754,14 @@ class TuiController:
         self.msg = _Message()
         self._tokens = itertools.count(1)
         self._ipc_alive = False
+        self.arm_owner: int | None = None
+        """``arm_owner`` of this TUI's own ``arm_motion`` reply (D9/R12).
+
+        The status stream runs on a connection of its own, so the snapshot's
+        ``arm_owner_is_self`` is about *that* connection, not about the command lane that
+        armed.  The id from the reply is what tells the two apart in the status line.  It is
+        dropped again as soon as a snapshot reports DISARMED, so an id from a previous daemon
+        process (ids restart at 1) cannot be mistaken for this session's."""
 
     # -- helpers
 
@@ -1002,6 +1012,11 @@ class TuiController:
             if failed:
                 self._say(f"stop: failed vectors {failed}", error=True)
         elif r.cmd in ("arm_motion", "disarm", "ack_estop"):
+            if r.cmd == "arm_motion":
+                owner = res.get("arm_owner")
+                self.arm_owner = owner if isinstance(owner, int) else None
+            elif r.cmd == "disarm":
+                self.arm_owner = None
             self._say(f"{r.cmd}: {res.get('arm_state', '')}".rstrip(": "))
 
     def shutdown(self) -> None:
@@ -1016,7 +1031,9 @@ class TuiController:
     def lines(self) -> list[str]:
         """The frame: status, jog settings, mode prompt, message, help."""
         snap, alive = self.backend.status()
-        out = format_status(snap, ipc_connected=alive)
+        if snap is not None and snap.get("arm_state") == str(ArmState.DISARMED):
+            self.arm_owner = None
+        out = format_status(snap, ipc_connected=alive, own_arm_owner=self.arm_owner)
         o = self.options
         jog = (
             f"jog: step {self.step_mm:g} mm @ {o.step_speed_mm_s:g} mm/s   "
@@ -1075,7 +1092,35 @@ def _format_words(
     return out
 
 
-def format_status(snap: Mapping[str, Any] | None, *, ipc_connected: bool = True) -> list[str]:
+def arm_text(snap: Mapping[str, Any], own_arm_owner: int | None = None) -> str:
+    """The arm field of the status line, with *who* owns the arming (D9/R12).
+
+    Since the R12 amendment of D9 the arming owner is the only connection that may jog, home
+    or start a job, so "armed" alone does not tell the operator whether *they* can move.
+    ``own_arm_owner`` is the ``arm_owner`` this client saw in its own ``arm_motion`` reply -
+    needed because the TUI arms on its command lane and reads status on another connection;
+    when it is not given, the snapshot's per-connection ``arm_owner_is_self`` decides.
+    """
+    state = str(snap.get("arm_state"))
+    if state == str(ArmState.DISARMED):
+        return state
+    owner = snap.get("arm_owner")
+    mine = own_arm_owner is not None and owner is not None and owner == own_arm_owner
+    if not mine and snap.get("arm_owner_is_self") is True:
+        mine = True
+    if mine:
+        return f"{state} (this session)"
+    if owner is not None:
+        return f"{state} (another client)"
+    return state  # armed by an in-process caller (no connection owns it)
+
+
+def format_status(
+    snap: Mapping[str, Any] | None,
+    *,
+    ipc_connected: bool = True,
+    own_arm_owner: int | None = None,
+) -> list[str]:
     """Human-readable status lines of a ``status`` snapshot (11 §4, :mod:`nexcut.mccd.status`)."""
     if snap is None:
         return [f"IPC: {'connected' if ipc_connected else 'NOT CONNECTED (retrying)'}  "
@@ -1085,7 +1130,7 @@ def format_status(snap: Mapping[str, Any] | None, *, ipc_connected: bool = True)
     poll_txt = "-" if poll is None else f"{poll * 1000:.0f} ms"
     head = (
         f"IPC {ipc}  link {snap.get('link')}  state {snap.get('machine_state')}  "
-        f"arm {snap.get('arm_state')}  poll {poll_txt}"
+        f"arm {arm_text(snap, own_arm_owner)}  poll {poll_txt}"
     )
     if snap.get("estop_latched"):
         head += "  ** E-STOP LATCHED (A = acknowledge) **"

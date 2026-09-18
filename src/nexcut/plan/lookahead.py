@@ -72,8 +72,13 @@ FEED_FILL_EPS = 0.01
 FEED_FILL_ROUNDS = 4
 """Pass 3 is unrolled x4 in the binary (05 §7.2)."""
 CADMODULE_NODE_FACTOR = 0.99
-"""Factor added by CADModule's node builder copy (``.rdata:0x101116d0``, used at ``0x100ff866``,
-05 §7.2).  UNVERIFIED what it multiplies; exposed but not applied."""
+"""The ``VelDecc.txt`` logging threshold of CADModule's node builder copy
+(``.rdata:0x101116d0``, read at ``0x100ff866``).
+
+**It multiplies nothing** (05 §7.2 correction, A9 §1 re-trace 2026-09-16): the value is compared
+against the per-piece speed factor (``piece+0x40``) and only a piece that was actually slowed -
+factor below 0.99 - gets a ``NodeID:%d V:%f mm/s`` line in the log.  Kept as a named constant
+because :func:`format_veldecc` reproduces that log; applying it to node speeds would be wrong."""
 
 
 @dataclass(slots=True)
@@ -371,6 +376,11 @@ def format_veldecc(speeds: FloatArray | list[float]) -> bytes:
 
     The package file is 0 bytes (the log flag was off, 05 §7.2), which an empty list reproduces.
     UNVERIFIED which speed the vendor logs (node limit vs planned speed).
+
+    **Known fidelity gap** (A9 §1, 05 §7.2 correction): the vendor writes a line only for a node
+    whose piece speed factor is below :data:`CADMODULE_NODE_FACTOR`, i.e. only for a piece that
+    the look-ahead actually slowed down; this helper writes every node it is given. Filtering
+    needs the per-piece factor, which the caller has and this signature does not.
     """
     return "".join(f"NodeID:{i} V:{float(v):f} mm/s\r\n" for i, v in enumerate(speeds)).encode(
         "ascii"

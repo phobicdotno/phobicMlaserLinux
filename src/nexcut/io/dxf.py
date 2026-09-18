@@ -45,7 +45,7 @@ import io
 import math
 import re
 from collections import Counter
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any
@@ -84,11 +84,20 @@ __all__ = [
     "DxfImportError",
     "DxfImportOptions",
     "DxfImportResult",
+    "arc_glyph",
     "decode_dxf_bytes",
     "doc_to_drawing",
+    "ellipse_glyph",
+    "extrusion_kind",
     "fonttools_available",
     "import_dxf",
+    "lwpoly_glyph",
+    "mirror_ocs",
+    "polyline_is_degenerate",
     "read_dxf",
+    "read_file_bytes",
+    "solid_glyph",
+    "spline_glyphs",
     "write_dxf",
 ]
 
@@ -133,6 +142,12 @@ UNVERIFIED: tuple[str, ...] = (
     "DXF import: text outlines use ezdxf fonts (the original: GDI GetGlyphOutlineW with the "
     "Windows font), glyph shapes and advance widths differ; text becomes one Group per entity",
     "DXF import: non-exploded INSERT -> one Group (nested INSERTs flattened into it)",
+    "DXF import: an open polyline with fewer than two vertices is dropped (it has no path "
+    "and its flattening is empty; the original's handling is untraced)",
+    "DXF import (streaming reader): an entity belongs to the modelspace when its owner "
+    "handle (330) is the *Model_Space BLOCK_RECORD, or - with no owner or no BLOCK_RECORD "
+    "table, as in R12 - when the paper-space flag (67) is 0; anything else hands the file "
+    "to ezdxf.  ezdxf's own layout assignment was read from its behaviour, not traced",
     "DXF export: R2000/ANSI_936, layer name = str(process layer), ACI colour = layer + 1",
 )
 
@@ -176,6 +191,10 @@ class DxfImportResult:
     entity_layers: Counter[str] = field(default_factory=Counter)
     """DXF layer name of every converted entity."""
     warnings: list[str] = field(default_factory=list)
+    reader: str = "ezdxf"
+    """Which import path produced this result: ``"stream"`` or ``"ezdxf"`` (STATUS §5 task 7)."""
+    fallback_reason: str = ""
+    """Why the streaming reader declined the file (empty when it ran, or was not tried)."""
 
     @property
     def bbox(self) -> tuple[Vec2, Vec2] | None:
@@ -239,7 +258,8 @@ def decode_dxf_bytes(data: bytes) -> tuple[str, str]:
         return data.decode("cp1252", "replace"), "cp1252"
 
 
-def _load_drawing(source: str | Path | bytes | IO[bytes]) -> tuple[Drawing, str]:
+def read_file_bytes(source: str | Path | bytes | IO[bytes]) -> bytes:
+    """Slurp a path / bytes / binary stream; raises :class:`DxfImportError` on I/O or emptiness."""
     if isinstance(source, (str, Path)):
         try:
             data = Path(source).read_bytes()
@@ -249,6 +269,13 @@ def _load_drawing(source: str | Path | bytes | IO[bytes]) -> tuple[Drawing, str]
         data = source
     else:
         data = source.read()
+    if not data.strip():
+        raise DxfImportError("file is empty")
+    return data
+
+
+def _load_drawing(source: str | Path | bytes | IO[bytes]) -> tuple[Drawing, str]:
+    data = source if isinstance(source, bytes) else read_file_bytes(source)
     if not data.strip():
         raise DxfImportError("file is empty")
     try:
@@ -273,17 +300,139 @@ def _xy(p: Any) -> Vec2:
     return Vec2(float(p[0]), float(p[1]))
 
 
-def _extrusion_kind(e: DXFGraphic) -> int:
-    """+1 for (0,0,1), -1 for (0,0,-1), 0 for a tilted OCS."""
-    ex = Vec3(e.dxf.get("extrusion", (0.0, 0.0, 1.0)))
-    if abs(ex.x) < 1e-9 and abs(ex.y) < 1e-9:
-        return 1 if ex.z > 0 else -1
+def extrusion_kind(ex: tuple[float, float, float]) -> int:
+    """+1 for (0,0,1), -1 for (0,0,-1), 0 for a tilted OCS (DXF arbitrary-axis rule)."""
+    if abs(ex[0]) < 1e-9 and abs(ex[1]) < 1e-9:
+        return 1 if ex[2] > 0 else -1
     return 0
 
 
-def _mirror(p: Vec2, kind: int) -> Vec2:
+def _extrusion_kind(e: DXFGraphic) -> int:
+    """:func:`extrusion_kind` of an ezdxf entity's ``extrusion`` attribute."""
+    ex = Vec3(e.dxf.get("extrusion", (0.0, 0.0, 1.0)))
+    return extrusion_kind((ex.x, ex.y, ex.z))
+
+
+def mirror_ocs(p: Vec2, kind: int) -> Vec2:
     """OCS -> WCS for extrusion (0,0,+-1): the arbitrary-axis x-axis is (-1,0,0) for -Z."""
     return p if kind == 1 else Vec2(-p[0], p[1])
+
+
+_mirror = mirror_ocs
+
+
+def arc_glyph(center: Vec2, radius: float, start_deg: float, end_deg: float, kind: int) -> ArcGlyph:
+    """DXF ARC (degrees, CCW, OCS ``kind``) -> the ``.chf`` type-3 arc (03 §7, §14).
+
+    A -Z extrusion mirrors about the OCS y-axis, which maps the angle ``a`` to
+    ``180 - a`` and swaps start and end; a zero sweep is a full turn.
+    """
+    s, en = start_deg, end_deg
+    if kind == -1:
+        s, en = 180.0 - en, 180.0 - s
+    c = mirror_ocs(center, kind)
+    a0 = math.radians(s)
+    sweep = math.radians((en - s) % 360.0)
+    if sweep < 1e-12:
+        sweep = 2 * math.pi
+    return ArcGlyph(c, radius, a0, a0 + sweep)
+
+
+def ellipse_glyph(
+    center: Vec2, major_axis: Vec2, ratio: float, t0: float, t1: float, kind: int
+) -> EllipseArcGlyph:
+    """DXF ELLIPSE -> the ``.chf`` type-5 ellipse arc (03 §7).
+
+    ELLIPSE is a WCS entity, so only the parametrisation flips for a -Z extrusion:
+    the minor axis is ``(-Z) x major``, i.e. ``P(t) -> P(-t)``.
+    """
+    if kind == -1:
+        t0, t1 = -t1, -t0
+    if t1 <= t0:
+        t1 += 2 * math.pi
+    return EllipseArcGlyph(center, major_axis, ratio, t0, t1)
+
+
+def lwpoly_glyph(
+    points: Iterable[tuple[float, float, float]], closed: int, kind: int
+) -> LwPolylineGlyph:
+    """``(x, y, bulge)`` vertices in OCS -> the ``.chf`` type-6 polyline (03 §7).
+
+    Mirroring about the y-axis reverses the sense of every bulge.
+    """
+    sign = 1.0 if kind == 1 else -1.0
+    return LwPolylineGlyph(
+        closed,
+        [
+            LwPolyVertex(mirror_ocs(Vec2(float(x), float(y)), kind), sign * float(b))
+            for x, y, b in points
+        ],
+    )
+
+
+def polyline_is_degenerate(count: int, closed: int) -> bool:
+    """True when a polyline of ``count`` vertices carries no path and must be dropped.
+
+    Finding (fixed): an *open* polyline with a single vertex became a one-vertex
+    type-6 glyph.  Its closed-form extent is undefined (:func:`glyph_extent`
+    returns None for ``segs < 1``), so ``refresh_contour`` fell through to
+    ``measure_contour``, whose flattening of that glyph is empty, and the import
+    of a crafted LWPOLYLINE/POLYLINE left :func:`import_dxf` as a bare
+    ``IndexError`` - not a :class:`DxfImportError`, so ``MainWindow.open_path``
+    could not catch it.  A *closed* single vertex is the zero-length loop the
+    model already measures and is kept.
+    """
+    return count < 1 or (count < 2 and not closed)
+
+
+def solid_glyph(corners: Sequence[Vec2], *, reorder: bool, kind: int) -> LwPolylineGlyph | None:
+    """SOLID/TRACE/3DFACE corners -> the closed outline polyline, or None if degenerate.
+
+    ``reorder`` is the SOLID/TRACE vertex order 0-1-3-2 (09 §3.2 ``CDxf4Corner``);
+    3DFACE is already in path order and is a WCS entity, so it is not mirrored.
+    """
+    pts = list(corners)
+    if reorder:
+        pts = [mirror_ocs(c, kind) for c in (pts[0], pts[1], pts[3], pts[2])]
+    uniq: list[Vec2] = []
+    for c in pts:
+        if not uniq or math.dist(c, uniq[-1]) > 1e-12:
+            uniq.append(c)
+    if len(uniq) > 1 and math.dist(uniq[0], uniq[-1]) <= 1e-12:
+        uniq.pop()
+    if len(uniq) < 2:
+        return None
+    return LwPolylineGlyph(1, [LwPolyVertex(c) for c in uniq])
+
+
+def spline_glyphs(bs: BSpline, warn: Callable[[str], None]) -> list[Glyph]:
+    """A B-spline -> the ``.chf`` type-7 cubic spline (03 §7, §12), or a polyline for degree 1.
+
+    Rational and non-cubic curves are converted as the module docstring and
+    :data:`UNVERIFIED` describe.  Raises :class:`ValueError` for a curve that
+    cannot become a clamped cubic B-spline.
+    """
+    if bs.degree == 1:
+        pts = [_xy(p) for p in bs.control_points]
+        return [LwPolylineGlyph(0, [LwPolyVertex(p) for p in pts])]
+    weights = list(bs.weights())
+    rational = bool(weights) and (max(weights) - min(weights)) > 1e-12 * max(1.0, max(weights))
+    if rational:
+        warn("rational SPLINE re-interpolated as a non-rational cubic B-spline")
+        samples = list(bs.points(_param_samples(bs)))
+        bs = BSpline.from_fit_points(samples, degree=3)
+    elif bs.degree < 3:
+        bs = bs.degree_elevation(3 - bs.degree)
+    elif bs.degree > 3:
+        warn(f"degree-{bs.degree} SPLINE re-interpolated as a cubic B-spline")
+        bs = BSpline.from_fit_points(list(bs.points(_param_samples(bs))), degree=3)
+    ctrl = [_xy(p) for p in bs.control_points]
+    knots = [float(k) for k in bs.knots()]
+    if len(ctrl) < 4 or len(knots) != len(ctrl) + 4:
+        raise ValueError(
+            f"cubic B-spline needs >= 4 control points and n+4 knots ({len(ctrl)}, {len(knots)})"
+        )
+    return [SplineGlyph(0, 0, ctrl, knots)]
 
 
 def _param_samples(bs: BSpline) -> list[float]:
@@ -342,13 +491,39 @@ class _Converter:
         return out
 
     # -- entities ----------------------------------------------------------
+    HANDLERS: dict[str, str] = {
+        "LINE": "_line",
+        "POINT": "_point",
+        "CIRCLE": "_circle",
+        "ARC": "_arc",
+        "ELLIPSE": "_ellipse",
+        "LWPOLYLINE": "_lwpolyline",
+        "POLYLINE": "_polyline",
+        "SPLINE": "_spline",
+        "SOLID": "_solid",
+        "TRACE": "_solid",
+        "3DFACE": "_solid",
+        "XLINE": "_xline",
+        "RAY": "_xline",
+        "TEXT": "_text",
+        "MTEXT": "_mtext",
+        "INSERT": "_insert",
+    }
+    """One method per :data:`SUPPORTED_TYPES` entity.
+
+    Finding (fixed): the name used to be derived as ``"_" + t.lower().replace("3d", "d3")``,
+    which spells ``3DFACE`` ``_d3face`` while the alias in this class was ``_d3dface``; every
+    3DFACE entity therefore left ``import_dxf`` as a bare ``AssertionError``, not as a
+    :class:`DxfImportError`.  The table is checked against ``SUPPORTED_TYPES`` by a test.
+    """
+
     def convert(self, e: DXFEntity) -> list[Graph]:
         t = e.dxftype()
         if t in IGNORED_TYPES or t not in SUPPORTED_TYPES:
             self.res.ignored_counts[t] += 1
             return []
         assert isinstance(e, DXFGraphic)
-        handler = getattr(self, "_" + t.lower().replace("3d", "d3"), None)
+        handler = getattr(self, self.HANDLERS[t], None)
         assert handler is not None, t
         try:
             graphs: list[Graph] = handler(e)
@@ -386,26 +561,27 @@ class _Converter:
         kind = _extrusion_kind(e)
         if kind == 0:
             return self.flatten_fallback(e, "with tilted extrusion")
-        s, en = float(e.dxf.start_angle), float(e.dxf.end_angle)
-        if kind == -1:
-            s, en = 180.0 - en, 180.0 - s
-        c = _mirror(_xy(e.dxf.center), kind)
-        a0 = math.radians(s)
-        sweep = math.radians((en - s) % 360.0)
-        if sweep < 1e-12:
-            sweep = 2 * math.pi
-        return [self.contour([ArcGlyph(c, float(e.dxf.radius), a0, a0 + sweep)], e)]
+        g = arc_glyph(
+            _xy(e.dxf.center),
+            float(e.dxf.radius),
+            float(e.dxf.start_angle),
+            float(e.dxf.end_angle),
+            kind,
+        )
+        return [self.contour([g], e)]
 
     def _ellipse(self, e: DXFGraphic) -> list[Graph]:
         kind = _extrusion_kind(e)
         if kind == 0:
             return self.flatten_fallback(e, "with tilted extrusion")
-        t0, t1 = float(e.dxf.start_param), float(e.dxf.end_param)
-        if kind == -1:  # minor axis = (-Z) x major = -(model perpendicular): P(t) -> model P(-t)
-            t0, t1 = -t1, -t0
-        if t1 <= t0:
-            t1 += 2 * math.pi
-        g = EllipseArcGlyph(_xy(e.dxf.center), _xy(e.dxf.major_axis), float(e.dxf.ratio), t0, t1)
+        g = ellipse_glyph(
+            _xy(e.dxf.center),
+            _xy(e.dxf.major_axis),
+            float(e.dxf.ratio),
+            float(e.dxf.start_param),
+            float(e.dxf.end_param),
+            kind,
+        )
         return [self.contour([g], e)]
 
     def _lwpolyline(self, e: DXFGraphic) -> list[Graph]:
@@ -413,88 +589,50 @@ class _Converter:
         if kind == 0:
             return self.flatten_fallback(e, "with tilted extrusion")
         pts = list(e.get_points("xyb"))  # type: ignore[attr-defined]
-        if not pts:
-            return []
-        sign = 1.0 if kind == 1 else -1.0
-        verts = [
-            LwPolyVertex(_mirror(Vec2(float(x), float(y)), kind), sign * float(b))
-            for x, y, b in pts
-        ]
         closed = 1 if e.closed else 0  # type: ignore[attr-defined]
-        return [self.contour([LwPolylineGlyph(closed, verts)], e)]
+        if polyline_is_degenerate(len(pts), closed):
+            if pts:
+                self.warn("LWPOLYLINE skipped: open polyline with a single vertex")
+            return []
+        return [self.contour([lwpoly_glyph(pts, closed, kind)], e)]
 
     def _polyline(self, e: DXFGraphic) -> list[Graph]:
         if e.is_polygon_mesh or e.is_poly_face_mesh:  # type: ignore[attr-defined]
             self.warn("POLYLINE mesh/polyface skipped")
             return []
         closed = 1 if e.is_closed else 0  # type: ignore[attr-defined]
-        verts: list[LwPolyVertex] = []
+        kind = 1
         if e.is_2d_polyline:  # type: ignore[attr-defined]
             kind = _extrusion_kind(e)
             if kind == 0:
                 return self.flatten_fallback(e, "with tilted extrusion")
-            sign = 1.0 if kind == 1 else -1.0
-            for v in e.vertices:  # type: ignore[attr-defined]
-                if v.dxf.get("flags", 0) & 16:  # spline frame control point, not on the curve
-                    continue
-                verts.append(
-                    LwPolyVertex(
-                        _mirror(_xy(v.dxf.location), kind), sign * float(v.dxf.get("bulge", 0.0))
-                    )
-                )
-        else:
-            for v in e.vertices:  # type: ignore[attr-defined]
-                if v.dxf.get("flags", 0) & 16:
-                    continue
-                verts.append(LwPolyVertex(_xy(v.dxf.location)))
-        if not verts:
+        pts: list[tuple[float, float, float]] = []
+        for v in e.vertices:  # type: ignore[attr-defined]
+            if v.dxf.get("flags", 0) & 16:  # spline frame control point, not on the curve
+                continue
+            p = v.dxf.location
+            bulge = float(v.dxf.get("bulge", 0.0)) if e.is_2d_polyline else 0.0  # type: ignore[attr-defined]
+            pts.append((float(p[0]), float(p[1]), bulge))
+        if polyline_is_degenerate(len(pts), closed):
+            if pts:
+                self.warn("POLYLINE skipped: open polyline with a single vertex")
             return []
-        return [self.contour([LwPolylineGlyph(closed, verts)], e)]
+        return [self.contour([lwpoly_glyph(pts, closed, kind)], e)]
 
     def _spline(self, e: DXFGraphic) -> list[Graph]:
         bs: BSpline = e.construction_tool()  # type: ignore[attr-defined]
-        if bs.degree == 1:
-            pts = [_xy(p) for p in bs.control_points]
-            return [self.contour([LwPolylineGlyph(0, [LwPolyVertex(p) for p in pts])], e)]
-        weights = list(bs.weights())
-        rational = bool(weights) and (max(weights) - min(weights)) > 1e-12 * max(1.0, max(weights))
-        if rational:
-            self.warn("rational SPLINE re-interpolated as a non-rational cubic B-spline")
-            samples = list(bs.points(_param_samples(bs)))
-            bs = BSpline.from_fit_points(samples, degree=3)
-        elif bs.degree < 3:
-            bs = bs.degree_elevation(3 - bs.degree)
-        elif bs.degree > 3:
-            self.warn(f"degree-{bs.degree} SPLINE re-interpolated as a cubic B-spline")
-            bs = BSpline.from_fit_points(list(bs.points(_param_samples(bs))), degree=3)
-        ctrl = [_xy(p) for p in bs.control_points]
-        knots = [float(k) for k in bs.knots()]
-        if len(ctrl) < 4 or len(knots) != len(ctrl) + 4:
-            raise ValueError(
-                f"cubic B-spline needs >= 4 control points and n+4 knots ({len(ctrl)}, {len(knots)})"
-            )
-        return [self.contour([SplineGlyph(0, 0, ctrl, knots)], e)]
+        return [self.contour(spline_glyphs(bs, self.warn), e)]
 
     def _solid(self, e: DXFGraphic) -> list[Graph]:
         corners = [_xy(e.dxf.get(f"vtx{i}", (0.0, 0.0))) for i in range(4)]
-        if e.dxftype() in ("SOLID", "TRACE"):
-            corners = [corners[0], corners[1], corners[3], corners[2]]  # SOLID vertex order 0-1-3-2
+        reorder = e.dxftype() in ("SOLID", "TRACE")
+        kind = 1
+        if reorder:
             kind = _extrusion_kind(e)
             if kind == 0:
                 return self.flatten_fallback(e, "with tilted extrusion")
-            corners = [_mirror(c, kind) for c in corners]
-        uniq: list[Vec2] = []
-        for c in corners:
-            if not uniq or math.dist(c, uniq[-1]) > 1e-12:
-                uniq.append(c)
-        if len(uniq) > 1 and math.dist(uniq[0], uniq[-1]) <= 1e-12:
-            uniq.pop()
-        if len(uniq) < 2:
-            return []
-        return [self.contour([LwPolylineGlyph(1, [LwPolyVertex(c) for c in uniq])], e)]
-
-    _trace = _solid
-    _d3dface = _solid
+        g = solid_glyph(corners, reorder=reorder, kind=kind)
+        return [] if g is None else [self.contour([g], e)]
 
     def _xline(self, e: DXFGraphic) -> list[Graph]:
         self.warn(f"{e.dxftype()} skipped (infinite line)")
@@ -642,12 +780,50 @@ def import_dxf(drawing: Drawing, options: DxfImportOptions | None = None) -> Dxf
 
 
 def read_dxf(
-    source: str | Path | bytes | IO[bytes], options: DxfImportOptions | None = None
+    source: str | Path | bytes | IO[bytes],
+    options: DxfImportOptions | None = None,
+    *,
+    reader: str = "auto",
 ) -> DxfImportResult:
-    """Read a DXF file (path, bytes or binary stream) into the model; see :func:`import_dxf`."""
+    """Read a DXF file (path, bytes or binary stream) into the model; see :func:`import_dxf`.
+
+    Two readers produce the same model (STATUS §5 task 7):
+
+    ``"stream"``
+        :func:`nexcut.io.dxf_stream.read_stream` walks the ``ENTITIES`` section
+        tag by tag and never builds an ezdxf document.  It is the fast path -
+        50 000 separate ``LINE`` entities cost about a fifth of the ezdxf load.
+    ``"ezdxf"``
+        :func:`_load_drawing` + :func:`import_dxf`, the complete reader: binary
+        DXF, ``INSERT`` explosion, text outlines, tilted OCS, paper space and
+        every file whose structure the fast path will not vouch for.
+
+    ``reader="auto"`` (the default) tries the fast path and falls back to ezdxf
+    whenever it declines; :attr:`DxfImportResult.reader` records which one ran and
+    :attr:`DxfImportResult.fallback_reason` why the fast path declined.  ``"stream"``
+    and ``"ezdxf"`` force one path (``"stream"`` raises :class:`DxfImportError` when
+    it cannot read the file) and exist for the cross-check tests.
+    """
+    if reader not in ("auto", "stream", "ezdxf"):
+        raise ValueError(f"unknown reader {reader!r}")
+    opts = options or DxfImportOptions()
+    reason = ""
+    if reader != "ezdxf":
+        from nexcut.io import dxf_stream
+
+        data = read_file_bytes(source)
+        try:
+            return dxf_stream.read_stream(data, opts)
+        except dxf_stream.StreamUnsupported as exc:
+            if reader == "stream":
+                raise DxfImportError(f"the streaming reader declined the file: {exc}") from exc
+            reason = str(exc)
+        source = data
     drawing, enc = _load_drawing(source)
-    res = import_dxf(drawing, options)
+    res = import_dxf(drawing, opts)
     res.encoding = enc
+    res.reader = "ezdxf"
+    res.fallback_reason = reason
     return res
 
 

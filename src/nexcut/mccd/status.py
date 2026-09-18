@@ -250,6 +250,24 @@ class StatusSnapshot:
     estop_latched: bool
     poll_age_s: float | None
     connected: bool = False
+    arm_owner: int | None = None
+    """IPC connection id that holds the arming, ``None`` when nothing is armed (D9).
+
+    With the D9/R12 amendment this is not decoration: ``jog_step``,
+    ``jog_continuous_start``, ``home``, ``load_job`` and ``start_job`` are accepted **only**
+    on that connection, so the id decides whether the reader of this snapshot can move at
+    all.  Ids are handed out by :class:`~nexcut.mccd.ipc.IpcServer` and are unique for the
+    life of one daemon process (they restart at 1 when the daemon does).
+    """
+    arm_owner_is_self: bool | None = None
+    """Whether :attr:`arm_owner` is the connection this snapshot was built for.
+
+    ``None`` when the snapshot was not built for a connection (an in-process caller, a test
+    harness); ``False`` also when nothing is armed.  A client that armed on a *different*
+    connection than the one it reads status on - the TUI, whose status stream is its own
+    connection - must compare :attr:`arm_owner` with the ``arm_owner`` its ``arm_motion``
+    reply returned instead.
+    """
     program_version: int | None = None
     di_word: int = 0
     di_ports_high: tuple[int, ...] = ()
@@ -294,6 +312,8 @@ class StatusSnapshot:
         estop_latched: bool,
         poll_age_s: float | None,
         block1000: Sequence[int] | None,
+        arm_owner: int | None = None,
+        arm_owner_is_self: bool | None = None,
         axis_ro: Sequence[int] | None,
         axis_ro_age_s: float | None = None,
         system_rw: Sequence[int] | None = None,
@@ -313,6 +333,8 @@ class StatusSnapshot:
             estop_latched=estop_latched,
             poll_age_s=poll_age_s,
             connected=link == "CONNECTED",
+            arm_owner=arm_owner,
+            arm_owner_is_self=arm_owner_is_self,
             machine_fault=machine_fault,
             watchdog=tuple(watchdog),
             homing=tuple(homing),

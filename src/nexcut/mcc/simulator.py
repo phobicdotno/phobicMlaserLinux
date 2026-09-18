@@ -451,8 +451,16 @@ class CardSimulator:
                 self.queue_low_water = (
                     depth if self.queue_low_water is None else min(self.queue_low_water, depth)
                 )
-                if not self.fifo and budget > 0:
+                if not self.fifo:
                     # Ran dry while running: FIFO starvation (04 §3.7 EtherCATErrorInfo_2_05).
+                    # The card reports "FIFO empty" at the instant it consumes the last item
+                    # (11 §7 step 8, mccd/feeder.JobFeeder._note_depth), so the condition is
+                    # "the running queue is empty after this step", not "there was tick budget
+                    # left over".  Requiring leftover budget made the alarm depend on whether a
+                    # status read landed inside the one tick in which the queue emptied exactly,
+                    # which is a race, not a card property
+                    # (tests/test_mccd_job.py::test_a_starvation_alarm_at_the_end_of_the_drain_*
+                    # failed that way once in ~100 runs under load).
                     self.underruns += 1
                     self.fifo_running = False
                     if self.config.fifo_starvation_alarm:

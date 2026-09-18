@@ -28,8 +28,10 @@ from nexcut.model import (
     Contour,
     ContourElement,
     ContourEx,
+    Group,
     LinkInfo,
     PointGlyph,
+    Scan,
     SegmentGlyph,
     Text,
     Vec2,
@@ -109,17 +111,81 @@ def test_link_point_raw_token_kept_on_rewrite() -> None:
     assert b"\r\n3.000000,4.000000\r\n<End Graphs>" in chf.write_chf(back)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="design: v2-v4 reserved lines are skipped unread (03 §9); keeping non-empty ones "
-    "needs a model slot or a strict-mode rejection",
-)
 def test_legacy_reserved_lines_with_content_are_not_lost() -> None:
+    """X6/D14: a v2-v4 reserved line with content is kept in a model slot and re-emitted.
+
+    The reserved lines of 03 §9 are consumed unread by the DLL and are empty in every
+    shipped sample, so nothing proves the vendor never writes one.  D14 keeps the raw text
+    instead of dropping it, and rejects nothing.
+    """
     data = chf.write_chf(ChfDocument(version=4, graphs=[_contour()]))
     marker = b"<Begin Graphs>\r\n\r\n"
     assert marker in data
     tampered = data.replace(marker, b"<Begin Graphs>\r\nRESERVED\r\n", 1)
-    assert chf.write_chf(chf.read_chf(tampered)) == tampered
+    doc = chf.read_chf(tampered)
+    assert doc.legacy_reserved == ["RESERVED", "", "", "", ""]
+    assert chf.write_chf(doc) == tampered
+
+
+def test_legacy_reserved_lines_are_kept_at_every_site() -> None:
+    """D14: all seven reserved-line sites of 03 §9 survive, each in its own model slot.
+
+    Every blank line of a v4 file is a reserved line (nothing else the writer emits is
+    empty), so giving each of them distinct content and demanding a byte-identical rewrite
+    pins the order and the ownership of all of them at once.
+    """
+    doc = ChfDocument(
+        version=4,
+        graphs=[
+            _contour(),
+            Scan(children=[_contour()], paths=[_contour()]),
+            Text(text="t", outline=Group(children=[_contour()])),
+        ],
+    )
+    data = chf.write_chf(doc)
+    lines = data.split(b"\r\n")
+    assert lines[-1] == b""  # the trailing CRLF, not a reserved line
+    tampered_lines = list(lines)
+    marks = 0
+    for i, line in enumerate(lines[:-1]):
+        if line == b"":
+            tampered_lines[i] = f"R{marks}".encode()
+            marks += 1
+    assert marks == 5 + 33 * 4 + 3 + 5 + 3 + 5  # doc + 4 contours + scan/text group bodies
+    tampered = b"\r\n".join(tampered_lines)
+    back = chf.read_chf(tampered)
+    assert chf.write_chf(back) == tampered
+    assert back.legacy_reserved == ["R0", "R1", "R2", "R3", "R4"]
+    first = back.graphs[0]
+    assert isinstance(first, Contour)
+    assert first.legacy_reserved_glyphs == [f"R{5 + i}" for i in range(10)]
+    assert len(first.elements[0].legacy_reserved) == 3
+    assert len(first.crafts.legacy_reserved) == 20
+    got_scan = back.graphs[1]
+    assert isinstance(got_scan, Scan)
+    assert len(got_scan.legacy_reserved) == 3 and len(got_scan.legacy_reserved_paths) == 5
+    got_text = back.graphs[2]
+    assert isinstance(got_text, Text) and got_text.outline is not None
+    assert len(got_text.legacy_reserved) == 5 and len(got_text.outline.legacy_reserved) == 3
+    assert all("" not in slot for slot in (back.legacy_reserved, first.legacy_reserved_glyphs))
+
+
+def test_legacy_reserved_line_count_is_enforced_on_write() -> None:
+    """D14: more reserved lines than 03 §9 reserves would change the grammar - refused."""
+    doc = ChfDocument(version=4, graphs=[_contour()], legacy_reserved=["a"] * 6)
+    with pytest.raises(ValueError, match="reserves 5 lines"):
+        chf.write_chf(doc)
+    doc.legacy_reserved = ["a\r\nb"]
+    with pytest.raises(ValueError, match="line break"):
+        chf.write_chf(doc)
+
+
+def test_legacy_reserved_lines_stay_empty_lists_when_blank() -> None:
+    """D14: all-blank reserved lines read back as ``[]`` (a port-built doc compares equal)."""
+    doc = ChfDocument(version=4, graphs=[_contour()])
+    back = chf.read_chf(chf.write_chf(doc))
+    assert back == doc
+    assert back.legacy_reserved == [] and back.graphs[0].legacy_reserved_glyphs == []  # type: ignore[union-attr]
 
 
 def test_point_only_contour_negative_zero_point_round_trips() -> None:

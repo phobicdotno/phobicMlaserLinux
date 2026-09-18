@@ -454,7 +454,9 @@ def test_import_of_many_circles_is_fast() -> None:
     t = time.perf_counter()
     res = import_dxf(dwg)
     report = apply_import_gates(res.document)
-    assert time.perf_counter() - t < 3.0
+    elapsed = time.perf_counter() - t
+    print(f"\n1000 circles: import + gates {elapsed:.2f} s (budget {budget_s():.2f} s)")
+    assert elapsed < budget_s(), elapsed
     assert report.overlaps_removed == 1 and len(res.document.graphs) == 1000
 
 
@@ -675,7 +677,9 @@ def test_nearest_sort_is_not_quadratic() -> None:
     graphs = _segment_grid(10_000)
     t = time.perf_counter()
     res = sortmod.sort_graphs(graphs, sortmod.SortType.NEAREST)
-    assert time.perf_counter() - t < 3.0
+    elapsed = time.perf_counter() - t
+    print(f"\nnearest sort of 10 000 segments: {elapsed:.2f} s (budget {budget_s():.2f} s)")
+    assert elapsed < budget_s(), elapsed
     assert sorted(res.order) == list(range(10_000))
     circles: list[Graph] = [
         build_contour([CircleGlyph(Vec2((i % 100) * 4.0, (i // 100) * 4.0), 1.5)])
@@ -698,7 +702,9 @@ def test_nearest_sort_is_not_quadratic() -> None:
     )
     t = time.perf_counter()
     depth, inside = sortmod.containment_depths(circles)
-    assert time.perf_counter() - t < 3.0
+    elapsed = time.perf_counter() - t
+    print(f"\ncontainment depth of 5 000 circles: {elapsed:.2f} s (budget {budget_s():.2f} s)")
+    assert elapsed < budget_s(), elapsed
     assert depth[:-1] == [1] * 5_000 and len(inside[-1]) == 5_000
 
 
@@ -1066,10 +1072,56 @@ def test_canvas_50k_separate_segments(qapp: object) -> None:
     view.close()
 
 
+def test_50k_separate_dxf_lines_import_is_no_longer_the_cost(tmp_path: Path) -> None:
+    """X11, part 1 (closed): reading 50 000 separate DXF ``LINE`` entities.
+
+    The ezdxf reader spent ~4.5 s of the ~8.2 s open building a
+    :class:`ezdxf.document.Drawing` the importer then threw away.
+    ``nexcut.io.dxf_stream`` walks the ENTITIES section tag by tag instead
+    (STATUS §5 task 7); ``read_dxf`` now picks it automatically and says so.
+
+    Measured 2026-09-16 on the owner's machine, idle, ``speed_factor`` 1.01 - i.e. at
+    the speed the 3 s budgets were written for, cross-checked by the 50 k-contour
+    ``.chf`` case reproducing its recorded 1.84-2.10 s: streaming read
+    **0.57 / 0.63 / 0.64 s** against ezdxf **3.22 / 3.63 / 3.41 s**, a 5.3-5.8x cut,
+    while the IGP clean-up over the resulting 50 000 one-segment contours costs
+    **3.64-3.68 s** and is now the dominant term by far.
+
+    The two assertions below are the durable ones: the parse fits several times over
+    into a *one second* share of the budget, and it is smaller than the clean-up.
+    """
+    from nexcut.ops.import_gates import apply_import_gates
+
+    path = _write_big("dxf-lines", 50_000, tmp_path)
+    t = time.perf_counter()
+    res = read_dxf(path)
+    read_s = time.perf_counter() - t
+    t = time.perf_counter()
+    apply_import_gates(res.document)
+    gates_s = time.perf_counter() - t
+    assert res.reader == "stream" and res.fallback_reason == ""
+    assert len(res.document.graphs) == 50_000
+    print(
+        f"50k separate DXF LINEs: read {read_s:.2f} s (stream), IGP gates {gates_s:.2f} s "
+        f"(1 s share of the budget: {budget_s(1.0):.2f} s)"
+    )
+    assert read_s < budget_s(1.0), read_s
+    assert read_s < gates_s, (read_s, gates_s)
+
+
 @pytest.mark.xfail(
     strict=True,
-    reason="ezdxf parsing of 50 000 LINE entities alone takes ~4.5 s on the review machine "
-    "(i5-5350U), plus the Python IGP gates; needs a streaming DXF entity reader",
+    reason="X11 (still open, cause moved): 50 000 separate DXF LINE entities open, fit "
+    "and paint in 5.04 / 5.42 / 5.03 s against the 3 s budget - was ~8.2 s.  The "
+    "streaming DXF reader of STATUS §5 task 7 took the parse from 3.2-3.6 s to "
+    "0.57-0.64 s (5.3-5.8x, test above), which is the whole of that 3.1 s; what is "
+    "left is NOT the DXF reader: ops.import_gates + ops.sort over 50 000 one-segment "
+    "contours 3.64-3.68 s (~70 %), the canvas build/fit/paint ~0.9 s (~18 %), the "
+    "parse ~0.6 s (~12 %).  Measured 2026-09-16 on the owner's machine, idle, "
+    "speed_factor 1.01, with the 50 k-contour .chf case reproducing its recorded "
+    "1.84-2.10 s as the cross-check that the machine is at budget speed.  Closing it "
+    "needs the IGP clean-up to get what the reader just had - the same vectorise-the-"
+    "per-item-Python-path work as X13 - not more DXF work.",
 )
 def test_open_50k_separate_dxf_lines(qapp: object, tmp_path: Path) -> None:
     path = _write_big("dxf-lines", 50_000, tmp_path)

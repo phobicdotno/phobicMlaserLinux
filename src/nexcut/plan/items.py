@@ -15,6 +15,21 @@ Three layers, mirroring the vendor split (A3 §1):
    rapid ticks, the per-contour prologue/epilogue records observed in the leaked CO2 frames
    (11 §5.4, frames 504/57 and 633) and the cut ticks with per-tick PWM.
 
+**Two paths through those three layers, and they agree to within one pulse.**  The layers above
+are the *definition*: one :class:`Record`, one :class:`Item` and one word list per 250 µs tick,
+which is what the vendor goldens are re-encoded through.  The grammar is identical on both paths and
+the pulse totals are exactly equal; the *placement* of a pulse can differ by one 250 µs cycle on
+a constant-speed run (review finding R-V4 - the bound and the measured numbers are at
+:func:`carry_cells`, and in ``docs/STATUS.md`` §1.5).  Production uses :class:`JobFrameStream`
+instead, which keeps the identical grammar but does the tick -> item -> word -> frame path in
+numpy array operations (:func:`carry_cells`, :func:`tick_words`,
+:meth:`nexcut.mcc.fifo.FrameStream.push_uniform`) and *yields* frames as they close - a
+100 000-contour job is 67.5 M ticks and 202 M words and can be neither built nor held one object
+at a time (PORT-PLAN §8.3, ``docs/STATUS.md`` §5 task 6).  Only the handful of control records
+per contour still goes through :class:`ItemBuilder`, so the record grammar - the automatic 3001
+after a run of ticks included - is written down exactly once.
+``tests/test_plan_vectorised_equivalence.py`` holds the two paths together.
+
 Laser safety (PORT-PLAN §8.2): every item that can emit light carries ``laser=True`` (a DO record
 switching a laser port on, a PWM-set record with duty > 0, a tick with duty > 0, a non-zero DA).
 :class:`JobStreamBuilder` defaults to ``laser_records=False`` (dry run: duty 0 and no laser DO /
@@ -24,15 +39,15 @@ PWM-set records at all); even with ``laser_records=True`` the frames still pass 
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
 
 import numpy as np
-from numpy.typing import ArrayLike
+from numpy.typing import ArrayLike, NDArray
 
 from nexcut.mcc.commands import MISC_DA, MISC_DO, MISC_DO_EXT, MISC_PWM, MISC_PWM_5V
-from nexcut.mcc.fifo import FramePacker, PackedFrame, item_header
+from nexcut.mcc.fifo import FramePacker, FrameStream, PackedFrame, item_header
 
 __all__ = [
     "FREQ_DEFAULT",
@@ -50,17 +65,21 @@ __all__ = [
     "IoSub",
     "Item",
     "ItemBuilder",
+    "JobFrameStream",
     "JobStreamBuilder",
     "Record",
     "RecordType",
     "StreamConfig",
     "TickQuantizer",
     "UnsupportedConfiguration",
+    "carry_cells",
+    "carry_cells_scalar",
     "do_item",
     "dwell_tick_count",
     "encode_item",
     "gas_do_port",
     "tick_item",
+    "tick_words",
     "wait_2001_word",
 ]
 
@@ -147,6 +166,56 @@ def tick_item(dx: int, dy: int, freq: int, duty: int) -> Item:
     d = int(duty) & 0xFF
     w1 = (_u16(int(dy), "dY") << 16) | _u16(int(dx), "dX")
     return Item(OP_TICK, (w1, (f << 16) | d), laser=d > 0)
+
+
+def tick_words(
+    dx: ArrayLike, dy: ArrayLike, freq: ArrayLike = 0, duty: ArrayLike = 0
+) -> tuple[NDArray[np.uint32], NDArray[np.bool_]]:
+    """Vectorised :func:`tick_item`: the ``[header, w1, w2]`` words of ``n`` opcode-3000 ticks.
+
+    Returns the flat ``3n`` word array (u32, ready for
+    :meth:`nexcut.mcc.fifo.FrameStream.push_uniform`) and the per-tick laser flag ``duty > 0``
+    (PORT-PLAN §8.2).  ``freq``/``duty`` are scalars or per-tick arrays and follow the scalar
+    rule of :func:`tick_item` exactly: the u16 mask is applied *before* the ``freq < 1`` test
+    (A3 §4.2), so ``freq = -1`` stays ``0xffff`` and ``freq = 0x10000`` becomes
+    :data:`FREQ_DEFAULT`.
+    """
+    x = np.asarray(dx, dtype=np.int64)
+    y = np.asarray(dy, dtype=np.int64)
+    if x.ndim != 1:
+        x = x.reshape(-1)
+    if y.ndim != 1:
+        y = y.reshape(-1)
+    if x.size != y.size:
+        raise ValueError(f"dX has {x.size} ticks, dY has {y.size}")
+    n = int(x.size)
+    if n and (
+        int(x.min()) < -0x8000
+        or int(x.max()) > 0x7FFF
+        or int(y.min()) < -0x8000
+        or int(y.max()) > 0x7FFF
+    ):
+        # Same exception, same message and the same *tick* as the scalar path: `tick_item`
+        # raises on the first offending tick and evaluates dY before dX inside it (the ``w1``
+        # expression), so a report of "which tick overflowed" cannot depend on which path ran.
+        k = int(np.argmax((x < -0x8000) | (x > 0x7FFF) | (y < -0x8000) | (y > 0x7FFF)))
+        _u16(int(y[k]), "dY")
+        _u16(int(x[k]), "dX")
+    words = np.empty((n, 3), dtype=np.uint32)
+    words[:, 0] = item_header(OP_TICK, 2)
+    np.bitwise_or((y & 0xFFFF) << 16, x & 0xFFFF, out=words[:, 1], casting="unsafe")
+    if np.ndim(freq) == 0 and np.ndim(duty) == 0:  # the common case: one PWM point per contour
+        f = int(freq) & 0xFFFF
+        d = int(duty) & 0xFF
+        words[:, 2] = ((FREQ_DEFAULT if f < 1 else f) << 16) | d
+        laser = np.broadcast_to(np.bool_(d > 0), (n,))
+    else:
+        f_arr = np.broadcast_to(np.asarray(freq, dtype=np.int64), (n,)) & 0xFFFF
+        np.copyto(f_arr, FREQ_DEFAULT, where=f_arr < 1)
+        d_arr = np.broadcast_to(np.asarray(duty, dtype=np.int64), (n,)) & 0xFF
+        np.bitwise_or(f_arr << 16, d_arr, out=words[:, 2], casting="unsafe")
+        laser = d_arr > 0
+    return words.reshape(-1), laser
 
 
 def do_item(xml_port: int, on: bool, laser_ports: Iterable[int] = (5, 9)) -> Item:
@@ -249,6 +318,169 @@ class AxisScale:
         return cls(xp, xl, int(float(g["MAC_1.WritePluse"])), float(g["MAC_1.SpeedRatio"]))
 
 
+_CARRY_GRID_TARGET_BITS = 47
+"""``|increment| · 2**bits <= 2**47``: the fixed-point grid :func:`carry_cells` rounds the
+per-tick increments onto.  See that function for why 47 and not more."""
+_CARRY_CHUNK = 1 << 15
+"""Increments per ``cumsum`` block.  ``2**15 · 2**47 = 2**62`` keeps the running sum inside
+int64 whatever the data."""
+_CARRY_MAX_INCREMENT = float(1 << 40)
+"""Above this the grid would need more than 52 bits; such an increment is ~10**10 pulses in one
+250 µs tick, far past the int16 the packer writes, and falls back to :func:`carry_cells_scalar`."""
+_CARRY_SCALAR_MAX = 256
+"""Runs at most this long take the scalar loop: it is both *faster* (the vectorised path costs
+~90 µs of numpy dispatch whatever its length, the loop ~0.15 µs per tick per axis, so they cross
+at ~300 ticks on the review laptop) and exactly the reference by definition.  Every rapid between
+two contours is well under it."""
+
+
+def carry_cells_scalar(increments: ArrayLike, carry: float) -> tuple[list[int], float]:
+    """The reference truncate-with-carry loop (MainApp ``0x437500``; 11 §5.3).
+
+    ``t = increment + carry``, ``cell = trunc(t)`` (``_ftol2``), ``carry = t - cell``, in IEEE
+    double.  Kept as the definition of the rule; :func:`carry_cells` is the vectorised form that
+    production uses, and ``tests/test_plan_vectorised_equivalence.py`` holds the two together.
+    """
+    c = float(carry)
+    cells: list[int] = []
+    append = cells.append
+    for v in np.asarray(increments, dtype=np.float64).tolist():
+        t = v + c
+        cell = int(t)  # truncation toward zero (_ftol2)
+        c = t - cell
+        append(cell)
+    return cells, c
+
+
+def carry_cells(
+    increments: ArrayLike, carry: float | Sequence[float]
+) -> tuple[NDArray[np.int64], float | NDArray[np.float64]]:
+    """Vectorised :func:`carry_cells_scalar` - same cells, in numpy array operations.
+
+    ``increments`` is one axis (``n``) with a scalar ``carry``, or several axes at once
+    (``n x k``) with one carry per axis; the axes are done in the same array operations, which
+    is where most of the speed comes from (the planner quantises X and Y together).
+
+    **Why a prefix sum is not enough, and what makes this exact.**  The scalar rule truncates
+    *toward zero*, so the residual carries the sign of ``t``; with ``floor`` the cells would be
+    the plain difference of ``floor`` of the running sum, but with ``trunc`` a negative excursion
+    shifts a pulse by one tick (``v = -0.5`` repeated gives ``0, -1, 0, -1`` truncating and
+    ``-1, 0, -1, 0`` flooring).  The exact rule is recovered by carrying one *bit* of state:
+    write ``A_k`` for the running sum, ``F_k`` for its floor, ``R_k`` for the remainder and
+    ``Q_k`` for the pulses emitted so far, then ``Q_k = F_k + D_k`` with ``D_k`` in ``{0, 1}``,
+    and ``D`` obeys a set/clear/hold machine (``m_k = F_k - F_{k-1}``):
+
+    * ``R_k > 0 and m_k < 0``  -> ``D_k = 1``
+    * ``R_k == 0 or m_k >= 1`` -> ``D_k = 0``
+    * otherwise                 -> ``D_k = D_{k-1}``
+
+    "the last set/clear wins" is two ``maximum.accumulate`` passes (the index of the last set
+    against the index of the last clear), so the whole recurrence is data-parallel.
+    ``cell_k = Q_k - Q_{k-1}`` and the residual is ``A_n - Q_n``.
+
+    **Arithmetic.**  The recurrence runs in int64 on the fixed-point grid ``2**-bits``, with
+    ``bits`` chosen so every increment is at most ``2**47`` grid units.  Rounding the increments
+    onto that grid is what makes the result *exactly* the scalar loop's: a multiple of
+    ``2**-bits`` below ``2**(48-bits)`` in magnitude needs 48 mantissa bits, so on gridded input
+    the scalar ``t = v + c`` is computed without any rounding at all and both paths evaluate the
+    same exact rational recurrence.  The only difference from the *ungridded* scalar loop is that
+    each increment is first rounded to ~1 ulp (``2**-47`` of its own magnitude, ~4e-13 pulses on
+    a 50-pulse tick), which can only change a cell if the scalar ``t`` lands within that distance
+    of an integer; ``tests/test_plan_vectorised_equivalence.py`` holds the two together over
+    millions of random ticks and proves the identity on gridded input.
+
+    **The limit of that agreement** (review finding R-V4,
+    ``tests/test_plan_vectorisation_review.py``).  With *random* increments the grid roundings
+    are random too and the running sum wanders as ``sqrt(n)``, so the two paths agree cell for
+    cell over millions of ticks.  With a **constant** increment - a straight line at constant
+    speed, the commonest geometry there is - every tick gets the identical rounding and the sums
+    separate linearly in ``n``: on a 1 m line 2 cells of 40 000 differ, on a 10**6-tick diagonal
+    372.  What is guaranteed, and pinned by that file, is the bound rather than identity: the
+    emitted position never differs from the scalar loop by more than **one pulse** at any tick
+    (a pulse displaced by one 250 µs cycle, never dropped or duplicated), the totals are exactly
+    equal, and the residual carry stays inside ``n · max|increment| · 2**-47``.  That is below
+    the difference between this float64 model and the vendor's own x87 80-bit arithmetic, so it
+    is not worth the ~3 % of planner throughput a finer grid would cost (the chunk length, and
+    with it :data:`_CARRY_CHUNK`, has to shrink 64x to make the increments exact).
+    """
+    v = np.asarray(increments, dtype=np.float64)
+    flat = v.ndim == 1
+    # Internally one row per axis: the running sums and the two scans then walk memory
+    # contiguously, which is worth more than the transpose costs.
+    values = v.reshape(1, -1) if flat else v.T
+    carry_in = np.atleast_1d(np.asarray(carry, dtype=np.float64)).reshape(-1)
+    axes, n = values.shape
+    if carry_in.size != axes:
+        raise ValueError(f"{carry_in.size} carries for {axes} axes")
+    if n == 0:
+        return np.zeros((0,) if flat else (0, axes), dtype=np.int64), carry
+    if n <= _CARRY_SCALAR_MAX:
+        return _carry_cells_rows(values, carry_in, flat)
+    maxabs = max(float(values.max()), -float(values.min()))
+    if not np.isfinite(maxabs) or maxabs >= _CARRY_MAX_INCREMENT:
+        return _carry_cells_rows(values, carry_in, flat)
+    _, exp = np.frexp(maxabs)  # maxabs < 2**exp
+    bits = int(min(52, max(0, _CARRY_GRID_TARGET_BITS - int(exp))))
+    unit = 1 << bits
+    c = np.clip(np.rint(carry_in * float(unit)), -unit + 1, unit - 1).astype(np.int64)
+    c = c.reshape(-1, 1)
+    # order="C": `values` is a transposed view for the 2-D case, and the running sums below
+    # are much cheaper on rows that are contiguous in memory.
+    scaled = np.rint(values * float(unit)).astype(np.int64, order="C")
+    out = np.empty((axes, n), dtype=np.int64)
+    index = np.arange(min(n, _CARRY_CHUNK), dtype=np.int64).reshape(1, -1)
+    for lo in range(0, n, _CARRY_CHUNK):
+        block = scaled[:, lo : lo + _CARRY_CHUNK]
+        rows = block.shape[1]
+        idx = index[:, :rows]
+        a = np.cumsum(block, axis=1)
+        a += c
+        f = a >> bits  # floor: arithmetic shift
+        r = a & (unit - 1)  # a - (f << bits), in [0, unit)
+        f_prev = c >> bits  # 0 for a non-negative carry, -1 for a negative one
+        m = np.empty_like(f)
+        np.subtract(f[:, 1:], f[:, :-1], out=m[:, 1:])
+        m[:, 0] = f[:, 0] - f_prev[:, 0]
+        positive = r > 0
+        rise = positive & (m < 0)
+        clear = ~positive | (m >= 1)
+        # D starts at -f_prev (1 for a negative carry); seed the two scans so that state wins
+        # until the first real event.
+        started = -f_prev  # 0 or 1 per axis
+        last_rise = np.where(rise, idx, started - 2)
+        last_clear = np.where(clear, idx, -1 - started)
+        np.maximum.accumulate(last_rise, axis=1, out=last_rise)
+        np.maximum.accumulate(last_clear, axis=1, out=last_clear)
+        q = f
+        q += last_rise > last_clear  # Q = F + D, in place on f
+        np.subtract(q[:, 1:], q[:, :-1], out=out[:, lo + 1 : lo + rows])
+        out[:, lo] = q[:, 0]  # Q of the previous tick is 0 at the start of every chunk
+        c = a[:, -1:] - (q[:, -1:] << bits)
+    carry_out = c.reshape(-1) / float(unit)
+    if flat:
+        return out[0], float(carry_out[0])
+    return out.T, carry_out
+
+
+def _carry_cells_rows(
+    values: NDArray[np.float64], carry_in: NDArray[np.float64], flat: bool
+) -> tuple[NDArray[np.int64], float | NDArray[np.float64]]:
+    """:func:`carry_cells_scalar` per axis, on the ``k x n`` (row per axis) layout.
+
+    Taken for a short run (:data:`_CARRY_SCALAR_MAX`, where the loop is the faster of the two)
+    and for increments no fixed-point grid can hold - non-finite, or beyond
+    :data:`_CARRY_MAX_INCREMENT` (> 2**40 pulses in one 250 µs tick).
+    """
+    cells = np.empty(values.shape, dtype=np.int64)
+    out = np.empty(values.shape[0], dtype=np.float64)
+    for axis in range(values.shape[0]):
+        row, out[axis] = carry_cells_scalar(values[axis], float(carry_in[axis]))
+        cells[axis] = row
+    if flat:
+        return cells[0], float(out[0])
+    return cells.T, out
+
+
 class TickQuantizer:
     """Truncate-with-carry pulse quantiser (MainApp ``0x437500``, ``0x450130``; 11 §5.3).
 
@@ -256,11 +488,18 @@ class TickQuantizer:
     ``t = (Xs_i - Xs_{i-1})·f + carry``, ``cell = trunc(t)``, ``carry = t - cell``.  The carry is
     never reset by the vendor (static array ``0x9495b0``); :meth:`reset` exists for tests.
     Arithmetic is IEEE double here, x87 80-bit in the vendor (differences are far below a pulse).
+
+    :meth:`quantize_arrays` is the vectorised path (:func:`carry_cells`); :meth:`quantize` is the
+    list-returning wrapper the older callers use and keeps the arrays in :attr:`last_cells`, so a
+    streaming caller that has to go through ``quantize`` (subclasses override it) pays no list
+    round trip.
     """
 
     def __init__(self, scale: AxisScale | None = None, carry: tuple[float, float] = (0.0, 0.0)):
         self.scale = scale or AxisScale()
         self.carry = [float(carry[0]), float(carry[1])]
+        self.last_cells: tuple[NDArray[np.int64], NDArray[np.int64]] | None = None
+        """Cells of the last :meth:`quantize_arrays` call (see the class docstring)."""
 
     def reset(self, carry: tuple[float, float] = (0.0, 0.0)) -> None:
         """Set the residual carry (the vendor never does this)."""
@@ -268,24 +507,23 @@ class TickQuantizer:
 
     def quantize(self, points_mm: ArrayLike) -> tuple[list[int], list[int]]:
         """Increments for consecutive points (``n x 2`` mm) -> ``(dx, dy)`` pulse lists."""
+        dx, dy = self.quantize_arrays(points_mm)
+        return dx.tolist(), dy.tolist()
+
+    def quantize_arrays(self, points_mm: ArrayLike) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
+        """:meth:`quantize` without the list conversion; both axes in one pass (11 §5.3)."""
         pts = np.asarray(points_mm, dtype=np.float64).reshape(-1, 2)
         if len(pts) < 2:
-            return [], []
-        out = []
-        for axis, f in ((0, self.scale.x_factor), (1, self.scale.y_factor)):
-            scaled = pts[:, axis] * 10000.0
-            d = (np.diff(scaled) * f).tolist()
-            c = self.carry[axis]
-            cells: list[int] = []
-            append = cells.append
-            for v in d:
-                t = v + c
-                cell = int(t)  # truncation toward zero (_ftol2)
-                c = t - cell
-                append(cell)
-            self.carry[axis] = c
-            out.append(cells)
-        return out[0], out[1]
+            empty = np.zeros(0, dtype=np.int64)
+            self.last_cells = (empty, empty)
+            return empty, empty
+        scaled = pts * 10000.0
+        increments = scaled[1:] - scaled[:-1]
+        increments *= (self.scale.x_factor, self.scale.y_factor)
+        cells, carry = carry_cells(increments, self.carry)
+        self.carry = [float(carry[0]), float(carry[1])]  # type: ignore[index]
+        self.last_cells = (cells[:, 0], cells[:, 1])
+        return self.last_cells
 
 
 # ================================================================================================
@@ -730,6 +968,117 @@ class JobStreamBuilder:
             packer.add_record([it.words() for it in group], sum(1 for it in group if it.laser))
         packer.end_batch()
         return packer.frames
+
+
+class JobFrameStream:
+    """Streaming, vectorised counterpart of :meth:`JobStreamBuilder.frames` (STATUS §5 task 6).
+
+    :meth:`JobStreamBuilder.frames` builds one :class:`Record`, one :class:`Item` and one word
+    list per 250 µs tick and returns the whole job as a list of frames.  That is ~7 µs and a few
+    hundred bytes per tick; PORT-PLAN §8.3's 100 000-contour job is 67.5 M ticks, so it costs
+    minutes and cannot be held in memory at all (202 M words).
+
+    This class emits the *same* frames - the same records, in the same order, packed by the same
+    300-word rule - but hands each one back as it closes and never builds a Python object per
+    tick: a run of ticks goes straight from the quantiser's pulse arrays through
+    :func:`tick_words` into :meth:`nexcut.mcc.fifo.FrameStream.push_uniform`.  Only the handful
+    of control records per contour (the prologue/epilogue of 11 §5.4) still take the scalar
+    :class:`ItemBuilder` path, which is where the grammar - the automatic 3001 after a run of
+    ticks included - stays defined exactly once.
+
+    The record grammar itself is not duplicated: the wrapped :class:`JobStreamBuilder` appends
+    the prologue/epilogue records to :attr:`JobStreamBuilder.records` and this class drains that
+    list after every step.  ``tests/test_plan_vectorised_equivalence.py`` pins frame-for-frame
+    identity with the scalar path.
+    """
+
+    def __init__(self, builder: JobStreamBuilder | None = None) -> None:
+        self.builder = builder or JobStreamBuilder()
+        self.items = ItemBuilder(self.builder.config)
+        self.items.new_batch()
+        self.stream = FrameStream()
+        self.ticks = 0
+        """Opcode-3000 items emitted so far (what :func:`total_ticks` would count)."""
+        self.frames = 0
+        """Frames yielded so far."""
+
+    def _drain(self) -> Iterator[PackedFrame]:
+        """Records the wrapped builder has appended -> items -> frames."""
+        records = self.builder.records
+        for rec in records:
+            group = self.items.build(rec)
+            self.ticks += sum(1 for it in group if it.opcode == OP_TICK)
+            closed = self.stream.push_record(
+                [it.words() for it in group], sum(1 for it in group if it.laser)
+            )
+            for frame in closed:
+                self.frames += 1
+                yield frame
+        records.clear()
+
+    def motion(
+        self, points_mm: ArrayLike, freq: ArrayLike = 0, duty: ArrayLike = 0
+    ) -> Iterator[PackedFrame]:
+        """Quantise a sampled point list and stream one opcode-3000 tick per interval.
+
+        The vectorised twin of :meth:`JobStreamBuilder.add_motion`; ``freq``/``duty`` are scalars
+        or per-interval arrays, and a dry run (``laser_records=False``) forces duty 0 exactly as
+        the scalar path does.
+
+        Records the wrapped builder has queued but not yet drained go out **first**, exactly
+        where :meth:`JobStreamBuilder.add_motion` would leave them: the scalar path appends
+        every record to one list, so a prologue written before a move precedes its ticks.  The
+        drain is a no-op in :meth:`contour`, which drains after every step anyway; it is what
+        keeps a laser / PWM / ZF record from landing *after* the ticks it has to precede when
+        ``motion`` is driven directly (11 §5.4).
+        """
+        yield from self._drain()
+        quantizer = self.builder.quantizer
+        if type(quantizer) is TickQuantizer:
+            dx, dy = quantizer.quantize_arrays(points_mm)
+        else:
+            # A subclass may override `quantize` (tests hook the point lists there), so call it
+            # and take the arrays back out of `last_cells` rather than re-converting the lists.
+            quantizer.last_cells = None
+            listed = quantizer.quantize(points_mm)
+            cells = quantizer.last_cells
+            if cells is None:  # an override that did not call through: pay the conversion
+                cells = (
+                    np.asarray(listed[0], dtype=np.int64),
+                    np.asarray(listed[1], dtype=np.int64),
+                )
+            dx, dy = cells
+        if dx.size == 0:
+            return
+        words, laser = tick_words(dx, dy, freq, duty if self.builder.laser_records else 0)
+        self.ticks += int(dx.size)
+        self.items.prev_type = RecordType.TICK  # the next control record gets its 3001
+        for frame in self.stream.push_uniform(words, 3, laser):
+            self.frames += 1
+            yield frame
+
+    def contour(
+        self,
+        points_mm: ArrayLike,
+        freq: ArrayLike,
+        duty: ArrayLike,
+        laser: ContourLaser | None = None,
+    ) -> Iterator[PackedFrame]:
+        """Prologue + cut ticks + epilogue (:meth:`JobStreamBuilder.add_contour`)."""
+        laser = laser or ContourLaser()
+        self.builder.prologue(laser)
+        yield from self._drain()
+        yield from self.motion(points_mm, freq, duty)
+        self.builder.epilogue(laser)
+        yield from self._drain()
+
+    def finish(self) -> Iterator[PackedFrame]:
+        """Job end: the gas-off records and the last, partly filled frame."""
+        self.builder.finish()
+        yield from self._drain()
+        for frame in self.stream.flush():
+            self.frames += 1
+            yield frame
 
 
 def items_duration_s(items: Iterable[Item], cycle_us: int = INTERP_CYCLE_US) -> float:

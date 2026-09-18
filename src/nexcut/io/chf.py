@@ -121,7 +121,9 @@ END_SCAN_PATH = "<End Scan path>"
 TEXT_PARA = "<Text para>"
 END_TEXT_PARA = "<End Text para>"
 
-# Reserved blank-line counts of versions 2..4 (03 §9, counted loops at the cited VAs).
+# Reserved-line counts of versions 2..4 (03 §9, counted loops at the cited VAs).  The
+# lines are blank in every shipped sample; their raw text is kept in the model anyway
+# (``legacy_reserved*``, docs/DECISIONS.md D14).
 LEGACY_BLANKS_BEGIN_GRAPHS = 5  # mov esi,5   @0x100a991d
 LEGACY_BLANKS_GLYPHS = 10  # mov ebx,0xa @0x1006b51a
 LEGACY_BLANKS_PER_GLYPH = 3  # mov ebx,3   @0x1006b64f
@@ -500,14 +502,30 @@ class _Tokens:
         if self.strict and not t.startswith(_MARKER_BYTES.get(prefix) or _marker_bytes(prefix)):
             raise ChfError(f"expected {prefix!r}, got {t!r}", 3, i + 1)
 
-    def skip(self, n: int) -> None:
-        """Consume ``n`` tokens (end of file is reported by the next read, as in the DLL)."""
+    def reserved(self, n: int) -> list[str]:
+        """Consume the ``n`` reserved lines of a v2-v4 record and return them (03 §9, D14).
+
+        The DLL consumes them with a counted ``ReadToken`` loop and never looks at
+        them; the port keeps the raw text in a model slot so a file that does put
+        something there round-trips (docs/DECISIONS.md D14).  Tokens are latin-1
+        decoded, which is lossless for any byte the tokenizer can produce.
+
+        All-empty reserved lines - the only thing any shipped sample has - return the
+        empty list, not a list of empty strings: the writer pads to ``n`` either way,
+        so the two are the same file, and a model built by the port stays equal to the
+        same model read back (and a 50 000-contour v4 file allocates nothing here).
+        """
         if n <= 0:
-            return
-        if self.line + n > len(self._tokens):
+            return []
+        i = self.line
+        if i + n > len(self._tokens):
             self.line = len(self._tokens)
             raise ChfError("unexpected end of file", 4, self.line + 1)
-        self.line += n
+        self.line = i + n
+        raw = self._tokens[i : i + n]
+        if not any(raw):
+            return []
+        return [tok.decode("latin-1") for tok in raw]
 
 
 # ---------------------------------------------------------------------------
@@ -554,7 +572,7 @@ def _read_contour(tk: _Tokens, version: int) -> Contour:
     c.precision = tk.double()
     tk.marker(GLYPHS)
     if _legacy(version):
-        tk.skip(LEGACY_BLANKS_GLYPHS)
+        c.legacy_reserved_glyphs = tk.reserved(LEGACY_BLANKS_GLYPHS)
     c.length = tk.double()
     c.bbox_min = tk.point()
     c.bbox_max = tk.point()
@@ -567,16 +585,17 @@ def _read_contour(tk: _Tokens, version: int) -> Contour:
         tk.header(GLY)
         direction = tk.int()
         gtype = tk.int()
-        c.elements.append(ContourElement(_read_glyph(tk, gtype), direction))
+        el = ContourElement(_read_glyph(tk, gtype), direction)
+        c.elements.append(el)
         if _legacy(version):
-            tk.skip(LEGACY_BLANKS_PER_GLYPH)
+            el.legacy_reserved = tk.reserved(LEGACY_BLANKS_PER_GLYPH)
     tk.marker(END_GLYPHS)
     c.layer = tk.int()
     c.int58 = tk.int()
     tk.marker(CRAFTS)
-    if _legacy(version):
-        tk.skip(LEGACY_BLANKS_CRAFTS)
     cr = c.crafts
+    if _legacy(version):
+        cr.legacy_reserved = tk.reserved(LEGACY_BLANKS_CRAFTS)
     cr.compensate_type = tk.int()
     cr.compensate_width = tk.double()
     tk.marker(PWM)
@@ -612,7 +631,7 @@ def _read_contour(tk: _Tokens, version: int) -> Contour:
 def _read_group_into(tk: _Tokens, version: int, g: Group) -> Group:
     """``CGlyGroup::Read`` ``0x10076910`` (03 §6.2)."""
     if _legacy(version):
-        tk.skip(LEGACY_BLANKS_GROUP)
+        g.legacy_reserved = tk.reserved(LEGACY_BLANKS_GROUP)
     g.length = tk.double()
     g.bbox_min = tk.point()
     g.bbox_max = tk.point()
@@ -660,7 +679,7 @@ def _read_scan(tk: _Tokens, version: int) -> Scan:
     _read_group_into(tk, version, g)
     tk.marker(SCAN_PATH)
     if _legacy(version):
-        tk.skip(LEGACY_BLANKS_SCAN)
+        g.legacy_reserved_paths = tk.reserved(LEGACY_BLANKS_SCAN)
     n = tk.int()
     for _ in range(n):
         tk.header(SCAN_PATH_NO)
@@ -673,7 +692,7 @@ def _read_text(tk: _Tokens, version: int) -> Text:
     """``CGlyText::Read`` ``0x100a4030`` (03 §6.3)."""
     g = Text()
     if _legacy(version):
-        tk.skip(LEGACY_BLANKS_TEXT)
+        g.legacy_reserved = tk.reserved(LEGACY_BLANKS_TEXT)
     g.position = tk.point()
     g.d130 = tk.double()
     g.d138 = tk.double()
@@ -756,7 +775,7 @@ def read_chf(data: bytes, *, strict: bool = True, drop_degenerate: bool = False)
     doc.version = tk.int()
     tk.marker(BEGIN_GRAPHS)
     if _legacy(doc.version):
-        tk.skip(LEGACY_BLANKS_BEGIN_GRAPHS)
+        doc.legacy_reserved = tk.reserved(LEGACY_BLANKS_BEGIN_GRAPHS)
     n = tk.int()
     for _ in range(n):
         tk.header(GRAPH_NO)
@@ -870,8 +889,23 @@ class _Out:
                 return
         self.point(p)
 
-    def blanks(self, n: int) -> None:
-        self.lines.extend([b""] * n)
+    def reserved(self, lines: Sequence[str], n: int) -> None:
+        """Write the ``n`` reserved lines of a v2-v4 record (03 §9, docs/DECISIONS.md D14).
+
+        ``lines`` are the raw lines kept by the model (empty in every shipped sample and in
+        anything the port builds itself), padded with empty lines to ``n``.  More than ``n``
+        would change the grammar the vendor reader counts on, so it is refused; a line break
+        inside one would too.
+        """
+        if len(lines) > n:
+            raise ValueError(
+                f"this record reserves {n} lines in .chf v2-v4, got {len(lines)} (03 §9)"
+            )
+        for i in range(n):
+            s = lines[i] if i < len(lines) else ""
+            if "\r" in s or "\n" in s:
+                raise ValueError(f"reserved line {s!r} contains a line break")
+            self.lines.append(s.encode("latin-1"))
 
 
 def _write_glyph(o: _Out, g: Glyph) -> None:
@@ -925,7 +959,7 @@ def _write_contour(o: _Out, c: Contour, version: int) -> None:
     o.double(c.precision)
     o.str(GLYPHS)
     if legacy:
-        o.blanks(LEGACY_BLANKS_GLYPHS)
+        o.reserved(c.legacy_reserved_glyphs, LEGACY_BLANKS_GLYPHS)
     o.double(c.length)
     o.point(c.bbox_min)
     o.point(c.bbox_max)
@@ -938,14 +972,14 @@ def _write_contour(o: _Out, c: Contour, version: int) -> None:
         o.int(el.glyph.TYPE)
         _write_glyph(o, el.glyph)
         if legacy:
-            o.blanks(LEGACY_BLANKS_PER_GLYPH)
+            o.reserved(el.legacy_reserved, LEGACY_BLANKS_PER_GLYPH)
     o.str(END_GLYPHS)
     o.int(c.layer)
     o.int(c.int58)
     o.str(CRAFTS)
-    if legacy:
-        o.blanks(LEGACY_BLANKS_CRAFTS)
     cr = c.crafts
+    if legacy:
+        o.reserved(cr.legacy_reserved, LEGACY_BLANKS_CRAFTS)
     o.int(cr.compensate_type)
     o.double(cr.compensate_width)
     o.str(PWM)
@@ -982,7 +1016,7 @@ def _write_contour(o: _Out, c: Contour, version: int) -> None:
 def _write_group(o: _Out, g: Group, version: int) -> None:
     """``CGlyGroup::Write`` ``0x10074630`` (03 §6.2)."""
     if _legacy(version):
-        o.blanks(LEGACY_BLANKS_GROUP)
+        o.reserved(g.legacy_reserved, LEGACY_BLANKS_GROUP)
     o.double(g.length)
     o.point(g.bbox_min)
     o.point(g.bbox_max)
@@ -1019,7 +1053,7 @@ def _write_graph(o: _Out, g: Graph, version: int) -> None:
             _write_group(o, g, version)
             o.str(SCAN_PATH)
             if legacy:
-                o.blanks(LEGACY_BLANKS_SCAN)
+                o.reserved(g.legacy_reserved_paths, LEGACY_BLANKS_SCAN)
             o.int(len(g.paths))
             for i, p in enumerate(g.paths, 1):
                 o.str_int(SCAN_PATH_NO, i)
@@ -1029,7 +1063,7 @@ def _write_graph(o: _Out, g: Graph, version: int) -> None:
             _write_group(o, g, version)
         case Text():  # 0x100a1fe0
             if legacy:
-                o.blanks(LEGACY_BLANKS_TEXT)
+                o.reserved(g.legacy_reserved, LEGACY_BLANKS_TEXT)
             o.point(g.position)
             o.double(g.d130)
             o.double(g.d138)
@@ -1061,8 +1095,12 @@ def write_chf(
     """Serialise a document to ``.chf`` bytes (03 §4.1, §5-§8).
 
     ``version`` defaults to ``doc.version``; 5 is the current writer
-    (``0x100ddf89``).  Versions 1-4 invert the reader gates of 03 §9 (the
-    reserved lines are written as empty lines, as ``WriteStr(NULL)`` would).
+    (``0x100ddf89``).  Versions 1-4 invert the reader gates of 03 §9: each
+    record re-emits the reserved lines it read (``legacy_reserved*``), padded
+    with empty lines as ``WriteStr(NULL)`` would write them - so a v2-v4 file
+    round-trips byte for byte even if something did put content there
+    (docs/DECISIONS.md D14).  Writing a v5 document as v4 emits blank reserved
+    lines, because a v5 file has none to carry.
     UNVERIFIED: no v1-v4 writer exists in the shipped DLL; v4 output is
     confirmed only by the four byte-identical v4 samples.  Cached geometry
     (``length``, bbox, ``start``, ``end``) is written as stored.
@@ -1075,7 +1113,7 @@ def write_chf(
     o.int(v)  # WriteInt([this+0x970])
     o.str(BEGIN_GRAPHS)  # WriteGraphs 0x100a52a0
     if _legacy(v):
-        o.blanks(LEGACY_BLANKS_BEGIN_GRAPHS)
+        o.reserved(doc.legacy_reserved, LEGACY_BLANKS_BEGIN_GRAPHS)
     o.int(len(doc.graphs))
     for i, g in enumerate(doc.graphs, 1):
         o.str_int(GRAPH_NO, i)

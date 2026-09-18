@@ -1015,14 +1015,21 @@ class MccDaemon:
 
     # ------------------------------------------------------------------------------- status
 
-    def snapshot(self) -> StatusSnapshot:
-        """Current decoded status (11 §4)."""
+    def snapshot(self, conn: Connection | None = None) -> StatusSnapshot:
+        """Current decoded status (11 §4).
+
+        ``conn`` is the connection the snapshot is built for: it decides
+        ``arm_owner_is_self`` (D9/R12 - the arming owner is the only connection that may
+        move, so a client has to be able to see whether that is itself).  Without a
+        connection the field stays ``None``; ``arm_owner`` is filled in either way.
+        """
         now = time.monotonic()
         with self._lock:
             b = list(self.block1000) if self.block1000 is not None else None
             ro = list(self.axis_ro) if self.axis_ro is not None else None
             ro_t, sysrw, zf = self.axis_ro_t, self.system_rw, self.zf_status
             link, err = self.link, self.last_error
+            owner = self._arm_owner
         leases = self.gate.leases()
         last = self.gate.last_status_ok
         reasons: list[str] = []
@@ -1041,6 +1048,8 @@ class MccDaemon:
             arm_state=str(self.gate.arming.state),
             estop_latched=self.gate.arming.estop_latched,
             poll_age_s=None if last is None else now - last,
+            arm_owner=owner,
+            arm_owner_is_self=None if conn is None else owner == conn.id,
             block1000=b,
             axis_ro=ro,
             axis_ro_age_s=None if ro_t is None else now - ro_t,
@@ -1067,8 +1076,10 @@ class MccDaemon:
             except Exception:  # pragma: no cover
                 log.exception("snapshot")
                 continue
+            owner = data["arm_owner"]
             for conn in due:
-                conn.push_event("status", data)
+                # arm_owner_is_self is per subscriber (D9/R12); everything else is shared.
+                conn.push_event("status", {**data, "arm_owner_is_self": owner == conn.id})
 
     # ---------------------------------------------------------------------------- homing
 
@@ -1294,7 +1305,7 @@ class MccDaemon:
         }
 
     def _cmd_status(self, conn: Connection | None, req: dict[str, Any]) -> Any:
-        return self.snapshot().to_json()
+        return self.snapshot(conn).to_json()
 
     def _cmd_subscribe(self, conn: Connection | None, req: dict[str, Any]) -> Any:
         if conn is None:

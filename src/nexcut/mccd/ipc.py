@@ -25,6 +25,12 @@ Wire format, one JSON object per ``\\n``-terminated UTF-8 line (max :data:`MAX_L
 * event    ``{"event": "status", "seq": n, "data": {...}}`` - pushed after ``subscribe``,
   interleaved with responses on the same connection.
 
+:class:`Connection.id` is what the daemon records as the arming owner (D9): it appears as
+``arm_owner`` in the ``arm_motion`` reply and in every status payload, and each connection's
+own view of it as ``arm_owner_is_self`` - computed per connection, in the ``status`` reply and
+in every pushed ``status`` event.  Ids are unique for the life of one daemon process and are
+never reused; a restarted daemon starts again at 1.
+
 Error codes: ``bad_request``, ``unknown_command``, ``refused`` (safety gate / policy),
 ``arming``, ``busy``, ``not_connected``, ``card`` (transaction failure), ``internal``.
 The command set is defined by the daemon (:data:`nexcut.mccd.daemon.IPC_COMMANDS`).

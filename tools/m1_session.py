@@ -18,6 +18,12 @@ What the tool does (PORT-PLAN §8.2, 11 §7):
 * Every motion is preceded by the planned vector(s) and needs an explicit ``y``; anything
   else (including an empty answer) skips that motion. The tool arms the daemon only after
   that ``y`` and disarms at the end of each step.
+* Arming - and with it the right to move - belongs to the IPC connection that asked for it
+  (docs/DECISIONS.md D9 and its R12 amendment). ``DaemonLink`` reconnects lazily, so a link
+  blip mid-step silently leaves the tool on a connection that owns neither. Every motion
+  command therefore goes through :meth:`M1Session._motion_call`, which notices the new
+  connection, re-runs *this step's* arming step, confirms with ``status`` that the daemon
+  agrees (``arm_owner_is_self``), and otherwise raises :class:`ArmingLost` and sends nothing.
 * Observations (automatic decodes and the operator's typed notes) go to
   ``~/mlaser-captures/m1-<date>/report.json`` and ``report.md`` after every step.
 * At the end it runs ``python -m nexcut.mcc.dissector`` on the pcap (if present), appends
@@ -255,6 +261,16 @@ class SessionAborted(Exception):
     """The session cannot continue (operator refusal, closed input)."""
 
 
+class ArmingLost(Exception):
+    """A reconnect dropped the arming of the running step and it could not be restored.
+
+    Raised instead of sending a motion command on a connection that does not own the arming
+    (docs/DECISIONS.md D9/R12). The step is recorded as incomplete and nothing is sent, which
+    is the safe direction: the operator armed for a step that no longer exists on the daemon
+    side.
+    """
+
+
 class Operator(Protocol):
     """Where prompts go. ``key`` is a stable id of the prompt (tests script answers by key)."""
 
@@ -309,11 +325,20 @@ class DaemonUnavailable(Exception):
 
 
 class DaemonLink:
-    """IPC client with lazy (re)connect. Only idempotent commands are retried."""
+    """IPC client with lazy (re)connect. Only idempotent commands are retried.
+
+    ``generation`` counts the connections this link has opened. It matters because a
+    reconnect is a **new** IPC connection, and arming - together with the right to move -
+    belongs to the connection that asked for it (docs/DECISIONS.md D9 and its R12
+    amendment). A caller that armed at generation *n* and finds itself at *n+1* has lost
+    both, silently, and must arm again before it may send another motion command.
+    """
 
     def __init__(self, socket_path: Path, timeout: float = 10.0) -> None:
         self.path = socket_path
         self.timeout = timeout
+        self.generation = 0
+        """Number of connections opened so far; 0 before the first one."""
         self._client: MccdClient | None = None
 
     def _get(self) -> MccdClient:
@@ -322,6 +347,7 @@ class DaemonLink:
                 self._client = MccdClient(self.path, timeout=self.timeout)
             except OSError as exc:
                 raise DaemonUnavailable(f"{self.path}: {exc}") from exc
+            self.generation += 1
         return self._client
 
     def call(self, cmd: str, **args: Any) -> Any:
@@ -812,6 +838,8 @@ class M1Session:
             "abort_reason": None,
         }
         self._armed = False
+        self._arm_generation = 0
+        """``DaemonLink.generation`` the current arming was made on (D9/R12)."""
         self._k = EXPECT_K
         self._current: StepRecord | None = None
 
@@ -880,9 +908,11 @@ class M1Session:
             rec.event("marker", what=what, ok=False, error=str(exc))
 
     def _arm(self, rec: StepRecord) -> None:
+        """Arm motion and remember which connection it was armed on (D9/R12)."""
         res = self.link.call("arm_motion")
         self._armed = True
-        rec.event("arm_motion", reply=res)
+        self._arm_generation = self.link.generation
+        rec.event("arm_motion", reply=res, connection=self._arm_generation)
 
     def _disarm(self, rec: StepRecord | None, why: str) -> None:
         if not self._armed:
@@ -890,11 +920,85 @@ class M1Session:
         try:
             res = self.link.call("disarm")
             self._armed = False
+            self._arm_generation = 0
             if rec is not None:
                 rec.event("disarm", why=why, reply=res)
         except (IpcError, DaemonUnavailable) as exc:
             if rec is not None:
                 rec.event("disarm", why=why, ok=False, error=str(exc))
+
+    def _motion_call(self, rec: StepRecord, cmd: str, **args: Any) -> dict[str, Any]:
+        """Send one owned motion command, re-arming first if a reconnect dropped the arming.
+
+        ``DaemonLink`` reconnects lazily, and a reconnect is a new IPC connection that owns
+        neither the arming nor the right to move (docs/DECISIONS.md D9 and its R12
+        amendment). Every step arms once and then sends several commands, and the ones in
+        between - ``status``, ``read_block`` - are retried on a fresh connection when the
+        link blips, so the motion that follows would be refused with a bare ``arming:``
+        message the operator has to decode.
+
+        So: before every ``jog_step`` / ``jog_continuous_start`` / ``home``, compare the
+        link's connection generation with the one the arming was made on. If they differ,
+        **ask the operator** whether to arm again, and only then re-run this step's arming
+        step and verify with ``status`` that the daemon really considers this connection the
+        owner (``arm_owner_is_self``). If any of that fails - including a ``no`` - raise
+        :class:`ArmingLost` and send nothing.
+        """
+        self._ensure_armed(rec, cmd)
+        try:
+            return dict(self.link.call(cmd, **args))
+        except DaemonUnavailable:
+            # The connection died with the command in flight: the arming went with it.
+            self._armed = False
+            self._arm_generation = 0
+            raise
+
+    def _ensure_armed(self, rec: StepRecord, what: str) -> None:
+        """Re-arm when a reconnect invalidated the arming; refuse if it cannot be restored."""
+        if not self._armed:
+            raise ArmingLost(f"{what} needs an arming step, and this step has none")
+        if self.link.generation == self._arm_generation:
+            return
+        rec.event(
+            "arming_lost",
+            what=what,
+            armed_on_connection=self._arm_generation,
+            now_on_connection=self.link.generation,
+            note="the link reconnected; D9/R12 give arming and the right to move to the "
+            "connection that asked for it, so the tool arms again before it sends anything",
+        )
+        self.op.say(
+            "    Link to nexcut-mccd reconnected: the arming did not survive it (D9), so the\n"
+            "    daemon has already STOPPED the machine and DISARMED it. Arming again puts it\n"
+            "    back under power, and the axis may not be where this step left it."
+        )
+        self._armed = False
+        # The consent the operator gave was for a motion on a machine that is no longer in
+        # that state: D9 had the daemon stop and disarm when the connection went. Re-arming
+        # is therefore its own decision, and the default is No (docs/DECISIONS.md D9).
+        if not self.op.confirm(
+            f"s{rec.info.n}.rearm.{what}",
+            "    Arm again and continue this step?",
+        ):
+            rec.event("rearm_declined", what=what, note="operator declined; nothing sent")
+            raise ArmingLost(
+                f"the link reconnected and the operator declined to arm again before {what}"
+            )
+        try:
+            self._arm(rec)
+        except (IpcError, DaemonUnavailable) as exc:
+            raise ArmingLost(f"re-arming after the reconnect failed: {exc}") from exc
+        try:
+            snap = self.link.call("status")
+        except (IpcError, DaemonUnavailable) as exc:
+            raise ArmingLost(f"could not confirm the new arming: {exc}") from exc
+        if snap.get("arm_owner_is_self") is not True or snap.get("arm_state") == "DISARMED":
+            raise ArmingLost(
+                f"the daemon does not consider this connection the arming owner after "
+                f"re-arming (arm_state {snap.get('arm_state')}, arm_owner "
+                f"{snap.get('arm_owner')}); nothing sent"
+            )
+        rec.event("arming_restored", what=what, connection=self._arm_generation)
 
     def _emergency_stop(self, why: str) -> None:
         """Ctrl-C / abort: stop, then disarm (the daemon also stops on client disconnect)."""
@@ -908,6 +1012,7 @@ class M1Session:
                 if rec is not None:
                     rec.event(cmd, why=why, ok=False, error=str(exc))
         self._armed = False
+        self._arm_generation = 0
 
     def _wait_connected(self, rec: StepRecord | None, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
@@ -973,6 +1078,17 @@ class M1Session:
         try:
             self._arm(rec)
             action(entry)
+        except ArmingLost as exc:
+            # D9/R12: the arming of this step is gone and could not be restored - refuse the
+            # rest of the step rather than send a motion the daemon would (rightly) refuse.
+            entry["outcome"] = entry.get("outcome") or f"arming lost: {exc}"
+            entry["error"] = {"code": "arming", "message": str(exc)}
+            rec.incomplete = True
+            self.op.say(
+                f"    Arming lost, nothing sent: {exc}\n"
+                f"    Re-run this step on its own with --steps {rec.info.n}."
+            )
+            return entry
         except IpcError as exc:
             entry["outcome"] = (
                 entry.get("outcome") or f"refused by the daemon: {exc.code}: {exc.message}"
@@ -1063,7 +1179,7 @@ class M1Session:
         while_moving: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         t_sent = time.time()
-        res = self.link.call("jog_step", slot=slot, mm=mm, speed=speed)
+        res = self._motion_call(rec, "jog_step", slot=slot, mm=mm, speed=speed)
         self._compare(entry, res.get("words") or [])
         entry["deadman_lease"] = bool(res.get("deadman"))
         rec.event("jog_step", slot=slot, mm=mm, speed=speed, reply=res)
@@ -1274,6 +1390,10 @@ class M1Session:
         except IpcError as exc:
             rec.event("error", error=f"{exc.code}: {exc.message}")
             self.op.say(f"Daemon error: {exc.code}: {exc.message}. Step recorded as failed.")
+            status = "failed"
+        except ArmingLost as exc:
+            rec.event("error", error=f"arming lost: {exc}")
+            self.op.say(f"Arming lost: {exc}. Step recorded as failed; nothing was sent.")
             status = "failed"
         self._disarm(rec, "step end")
         with contextlib.suppress(IpcError, DaemonUnavailable):
@@ -1486,10 +1606,13 @@ class M1Session:
             if not again:
                 return
             try:
-                res = self.link.call("jog_step", slot=0, mm=mm, speed=speed)
+                res = self._motion_call(rec, "jog_step", slot=0, mm=mm, speed=speed)
                 second.update({**_stamp(), "sent": True, "reply": res})
             except IpcError as exc:
                 second.update({**_stamp(), "sent": False, "error": f"{exc.code}: {exc.message}"})
+            except ArmingLost as exc:
+                # The first jog is still running; let it finish rather than abort the step.
+                second.update({**_stamp(), "sent": False, "error": f"arming lost: {exc}"})
             rec.event("jog_while_moving", **second)
 
         wait: dict[str, Any] = {}
@@ -1615,7 +1738,9 @@ class M1Session:
         result: dict[str, Any] = {}
 
         def action(entry: dict[str, Any]) -> None:
-            res = self.link.call("jog_continuous_start", slot=0, positive=True, speed=speed)
+            res = self._motion_call(
+                rec, "jog_continuous_start", slot=0, positive=True, speed=speed
+            )
             t_start = time.time()
             self._compare(entry, res.get("words") or [])
             rec.event("jog_continuous_start", reply=res)
@@ -1710,7 +1835,7 @@ class M1Session:
                 entry: dict[str, Any], slot: int = slot, info: dict[str, Any] = info
             ) -> None:
                 t_sent = time.time()
-                res = self.link.call("home", slots=[slot])
+                res = self._motion_call(rec, "home", slots=[slot])
                 rec.event("home", slot=slot, reply=res)
                 entry["sent_words"] = None
                 entry["matches_plan"] = (

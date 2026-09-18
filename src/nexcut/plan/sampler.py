@@ -145,9 +145,12 @@ class PathGeometry:
     def point_at(self, s: FloatArray | float) -> FloatArray:
         """XY at abscissa ``s`` (clamped to the path), ``n x 2``."""
         ss = np.clip(np.atleast_1d(np.asarray(s, dtype=np.float64)), 0.0, self.length)
-        return np.column_stack(
-            (np.interp(ss, self.s, self.xy[:, 0]), np.interp(ss, self.s, self.xy[:, 1]))
-        )
+        # Written into one output array rather than column_stack'ed: this runs once per contour
+        # and once per rapid of a job, and PORT-PLAN §8.3 counts every array call (STATUS §5.6).
+        out = np.empty((ss.size, 2), dtype=np.float64)
+        out[:, 0] = np.interp(ss, self.s, self.xy[:, 0])
+        out[:, 1] = np.interp(ss, self.s, self.xy[:, 1])
+        return out
 
 
 @dataclass(slots=True)
@@ -201,7 +204,7 @@ def sample_plan(
     elif per_segment:
         t0 = 0.0
         first = True
-        seg_start = np.concatenate(([0.0], np.cumsum([p.total_time for p in plan.profiles])))
+        seg_start: FloatArray | None = None  # built on demand: most plans skip no segment
         run_start = -1.0  # global start time of the current run of skipped segments
         run_time = 0.0
 
@@ -225,6 +228,10 @@ def sample_plan(
             if is_dropped or (n == 0 and not first):
                 dropped += int(is_dropped)
                 if run_start < 0.0:
+                    if seg_start is None:
+                        seg_start = np.concatenate(
+                            ([0.0], np.cumsum([p.total_time for p in plan.profiles]))
+                        )
                     run_start = float(seg_start[i])
                 run_time += prof.total_time
                 continue
@@ -240,9 +247,12 @@ def sample_plan(
         fill_run()
         if not s_parts:
             t_parts, s_parts, v_parts = [np.zeros(1)], [np.zeros(1)], [np.zeros(1)]
-        t = np.concatenate(t_parts)
-        s = np.concatenate(s_parts)
-        v = np.concatenate(v_parts)
+        if len(s_parts) == 1:  # one profile (every rapid, and most single-glyph contours)
+            t, s, v = t_parts[0], s_parts[0], v_parts[0]
+        else:
+            t = np.concatenate(t_parts)
+            s = np.concatenate(s_parts)
+            v = np.concatenate(v_parts)
     else:
         n = int(np.ceil(plan.total_time / dt - _EPS))
         t = np.arange(n + 1, dtype=np.float64) * dt

@@ -6,6 +6,18 @@ doubles, the contour-ex link records) - so a document read and written again
 preserves the Windows program's values (03 §14 "design notes").  Derived cached
 values (``length``, bbox, ``start``, ``end``) are stored as read; recomputation
 lives in :mod:`nexcut.model.flatten`.
+
+**``legacy_reserved*`` slots (03 §9, docs/DECISIONS.md D14).**  Versions 2-4 emit a fixed
+number of extra lines at seven defined places.  The vendor reader consumes them with a
+counted ``ReadToken`` loop and never looks at them; every shipped sample leaves them empty,
+and no v2-v4 writer exists in the shipped DLL.  Rather than drop what cannot be modelled,
+each record keeps the raw text of the lines it owns, so a v2-v4 file written by some other
+producer round-trips byte for byte.  Entries are tokens as read, latin-1 decoded (the
+tokenizer has already dropped spaces and tabs, 03 §4.2); on write a short list is padded
+with empty lines and a list longer than the slot count is refused.  Reserved lines that are
+all empty - the only case any shipped sample has - are kept as the empty list, so a record
+the port built and the same record read back compare equal.  The lists are always empty for
+versions 1 and 5, which have no reserved lines.
 """
 
 from __future__ import annotations
@@ -77,6 +89,8 @@ class Crafts:
     lead_line: LeadLine = field(default_factory=LeadLine)
     cool_pos: list[float] | None = field(default_factory=list)
     """``[+0x14c]``: cooling-stop positions (unit undetermined)."""
+    legacy_reserved: list[str] = field(default_factory=list)
+    """v2-v4: the 20 reserved lines after ``<Crafts>`` (``mov ebx,0x14`` @``0x1006b6f7``)."""
 
 
 @dataclass(slots=True)
@@ -89,6 +103,8 @@ class ContourElement:
 
     glyph: Glyph
     direction: int = 1
+    legacy_reserved: list[str] = field(default_factory=list)
+    """v2-v4: the 3 reserved lines after this glyph (``mov ebx,3`` @``0x1006b64f``)."""
 
 
 @dataclass(slots=True)
@@ -110,6 +126,8 @@ class Contour:
     layer: int = 0
     int58: int = 1
     crafts: Crafts = field(default_factory=Crafts)
+    legacy_reserved_glyphs: list[str] = field(default_factory=list)
+    """v2-v4: the 10 reserved lines after ``<Glyphs>`` (``mov ebx,0xa`` @``0x1006b51a``)."""
 
     TYPE = GraphType.CONTOUR
 
@@ -130,6 +148,10 @@ class Group:
     children: list[Contour] = field(default_factory=list)
     layer: int = 0
     int58: int = 1
+    legacy_reserved: list[str] = field(default_factory=list)
+    """v2-v4: the 3 reserved lines at the start of the group body (``mov edi,3``
+    @``0x1007694b``).  Inherited by :class:`ContourEx` and :class:`Scan`, and carried by the
+    outline group of a :class:`Text`."""
 
     TYPE = GraphType.GROUP
 
@@ -170,6 +192,8 @@ class Scan(Group):
     """``CGlyScan`` (type 11): source contours (group body) plus generated fly-cut paths (03 §6.4)."""
 
     paths: list[Contour] = field(default_factory=list)
+    legacy_reserved_paths: list[str] = field(default_factory=list)
+    """v2-v4: the 5 reserved lines after ``<Scan path>`` (``mov ebx,5`` @``0x10094944``)."""
 
     TYPE = GraphType.SCAN
 
@@ -197,6 +221,8 @@ class Text:
     outline: Group | None = field(default_factory=Group)
     layer: int = 0
     int58: int = 1
+    legacy_reserved: list[str] = field(default_factory=list)
+    """v2-v4: the 5 reserved lines before the text record (``mov ebx,5`` @``0x100a40b7``)."""
 
     TYPE = GraphType.TEXT
 
@@ -228,6 +254,8 @@ class ChfDocument:
     trailer_double: float = 0.0
     trailer_pt1: Vec2 = ZERO
     trailer_pt2: Vec2 = ZERO
+    legacy_reserved: list[str] = field(default_factory=list)
+    """v2-v4: the 5 reserved lines after ``<Begin Graphs>`` (``mov esi,5`` @``0x100a991d``)."""
 
 
 ContourKind = Literal["self", "child", "scanpath"]

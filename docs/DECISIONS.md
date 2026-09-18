@@ -18,11 +18,13 @@ A decision that rests on a value not proven by evidence says so (UNVERIFIED).
 | D6 | Deadman and input sources | decided; amended (no lease refresh while disarmed) |
 | D7 | Watchdog scope and recovery | decided, **with one open issue**: jogging off a pressed hard limit while `alarm_1 ≠ 0` (11 §7 step 7) |
 | D8 | Card-side motion gates mirrored on the PC | decided; amended (one motion lock) |
-| D9 | Arming is owned by the IPC connection that asked for it | **decided 2026-09-16**; amended the same day by safety review R12 (the owner also owns the right to move) |
+| D9 | Arming is owned by the IPC connection that asked for it | **decided 2026-09-16**; amended twice the same day — safety review R12 (the owner also owns the right to move) and the UI review (re-arming after a reconnect needs its own operator confirmation) |
 | D10 | Motion epoch: nothing queued before a stop is sent after it | decided |
 | D11 | No letter key starts motion; the key table is data | **decided 2026-09-16**; re-reviewed unchanged (exhaustive key × mode × case matrix) |
 | D12 | One master per card: an advisory lock keyed by the card address | **decided 2026-09-16**; amended the same day by safety review R13/R14/R15 |
-| D13 | Laser arming (`LASER_ARMED`) | **not written yet** — see "Entries still to be written"; it blocks all of M5 |
+| D13 | Laser arming (`LASER_ARMED`): what `arm_laser` quotes, proves and loses | **proposed 2026-09-16 — needs the owner's sign-off before implementation**; no M5 code exists or may exist until then |
+| D14 | `.chf` v2-v4 reserved lines are kept verbatim in a model slot; nothing is rejected | **decided 2026-09-16** (closes strict xfail X6) |
+| D15 | A parameter file changes only where the operator changed it | **decided 2026-09-16** by the UI review (U1-U4, W1-W3) |
 
 ---
 
@@ -182,6 +184,19 @@ Option (b), an idle timeout, was rejected: the timeout value would be UNVERIFIED
 
 **The owner also owns motion (amendment, safety review R12).** `jog_step`, `jog_continuous_start`, `home`, `load_job` and `start_job` are accepted only on the connection that is the current `_arm_owner`; any other connection gets `arming: … needs MOTION_ARMED armed on this connection … (docs/DECISIONS.md D9)`. The first version of D9 tied only the *lifetime* of arming to a connection, so while the arming client was alive **any** other client of the same uid still jogged, homed and streamed jobs without an arming step of its own — precisely the stray-`nexcut-mccd jog` case this entry calls the whole point of the arming state, and a window in which a client that connected after `arm_motion` inherited an armed machine. `arm_motion` on another connection still transfers ownership, so a deliberate hand-over works. Stops are deliberately **not** owned: `stop`, `estop`, `disarm`, `jog_continuous_stop`, `pause_job` and `stop_job` are accepted from any connection, so a stuck arming client can never lock an operator out. `jog_refresh` is not owned either — the TUI refreshes the deadman on its own connection (`IpcBackend._refresh_loop`), and a lease cannot be refreshed while the machine is DISARMED (D6 amendment), so the arming owner's death still ends it. In-process callers (`conn is None`, e.g. `load_job_frames`) are inside the D5 boundary and are not checked.
 
+**Re-arming after a reconnect is its own consent (amendment, 2026-09-16, UI/safety review M1).**
+A client that reconnects gets a *new* connection, which owns neither the arming nor the right to
+move — and by the time it reconnects the daemon has already run the full `_release_arming` path:
+the machine was **stopped and disarmed**, and the axis need not be where the operator's last
+instruction left it. `tools/m1_session.py` used to restore the arming and send the queued motion on
+the strength of a printed line. It now asks an explicit `y/N` (`op.confirm("s<n>.rearm.<cmd>")`,
+defaulting to **No**) before re-arming; a `no` records `rearm_declined`, raises `ArmingLost` and
+sends nothing. The general rule this fixes: **consent given for a motion is consent for the machine
+state that existed when it was given.** Any future client that re-establishes arming on the
+operator's behalf has to re-ask, for the same reason. Tests:
+`tests/test_ui_safety_review.py::test_a_reconnect_rearm_asks_the_operator_and_sends_nothing_on_no`;
+the 14 existing `tests/test_m1_session.py` tests are unchanged (the scripted operator answers `y`).
+
 **Residual (documented, not fixed).** A client that is alive but stuck — SIGSTOPped, hung in a syscall, or half-closed on the read side only — never produces a close event, so it keeps the machine armed. D9 rejected an idle timeout, and with the amendment above a stuck owner can no longer be *used* by anything else: nothing moves, and any connection can still stop and disarm. A half close (`shutdown(SHUT_WR)`) does disarm: the daemon's reader sees EOF. Tests: `test_r19_*`.
 
 **Where.** `MccDaemon._cmd_arm_motion`, `_require_arm_owner`, `_release_arming`, `_disarm_and_stop`, `_arming_hint`; `nexcut.mccd.cli._armed`, `_jog`, `_home`, `_one_shot`. Tests: `tests/test_mccd_safety_review.py::test_r9_*`, `test_r12_*`, `test_r19_*`, `tests/test_mccd_cli.py::test_one_shot_arm_does_not_survive_its_process`.
@@ -251,13 +266,383 @@ Key = address, not socket: `--card-ip 10.1.1.168` twice collides, `--sim` twice 
 
 ---
 
+## D13 — Laser arming (`LASER_ARMED`): what `arm_laser` must quote, prove and lose
+
+**Status: proposed — needs the owner's sign-off before implementation.** Nothing in this entry is
+implemented, and nothing in this phase may implement it. It is written *before* any M5 code exists
+because that is the point of the D-series: `LASER_ARMED` is the one state in the port that can put
+energy into material, and the shape of the request that reaches it should be argued on paper, not
+discovered while wiring a button. Until the owner signs this off, `mcc/safety.py`'s refusal stays
+exactly as it is (see "The placeholder, and the exact lines that change").
+
+**Scope.** This entry settles the *grant*: the IPC request, what the daemon verifies, what revokes
+it, what is written to the log, and what software cannot do at all. It does **not** settle the
+in-stream laser records themselves (11 §5.2: tick duty in the low half of the second `3000` word,
+`9999[2, 1<<p, v<<p]` DO for the DO9 CO2 gate, `9999[3|0x11, freq, duty]` PWM-set, `9999[4, ch, v]`
+DA) — those are already classified by `mcc/safety.strip_laser_records` and by the write allow-list
+(11 §3.1 ALLOW, §3.3 DENY); D13 only decides *when* a frame is allowed to keep them.
+
+---
+
+### 1. The request
+
+```json
+{"cmd": "arm_laser",
+ "job_token": "<the token load_job returned>",
+ "layers":    [1, 3, 9],
+ "material":  {"kind": "technology", "laser": "co2",
+               "preset": "Carbon 10.0mm  4.0D F+12 O2",
+               "sha256": "<of the technology XML as the port serialises it>"},
+ "confirm":   "ARM LASER <job name>",
+ "ttl_s":     300}
+```
+
+Every field is mandatory, and every field is a *quote of something the operator can see on screen*
+— the request carries no value of its own, so a client cannot arm a machine into a configuration
+the operator never looked at.
+
+* **`job_token`** — the token `ArmingStateMachine.begin_job()` minted for the loaded job (the same
+  token `load_job` returns today and `arm_laser(job_token=…)` already demands). A token exists only
+  while a job is loaded, so "arm the laser with no job" is unrepresentable rather than refused.
+* **`layers`** — the 1-based layer slots (02 §4) the job will actually cut, sorted, no duplicates.
+  The daemon compares them with the layer set of the loaded job and refuses a mismatch. This is
+  what makes a laser arming specific to *this* job: re-using a token after the operator changed
+  which layers are enabled is a different job in every way that matters to the material.
+* **`material`** — the technology preset the layers were loaded from (`LayerFileName`, 02 §6.1)
+  plus the sha256 of that preset as `io.params.serialize_technology` writes it. The daemon
+  re-serialises the layer slots it is about to cut and compares. A preset edited between the dry
+  run and the arming is a different cut; the operator re-confirms it.
+* **`confirm`** — a free-text string the operator *types*, not a boolean. It must equal
+  `f"ARM LASER {job_name}"` (case-sensitive, the job name as `job_status` reports it). A boolean
+  `confirmed: true` is one flipped flag in a buggy client; a string that has to name the job cannot
+  be produced by a client that does not know which job is loaded, and cannot be produced at all by
+  a retry loop replaying an older request against a newer job. `mcc/safety.ArmingStateMachine.
+  arm_laser(confirmed=…)` keeps its boolean parameter — the daemon is what turns the typed string
+  into that boolean, because `safety.py` must not grow a notion of "job name".
+* **`ttl_s`** — how long the operator wants the arming to last, 1 ≤ ttl ≤ `laser.max_arm_ttl_s`
+  (proposed default **600 s**, UNVERIFIED port choice). See §3 (idle timeout).
+
+The reply is `{"arm_state": "LASER_ARMED", "job_token": …, "expires_at": <monotonic>, "layers": …,
+"material_sha256": …}` — the grant restates what it granted, so the UI can display it and a log
+reader can see it without reconstructing the request.
+
+**`arm_laser` is added to `IPC_COMMANDS`** (it is absent today, D5) and is subject to D9 **and** its
+R12 amendment: it is accepted only on the connection that is `_arm_owner`. The laser cannot be
+armed by a connection that did not arm the motion, and — per D9's ownership transfer rule — a later
+`arm_motion` on another connection takes the machine away from it (and, by §3 below, disarms the
+laser on the way).
+
+A companion `disarm_laser` (`LASER_ARMED → MOTION_ARMED`, drops the token) is accepted from **any**
+connection, exactly like `stop`/`estop`/`disarm` (D9): revoking energy is never owned.
+
+---
+
+### 2. What the daemon verifies before granting it
+
+In this order, each refusal naming the check and this entry:
+
+1. **Not E-stop latched** and `card_lock_lost is None` (D12/R13) — the same two gates `arm_motion`
+   has. A daemon that has lost its card lock may not arm anything.
+2. **State is `MOTION_ARMED`** and this connection owns it (D9/R12).
+3. **Homed, on every axis the job moves**, and **`position_scale_verified` is true** (D2). D2 already
+   refuses homed soft limits without a verified scale; a laser that follows a path whose millimetres
+   are not known to be millimetres is the same defect with a beam attached. This one check means M5
+   cannot start before §5 task 3 of STATUS (the 100 mm ruler measurement) has been done — which is
+   the intended ordering, not an accident.
+4. **A job is loaded, its token matches, and it is *dry-run-clean*.** "Dry-run-clean" is defined
+   here as: the loaded job has been streamed to completion at least once with
+   `strip_laser_records` active, on this daemon, since it was loaded, and that run ended `DONE`
+   with 0 starvation events and 0 aborted frames. The feeder records this as
+   `JobFeeder.dry_run_result`; the daemon keeps the last one per job token. No dry run, a failed
+   dry run, or a dry run of a *different* token → refused. (INFERENCE, port policy: the vendor has
+   no such rule; 空走 is a mode the operator chooses, not a precondition. The port makes it a
+   precondition because a first cut is the worst place to discover a path that leaves the bed or a
+   stream that starves.)
+5. **Soft limits**: the planned path is inside `SoftLimitMaxLen` (D2/PORT-PLAN §8.2). Already
+   enforced for streaming; re-checked here so the refusal names the laser.
+6. **No alarm**: alarm words 1006/1007 are 0 and the last status poll is younger than the watchdog
+   period (11 §4; PORT-PLAN §8.2). A stale poll is treated as an alarm.
+7. **Gas / assist state**: the assist-gas DO for every gas type the job's layers request
+   (`CutGasType`, `DrillGasType{k}`, 02 §3.3/§3.6, ports from `MGP`/`DO`) is *available* — the port
+   is configured (non-zero, 11 §3.1 DO allow-list) and the valve is not already commanded on by
+   something else. The port does **not** measure pressure: there is no pressure DI on this machine
+   in `BkHardPara.xml`, so "gas is flowing" is not observable (UNVERIFIED, and it stays that way
+   until a capture says otherwise). What the check buys is that a cut cannot be armed against a
+   gas configuration that has no output port at all.
+8. **The hardware interlock is still the primary safeguard.** PORT-PLAN §8.2: the CO2 tube PSU
+   enable / key switch (fibre: emission enable + shutter) is wired in hardware and software cannot
+   override a missing PSU enable. The daemon does not check it, cannot check it, and must never
+   present `LASER_ARMED` as "the laser is enabled" — it means "this daemon will stop stripping
+   laser records from *this* job's frames". Every UI string for this state says so.
+
+Refusals use the existing `IpcError` codes: `arming` for 1–3, `refused` for 4–7.
+
+---
+
+### 3. Auto-disarm: everything that drops `LASER_ARMED` back to `MOTION_ARMED`
+
+`LASER_ARMED` is a lease, never a mode. It ends — with no operator action and no acknowledgement —
+on **every** one of:
+
+| Event | Where it already exists |
+|---|---|
+| job end (`DONE`, `ABORTED`, or any final feeder state) | `ArmingStateMachine.end_job` |
+| `stop`, `stop_job` | `on_stop` (PORT-PLAN §8.2: "auto-disarms on stop") |
+| **`pause_job`** | *new*: pause is a stop with an intent to resume. Resuming re-arms, with a new `confirm` string |
+| `estop` (UI or alarm 1006 bit 30) | `estop` → `disarm` + latch |
+| any card alarm ≠ 0 | `on_alarm` |
+| comm loss (status poll failing > 1 s) | `on_comm_loss` |
+| watchdog trip, card-lock loss (D12/R13) | `_trip`, `MccDaemon.card_lock_lost` |
+| the arming connection closing — clean close, crash, SIGKILL, half close (**D9**) | `_release_arming` → `_disarm_and_stop` |
+| `arm_motion` on another connection (D9 ownership transfer) | *new*: the transfer disarms the laser first |
+| daemon shutdown | `MccDaemon.close` |
+| **idle timeout**: `ttl_s` elapsed, or 30 s with no frame accepted by the card while a job is streaming | *new* |
+
+**The idle timeout is the one place D13 departs from D9.** D9 rejected an idle timeout for *motion*
+arming because the timeout value would be UNVERIFIED and it still leaves a window in which a foreign
+client moves. Both objections are weaker here and one of them inverts: the value being a port choice
+matters less when expiry is the *safe* direction (the laser stops being armable, nothing starts), and
+the hazard being timed out is qualitatively different — a motion arming left behind by a frozen
+client is a machine that will not move until someone asks it to, while a laser arming left behind is
+a machine one stray `start_job` away from cutting. `ttl_s` is chosen by the operator per arming and
+is bounded by `laser.max_arm_ttl_s`; the 30 s no-progress rule is a second, shorter fuse for the case
+where the stream stalls with the lease held. Both values are **UNVERIFIED port choices**.
+
+Disarming the laser never disarms the motion and never stops an axis by itself: the events above
+that *should* stop the machine (stop, estop, alarm, comm loss, close) already do, through their own
+paths. A bare laser disarm only takes the beam away.
+
+---
+
+### 4. What is logged
+
+Every grant, refusal and revocation is one structured record in the daemon log **and** in
+`SafeMccClient.write_log`, at WARNING:
+
+* on grant: `arm_laser`, connection id, job token, job name, layer list, material preset name and
+  sha256, the `confirm` string as typed, `ttl_s`, the expiry, and the dry-run result being relied on
+  (its end state, frame count and starvation count);
+* on refusal: the same fields plus the number of the check in §2 that failed;
+* on revocation: which row of §3 fired, the wall-clock and monotonic time, how long the lease had
+  run, and how many FIFO frames carried a laser record while it was held.
+
+The last item is the one number an incident review needs and the only one nothing counts today, so
+it is part of the decision rather than an implementation detail: `SafeMccClient` already returns
+`laser_items` from `strip_laser_records(…, laser_ok=True)` on the `LASER_ARMED` path
+(`mcc/safety.py`, the `0x66` branch), so it is a counter, not a new mechanism. The audit-log size
+item in STATUS §5 task 10 has to be settled first — a per-frame 298-word record at tens of MB per
+job is not a log one can keep for a review.
+
+Nothing in the log is a secret, and the `confirm` string is operator-typed text about this machine,
+so it is logged verbatim.
+
+---
+
+### 5. What stays impossible in software, on purpose
+
+* **The PSU key.** The CO2 tube's PSU enable / key switch (fibre: emission enable and the shutter)
+  is not reachable from any register in 11 §3.1, is not on any DO this machine wires, and is not
+  something `arm_laser` can assert. `LASER_ARMED` with the key off is a laser that does not fire.
+  This is the safeguard the port deliberately does not replicate, and every M5 runbook step starts
+  with it off.
+* **The DENY list does not move.** 11 §3.3 stays exactly as it is under `LASER_ARMED`: 150/151,
+  59500–59599, 59600+ writes, 11000+2k, `100 ← 9999`, 5000–5012, 200/201, the unnamed `0x65`
+  sub-commands and func 0x26 are refused in every arming state. `LASER_ARMED` widens **one** thing:
+  `9999[2, 1<<p, v<<p]` for `p` in the laser DO set and the in-stream duty/PWM/DA records of 11
+  §5.2 stop being stripped from `0x66` frames of *this* job. Nothing else.
+* **No "arm and forget".** There is no configuration file key, no environment variable and no CLI
+  flag that pre-arms the laser or raises `max_arm_ttl_s` past its bound. `nexcut-mccd` gains no
+  `--arm-laser`; the only path is the IPC request above, on a connection that already owns the
+  motion arming, quoting a job that has already been dry-run.
+* **Simulator by default (D3).** `arm_laser` against the simulator target is granted and logged
+  like any other, because the whole point of the simulator is to exercise this path; the real card
+  still needs `--card-ip`.
+
+---
+
+### 6. The placeholder, and the exact lines that change when M5 starts
+
+Today the port cannot reach `LASER_ARMED` from outside at all, in four independent places. M5
+changes them in this order and no earlier:
+
+| File | What is there now | What M5 changes |
+|---|---|---|
+| `src/nexcut/mccd/daemon.py`, `IPC_COMMANDS` (the tuple at line ~126) and its docstring | the 21-command vocabulary has no `arm_laser`, and the docstring says the `*_job` commands "are **dry run only**" | add `"arm_laser"` and `"disarm_laser"`; add `_cmd_arm_laser` / `_cmd_disarm_laser` implementing §1–§4; the docstring stops saying dry-run-only and cites D13 |
+| `src/nexcut/mccd/daemon.py`, `load_job_frames` (the `if self.gate.arming.state is ArmState.LASER_ARMED: raise IpcError("refused", "the machine is LASER_ARMED: this phase streams dry runs only (docs/DECISIONS.md D5)")` block) | a job cannot even be *loaded* while laser-armed | the refusal goes; loading a new job while armed instead revokes the arming first (§3: a new token is a new job) |
+| `src/nexcut/mccd/feeder.py`, `JobFeeder._preflight` and `_stop_reason` (the two `ArmState.LASER_ARMED` branches: `"streaming is refused while LASER_ARMED: this phase runs dry runs only (docs/DECISIONS.md D5)"` and `"machine became LASER_ARMED (D5)"`) | streaming refuses to start, and aborts if the state appears mid-job | both branches invert: `LASER_ARMED` becomes a permitted streaming state for the token that owns it, and the abort fires on `LASER_ARMED` **without** the matching token. `_preflight` also asserts the §2 checks still hold |
+| `src/nexcut/mcc/safety.py`, `ArmingStateMachine.arm_laser` (`confirmed` / `job_token` arguments), `SafetyConfig.laser_do_ports` / `laser_da_channel_words` / `fifo_laser_da_channel_words`, and the `0x66` branch of `SafeMccClient` | the **placeholder refusal lives here and stays**: `arm_laser` raises `ArmingError` without an explicit confirmation and without the running job's token; a DO write to port 5/6/9, a non-zero laser DA word and a `0x67 ← [1]`-less FIFO start over frames queued while armed are all refused unless the state is `LASER_ARMED`; every `0x66` frame goes through `strip_laser_records` in every other state. Nothing outside `tests/` can reach `LASER_ARMED`, because no IPC command leads here | **unchanged in shape**: `arm_laser` gains no new parameter (the daemon turns §1's typed string into `confirmed`), the allow/deny classification is untouched, and the `0x66` branch gains only the counter of §4. The refusals this entry lifts are the daemon's and the feeder's, not this module's |
+
+`mcc/safety.py` is therefore *not* the placeholder that goes away — it is the mechanism the
+placeholder protects. The refusals that change are the two in `feeder.py` and the one in
+`daemon.load_job_frames`, plus the absent command in `IPC_COMMANDS`.
+
+**Why.** PORT-PLAN §8.2 requires that `LASER_ARMED` be reachable "only from the UI with a
+confirmation, only while a job-running token exists, auto-disarming on stop/alarm/comm loss". That
+sentence leaves four things open that an implementer would otherwise settle by accident: *what* the
+confirmation is (here: a typed string naming the job, not a boolean), *what else* the request has to
+quote so the arming is specific to a cut (here: the layer set and the material preset hash), *what
+the daemon must independently prove* before granting it (here: the eight checks of §2, of which the
+D2 scale verification and the dry-run requirement are the two that actually gate M5), and *what ends
+it* (here: eleven events, including three that do not exist yet). Writing them down first is cheaper
+than arguing them over a lit tube.
+
+**Alternatives rejected.**
+* *A boolean `confirmed` flag* (what `safety.py` takes internally): too easy to set by accident, and
+  it carries no evidence that the operator saw this job. Kept as the internal parameter, never as
+  the wire format.
+* *Arming the laser for a session rather than for a job*: it is the vendor's model (the PSU key is
+  the session), and it is exactly the state D9 refused for motion — an arming nobody remembers
+  granting. A job token is the shortest lease that still lets a job run.
+* *No idle timeout, by analogy with D9*: rejected above. The asymmetry is deliberate and argued.
+* *Letting the UI hold the arming across a pause*: rejected; a paused job is where the operator
+  walks up to the machine.
+
+**Where (once implemented).** `nexcut.mccd.daemon.IPC_COMMANDS`, `_cmd_arm_laser`,
+`_cmd_disarm_laser`, `_release_arming`, `_disarm_and_stop`; `nexcut.mccd.feeder.JobFeeder._preflight`
+/ `_stop_reason` / `dry_run_result`; `nexcut.mcc.safety.ArmingStateMachine.arm_laser`;
+`nexcut.core.config` for `laser.max_arm_ttl_s`. Tests: a new `tests/test_mccd_laser_arming.py`
+covering each §2 check failing on its own, each §3 event revoking, and an adversarial pass in the
+style of R12–R21.
+
+**How to change.** This entry, then the code — never the other way round. Any relaxation of §2 or
+§3 needs a new dated amendment here with the reason, exactly as D9/D12 carry theirs.
+
+---
+
+## D14 — `.chf` v2–v4 reserved lines are kept in a model slot, and nothing is rejected (X6)
+
+**Status: decided (2026-09-16) and implemented.** This closes the strict xfail X6
+(`tests/test_io_fidelity_review.py::test_legacy_reserved_lines_with_content_are_not_lost`),
+which STATUS §2 correctly called "a design choice waiting to be made, not a missing
+measurement".
+
+**The situation.** Versions 2–4 of the `.chf` container emit a fixed number of extra lines at
+seven places (03 §9, counted `ReadToken` loops at `0x100a991d`, `0x1006b51a`, `0x1006b64f`,
+`0x1006b6f7`, `0x1007694b`, `0x10094944`, `0x100a40b7`):
+
+| Site | Lines | Owner in the port |
+|---|---|---|
+| after `<Begin Graphs>` | 5 | `ChfDocument.legacy_reserved` |
+| after `<Glyphs>` | 10 | `Contour.legacy_reserved_glyphs` |
+| after each glyph | 3 | `ContourElement.legacy_reserved` |
+| after `<Crafts>` | 20 | `Crafts.legacy_reserved` |
+| start of a group body | 3 | `Group.legacy_reserved` (inherited by `ContourEx`/`Scan`, and carried by a `Text`'s outline group) |
+| after `<Scan path>` | 5 | `Scan.legacy_reserved_paths` |
+| start of a text record | 5 | `Text.legacy_reserved` |
+
+The vendor reader consumes them and never looks at them; 03 §9 reads them as reserved string
+fields a writer emitted as `WriteStr(NULL)`. All four shipped v4 samples leave every one of
+them empty, and **no v1–v4 writer exists in the shipped DLL**, so there is no evidence either
+way about whether any producer ever puts content there. Until this entry the port skipped
+them unread, i.e. it silently dropped bytes it could not model.
+
+**Decision.** Option (a) of the three below: **keep the raw line text in a model slot and
+re-emit it; reject nothing.**
+
+* Each record owns the lines that belong to it (table above), as `list[str]`, latin-1 decoded
+  — lossless for every byte the tokenizer can produce.
+* On write, a short list is padded with empty lines exactly as the vendor's `WriteStr(NULL)`
+  would write them. **More** lines than the site reserves is a `ValueError`, and so is a line
+  break inside one: either would change the line grammar the vendor reader counts by, which
+  is the one thing the port must never emit.
+* All-blank reserved lines — the only case that exists in the wild today — are stored as the
+  **empty list**, not as a list of empty strings. The file is identical either way (the writer
+  pads), and it keeps a document the port built equal to the same document read back, keeps
+  the JSON dumps clean, and allocates nothing on a 50 000-contour v4 file.
+* A v5 document written as v4 emits blank reserved lines, because a v5 file has none to carry.
+
+**Why, and why not the alternatives.**
+
+* *Option (b), reject a v2–v4 file whose reserved lines are not empty (a strict-mode error).*
+  Rejected. The port would refuse a file the vendor tool reads without complaint, on the
+  strength of a guess about what the bytes mean. Interchange failures are the expensive kind
+  of failure here, and this one would be self-inflicted.
+* *Option (c), keep skipping them.* Rejected: it is the one behaviour that is certainly wrong
+  if a producer does write there, and it fails silently — a file round-tripped through the
+  port loses data with nothing to show for it. The whole point of 03 §14's "keep every scalar
+  the original serialises" is that unknown ≠ ignorable.
+* Option (a) costs one list per record, is invisible when the lines are empty (the [] rule),
+  and its failure mode is inert data carried along.
+
+**What it does *not* claim.** Nothing here says what the lines mean, or that the vendor ever
+writes one. UNVERIFIED, and settled by nothing short of a Wine session that saves a v2–v4 file
+(`docs/WINE-SESSION-H.md`, question H-4) — which no shipped build can do, since the writer is
+v5-only. The slots simply make that question harmless in the meantime.
+
+**Where.** `nexcut.io.chf._Tokens.reserved`, `_Out.reserved`, the seven call sites in
+`_read_*`/`_write_*`; `nexcut.model.graph` (the `legacy_reserved*` fields and the module
+docstring). Tests: `tests/test_io_fidelity_review.py::test_legacy_reserved_lines_*` (four,
+including the former X6), plus the eight byte-identity samples of
+`test_all_vendor_chf_files_rewrite_byte_identical`, which are unchanged and still green.
+
+**How to change.** Code only, plus this entry. To go to option (b), raise in
+`_Tokens.reserved` when `any(raw)` and `self.strict`; the model slots can stay.
+
+---
+
+## D15 - A parameter file changes only where the operator changed it (U1-U4, W1-W3)
+
+**Status: decided (2026-09-16) and implemented.** Written by the UI/safety/UX adversarial review,
+which found four independent ways for a property page to alter a value nobody edited and three ways
+for the write-back to damage the file it was saving. `docs/STATUS.md` §1.4 has the measured effect
+of each; this entry is the rule they were fixed against.
+
+**Decision.** Three clauses, in order of how much they cost to hold:
+
+1. **An editor that is opened and closed without a change writes nothing.** Not "writes the same
+   value" - writes *nothing*. `_Delegate` records the value at `setEditorData` time (`_OPENED_AT`)
+   and `setModelData` returns early when the editor still holds it.
+2. **An editor may not be able to store a value the schema rejects.** `editor_range` converts the
+   descriptor's own min/max into the *display* unit, quantises both bounds **inward** to the
+   resolution the widget actually offers, and re-checks them through `to_stored`; `clamp_stored`
+   runs on the way out. Where a unit conversion makes an integer row unrepresentable (`FCP.MaxAcc`
+   20000 mm/s^2 = 2.0394 G, and an int spin box can only offer `2`), the row gets a
+   `QDoubleSpinBox` instead - the same rule `display_text` already followed.
+3. **A value the file already holds is legal, whatever the schema says.** `PropertyGrid.stored_bounds`
+   widens the editor's range to contain the value the row holds, so a vendor file that violates its
+   own descriptor range (this machine's `GRP.EdgeBoardSizeX/Y` hold `5.0` against a min of `50`) is
+   *preserved*, not "corrected". `core.schema.Descriptor.validate`'s own docstring already said
+   vendor data is not guaranteed to satisfy min/max and that callers should warn rather than reject;
+   this makes the editors obey it.
+
+And, for the file itself (`io/params.write_params`, W1-W3): the directory is `fsync`ed after
+`os.replace`, so the ordering the docstring promises ("either the old file, or the old file plus its
+copy") survives a power loss; the replaced file's **mode is carried over** instead of `mkstemp`'s
+`0600`, and the `.bak` inherits the mode of the file it is a copy of; and a failed read-back verify
+names the backup in its message.
+
+**Why.** The port's job in M3 is to be usable *alternately* with the Windows tool on the same
+machine (PORT-PLAN §1 goal 2). A page that quietly rewrites `GRP.EdgeBoardSizeX` from 5 to 50, or
+`FCP.MaxAcc` from 20000 to 19613, breaks that goal in the most expensive possible way: no error, no
+prompt, no undo, and the damage is discovered by the machine. The vendor's own files are the proof
+that "the schema is the truth" is wrong - they violate it - so the only defensible rule is that the
+port is a *lossless* editor of somebody else's file and an edit is something the operator did.
+
+**Alternatives rejected.**
+* *Clamp the value into the descriptor range and warn.* This is what the code did by accident, and
+  it is what U3 is. A warning the operator sees after the file is written is not consent.
+* *Refuse to load a file that violates its own schema.* Refuses this machine's real files.
+* *Block the save on `document.validate()`.* Same objection. A non-blocking "N values outside their
+  range" line on save is worth having and is `docs/STATUS.md` §5 task 10; it does not change this
+  entry.
+
+**UNVERIFIED in the implementation** (`docs/STATUS.md` §3.8, settle in Wine session H):
+`property_grid.INT32_MIN/INT32_MAX` as the editor bound for a u32 descriptor - a port choice
+justified by the vendor writing those rows signed (`SOP.JoystickID2 = "-684904636"` in this
+machine's `File/BkHardPara.xml`), but a file value above 2**31-1 is then preserved and displayed and
+not editable; and `_QUANTISE_STEPS = 4`, how far a bound may be stepped inward.
+
+**Where.** `nexcut.ui.property_grid` (`stored_bounds`, `clamp_stored`, `uses_int_spin`,
+`editor_range`, `_editor_value`, `_snap`, `_Delegate`), `nexcut.io.params` (`_fsync_dir`,
+`_atomic_write`, `write_params`). Tests: `tests/test_ui_safety_review.py` sections A and B (52 tests
+in the file), plus the existing UI and params tests, which are unchanged and still green.
+
+**How to change.** This entry, then the code. Loosening clause 1 or 3 needs a dated amendment here
+with the reason - they are the two that protect the operator's file.
+
+---
+
 ## Entries still to be written
 
-* **D13 — laser arming (`LASER_ARMED`).** D5 says this needs its own entry, and nothing in the port
-  can reach `LASER_ARMED` until it exists: there is no `arm_laser` in `IPC_COMMANDS`,
-  `strip_laser_records` removes every DO9/PWM/DA record, and `mccd/feeder.py` refuses to load a job
-  while `LASER_ARMED` as a placeholder. The entry has to settle the IPC shape, the job token the
-  command must quote, the operator confirmation, and the auto-disarm rule (stop / alarm / comm loss
-  / job end). It blocks all of M5 and needs no measurement — only a decision.
 * **The open half of D7** (see that entry): whether the operator may jog off a pressed hard limit
   while `alarm_1 ≠ 0`. Settled by 11 §7 step 7, not by argument.

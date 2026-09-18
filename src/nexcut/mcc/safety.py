@@ -27,13 +27,17 @@ position. A supervisor thread services the deadman/watchdog while something need
 
 from __future__ import annotations
 
+import array
 import contextlib
+import heapq
 import logging
 import secrets
 import threading
 import time
-from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass, field
+import zlib
+from collections import deque
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Protocol
 
@@ -64,11 +68,14 @@ __all__ = [
     "ArmingError",
     "ArmingStateMachine",
     "Decision",
+    "FifoDigest",
     "McClient",
     "SafeMccClient",
     "SafetyConfig",
     "SafetyViolation",
     "StopOutcome",
+    "WriteLog",
+    "WriteLogLimits",
     "WriteRecord",
     "classify_read",
     "classify_write",
@@ -660,6 +667,172 @@ class WriteRecord:
     """``sent``, ``refused`` or ``failed`` (transport error after the gate passed)."""
     reason: str
     stripped: int = 0
+    """Laser items neutralised in a FIFO frame (dry run, not ``LASER_ARMED``)."""
+    laser_items: int = 0
+    """Laser items a FIFO frame carried to the card unmodified while ``LASER_ARMED`` (D13 §4)."""
+    digest: FifoDigest | None = None
+    """Set when :class:`WriteLog` compacted an old FIFO record; ``words`` and ``frame`` are
+    then empty and this carries what identifies the frame (STATUS §5 task 9)."""
+
+
+@dataclass(frozen=True, slots=True)
+class FifoDigest:
+    """What is kept of a ``0x66`` frame once it is older than the full-record window."""
+
+    frame_id: int
+    """``words[0]`` - the frame id the card acknowledges in reg 1015."""
+    n_words: int
+    words_crc32: int
+    """``zlib.crc32`` of the words as sent (after dry-run stripping), little-endian u32."""
+    frame_bytes: int
+    """Length of the encoded request (1 206 for a full 298-word frame)."""
+    frame_crc32: int
+    """``zlib.crc32`` of the encoded request bytes (sequence number included)."""
+    first_opcodes: tuple[int, ...]
+    """Opcodes of the first (up to) three items, from the item headers."""
+
+
+def _u32_bytes(words: Sequence[int]) -> bytes:
+    try:
+        return array.array("I", words).tobytes()
+    except (OverflowError, TypeError):
+        return array.array("I", (int(w) & 0xFFFFFFFF for w in words)).tobytes()
+
+
+def fifo_digest(words: Sequence[int], frame: bytes) -> FifoDigest:
+    """Compact identity of a ``0x66`` payload ``[frame_id, items...]`` (11 §5.2)."""
+    ops: list[int] = []
+    i = 1
+    while i < len(words) and len(ops) < 3:
+        h = int(words[i]) & 0xFFFFFFFF
+        ops.append(h & 0xFFFF)
+        i += 1 + (h >> 16) // 4
+    return FifoDigest(
+        frame_id=int(words[0]) & 0xFFFFFFFF if words else 0,
+        n_words=len(words),
+        words_crc32=zlib.crc32(_u32_bytes(words)),
+        frame_bytes=len(frame),
+        frame_crc32=zlib.crc32(frame),
+        first_opcodes=tuple(ops),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class WriteLogLimits:
+    """Caps of :class:`WriteLog`. Defaults bound the log at roughly 10 MB (measured in
+    ``tests/test_bounded_logs.py``)."""
+
+    fifo_full_keep: int = 32
+    """The most recent ``0x66`` frames kept in full (words and frame bytes)."""
+    max_fifo_digests: int = 20_000
+    """Older ``0x66`` frames kept as a :class:`FifoDigest` (~8 min at the 250 µs tick)."""
+    max_records: int = 10_000
+    """Every other record - all non-FIFO writes and every refused FIFO frame, in full."""
+
+    def __post_init__(self) -> None:
+        if min(self.fifo_full_keep, self.max_fifo_digests, self.max_records) < 1:
+            raise ValueError(f"write-log limits must be >= 1: {self}")
+
+
+class WriteLog:
+    """Bounded, ordered audit log of :class:`SafeMccClient` writes (STATUS §5 task 9, D13 §4).
+
+    * Every write that is not a sent/failed ``0x66`` frame - commands, register writes,
+      ``0x67`` FIFO control, refusals of anything including FIFO frames - is kept **in full**,
+      the newest ``max_records`` of them.
+    * The newest ``fifo_full_keep`` sent/failed ``0x66`` frames are kept in full; older ones
+      are replaced by a record with empty ``words``/``frame`` and a :class:`FifoDigest`; the
+      newest ``max_fifo_digests`` of those are kept.
+    * Iteration, indexing and slicing see one sequence in write order. What fell off either
+      end is counted (``dropped_fifo``, ``dropped_other``, ``compacted``) and reported by
+      :meth:`summary`, so a review can tell an empty stretch from a trimmed one.
+
+    Thread-safe: readers get a snapshot, so a test or the daemon can iterate while a feeder
+    thread appends.
+    """
+
+    def __init__(self, limits: WriteLogLimits | None = None, **kw: int) -> None:
+        self.limits = limits or WriteLogLimits(**kw)
+        self._lock = threading.Lock()
+        self._n = 0
+        self._other: deque[tuple[int, WriteRecord]] = deque()
+        self._fifo_full: deque[tuple[int, WriteRecord]] = deque()
+        self._fifo_digest: deque[tuple[int, WriteRecord]] = deque()
+        self.compacted = 0
+        self.dropped_fifo = 0
+        self.dropped_other = 0
+
+    @property
+    def dropped(self) -> int:
+        return self.dropped_fifo + self.dropped_other
+
+    def append(self, rec: WriteRecord) -> None:
+        lim = self.limits
+        with self._lock:
+            entry = (self._n, rec)
+            self._n += 1
+            if rec.addr == REG_FIFO_DATA and rec.decision != "refused" and rec.digest is None:
+                self._fifo_full.append(entry)
+                if len(self._fifo_full) > lim.fifo_full_keep:
+                    idx, old = self._fifo_full.popleft()
+                    small = replace(
+                        old, words=(), frame=b"", digest=fifo_digest(old.words, old.frame)
+                    )
+                    self.compacted += 1
+                    self._fifo_digest.append((idx, small))
+                    if len(self._fifo_digest) > lim.max_fifo_digests:
+                        self._fifo_digest.popleft()
+                        self.dropped_fifo += 1
+            elif rec.digest is not None:
+                self._fifo_digest.append(entry)
+                if len(self._fifo_digest) > lim.max_fifo_digests:
+                    self._fifo_digest.popleft()
+                    self.dropped_fifo += 1
+            else:
+                self._other.append(entry)
+                if len(self._other) > lim.max_records:
+                    self._other.popleft()
+                    self.dropped_other += 1
+
+    def _snapshot(self) -> list[WriteRecord]:
+        with self._lock:
+            parts = (list(self._other), list(self._fifo_digest), list(self._fifo_full))
+        return [rec for _, rec in heapq.merge(*parts, key=lambda e: e[0])]
+
+    def __iter__(self) -> Iterator[WriteRecord]:
+        return iter(self._snapshot())
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._other) + len(self._fifo_digest) + len(self._fifo_full)
+
+    def __getitem__(self, i: int | slice) -> WriteRecord | list[WriteRecord]:  # type: ignore[override]
+        if i == -1:
+            with self._lock:
+                tails = [d[-1] for d in (self._other, self._fifo_digest, self._fifo_full) if d]
+            if not tails:
+                raise IndexError("write log is empty")
+            return max(tails, key=lambda e: e[0])[1]
+        return self._snapshot()[i]
+
+    def clear(self) -> None:
+        with self._lock:
+            self._other.clear()
+            self._fifo_full.clear()
+            self._fifo_digest.clear()
+
+    def summary(self) -> dict[str, int]:
+        """Counts for a status snapshot or an incident review."""
+        with self._lock:
+            return {
+                "records": len(self._other) + len(self._fifo_digest) + len(self._fifo_full),
+                "written": self._n,
+                "fifo_full": len(self._fifo_full),
+                "fifo_digests": len(self._fifo_digest),
+                "compacted": self.compacted,
+                "dropped_fifo": self.dropped_fifo,
+                "dropped_other": self.dropped_other,
+            }
 
 
 @dataclass(slots=True)
@@ -692,13 +865,17 @@ class SafeMccClient:
         on_write: Callable[[WriteRecord], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
         supervise: bool = True,
+        log_limits: WriteLogLimits | Mapping[str, int] | None = None,
     ) -> None:
         self.client = client
         self.arming = arming or ArmingStateMachine()
         self.config = config or SafetyConfig()
         self.params = params or MachineParams()
         self.on_write = on_write
-        self.write_log: list[WriteRecord] = []
+        if log_limits is not None and not isinstance(log_limits, WriteLogLimits):
+            log_limits = WriteLogLimits(**log_limits)
+        self.write_log = WriteLog(log_limits)
+        """Bounded audit log of every write attempt (:class:`WriteLog`, STATUS §5 task 9)."""
         self.homed = False
         """Set by the caller from the axis-status homed bits (A2 §3.1) - gates V8."""
         self.positions_word: dict[int, int] = {}
@@ -938,11 +1115,14 @@ class SafeMccClient:
                         "failed",
                         f"{reason}; {exc}",
                         stripped,
+                        laser_items,
                     )
                 )
                 raise
         self._record(
-            WriteRecord(self._clock(), addr, tuple(w), frame, state, "sent", reason, stripped)
+            WriteRecord(
+                self._clock(), addr, tuple(w), frame, state, "sent", reason, stripped, laser_items
+            )
         )
         if addr == REG_FIFO_DATA and laser_items:
             self.card_fifo_has_laser = True

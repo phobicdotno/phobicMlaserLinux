@@ -52,9 +52,9 @@ import socket
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, overload
 
 from nexcut.mcc.commands import (
     ABSOLUTE_BIT,
@@ -117,6 +117,7 @@ __all__ = [
     "RUN_IDLE",
     "RUN_MOVING",
     "CardSimulator",
+    "RequestLog",
     "RequestRecord",
     "SimConfig",
 ]
@@ -182,6 +183,10 @@ class SimConfig:
     dry run). The conservative reading is kept as the default; the streaming tests of
     :mod:`nexcut.mccd.feeder` set this to False and measure the queue depth instead
     (:attr:`CardSimulator.queue_low_water`), which is what PORT-PLAN §8.3 asks for."""
+    request_log_limit: int | None = 20_000
+    """Keep this many datagrams in :attr:`CardSimulator.requests` (a ring: the oldest are
+    dropped and counted in ``requests.dropped``). ``None`` = keep all. A port choice
+    (STATUS §5 task 9): a ten-minute streaming run used to grow the list by ~60 MB."""
     consumed_log_limit: int = 0
     """Keep this many consumed items in :attr:`CardSimulator.consumed_items` so a test can
     diff the *executed* stream against what the planner emitted.  0 = keep none (default:
@@ -238,6 +243,48 @@ class RequestRecord:
     """``replied``, ``exception``, ``dropped``, ``no-reply``, ``silent``, ``bad-crc``, ``undecodable``."""
 
 
+class RequestLog:
+    """Ring buffer of :class:`RequestRecord` (``SimConfig.request_log_limit``).
+
+    Reads like the list it replaced - ``len``, iteration, ``[i]``, ``[a:b]`` - and every read
+    works on a snapshot, so a test can iterate while the simulator thread appends.
+    ``dropped`` counts the records that fell off the old end.
+    """
+
+    def __init__(self, maxlen: int | None) -> None:
+        if maxlen is not None and maxlen < 1:
+            raise ValueError(f"request_log_limit must be >= 1 or None, not {maxlen}")
+        self._d: deque[RequestRecord] = deque(maxlen=maxlen)
+        self.dropped = 0
+
+    @property
+    def maxlen(self) -> int | None:
+        return self._d.maxlen
+
+    def append(self, rec: RequestRecord) -> None:
+        if self._d.maxlen is not None and len(self._d) == self._d.maxlen:
+            self.dropped += 1
+        self._d.append(rec)
+
+    def clear(self) -> None:
+        self._d.clear()
+
+    def __len__(self) -> int:
+        return len(self._d)
+
+    def __iter__(self) -> Iterator[RequestRecord]:
+        return iter(list(self._d))  # list(deque) runs in C under the GIL: a consistent copy
+
+    @overload
+    def __getitem__(self, i: int) -> RequestRecord: ...
+    @overload
+    def __getitem__(self, i: slice) -> list[RequestRecord]: ...
+    def __getitem__(self, i: int | slice) -> RequestRecord | list[RequestRecord]:
+        if isinstance(i, slice):
+            return list(self._d)[i]
+        return self._d[i]
+
+
 class CardSimulator:
     """Threaded UDP server that answers like an MCC100 card (see module docstring)."""
 
@@ -252,7 +299,7 @@ class CardSimulator:
         self._thread: threading.Thread | None = None
         self._outbox: list[tuple[float, int, bytes, tuple[str, int]]] = []
         self._counter = itertools.count()
-        self.requests: list[RequestRecord] = []
+        self.requests = RequestLog(self.config.request_log_limit)
         # fault injection state
         self._drop_requests = 0
         self._drop_replies = 0

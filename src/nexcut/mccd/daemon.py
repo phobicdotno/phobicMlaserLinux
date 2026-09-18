@@ -161,7 +161,8 @@ UNVERIFIED port choice: two ``stat`` calls, so it costs nothing, and it is far s
 the time it takes a human to delete a lock file and start a second daemon."""
 _PUBLISH_TICK_S = 0.01
 _LOG_KEEP = 2000
-"""Gate write-log / arming-history entries kept in memory."""
+"""Arming-history entries kept in memory (the gate's write log has its own caps,
+:class:`nexcut.mcc.safety.WriteLogLimits`)."""
 MAX_JOB_FRAMES = 1_000_000
 """Frames one ``load_job`` accepts (~7 h of machine time at 99 ticks x 250 us per frame).
 A port choice: the feeder streams lazily, so this only bounds pathological input."""
@@ -870,12 +871,8 @@ class MccDaemon:
             self._jog_speed.pop(idx, None)
             for src in list(self._sources):
                 src.release(idx)
-        # housekeeping (never wait for the gate lock here)
-        if len(self.gate.write_log) > 2 * _LOG_KEEP and self.gate._lock.acquire(blocking=False):
-            try:
-                del self.gate.write_log[:-_LOG_KEEP]
-            finally:
-                self.gate._lock.release()
+        # housekeeping. The gate's write log bounds itself (mcc.safety.WriteLog, STATUS §5
+        # task 9); the arming history is small and is trimmed here.
         if len(self.gate.arming.history) > 2 * _LOG_KEEP:
             del self.gate.arming.history[:-_LOG_KEEP]
 

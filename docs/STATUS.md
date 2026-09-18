@@ -41,7 +41,7 @@ if the owner is at the machine; `docs/WINE-SESSION-H.md` if the owner is at a Wi
 ```sh
 cd ~/phobicMlaserLinux
 NEXCUT_SRC=~/Documents/CF1390-250715-1084-0973/Mlaser-v0.0.0.52 QT_QPA_PLATFORM=offscreen \
-    .venv/bin/pytest -q -p no:cacheprovider     # 1676 passed, 3 xfailed, ~3 min 45 s
+    .venv/bin/pytest -q -p no:cacheprovider     # 1734 passed, 2 xfailed, ~5 min
 NEXCUT_SRC=/nonexistent QT_QPA_PLATFORM=offscreen \
     .venv/bin/pytest -q -p no:cacheprovider     # what CI runs: the vendor-golden tests skip
 .venv/bin/ruff check . tools/m1_session.py      # All checks passed!
@@ -57,7 +57,7 @@ QT_QPA_PLATFORM=offscreen .venv/bin/pytest -q -s \
     tests/test_import_ui_fidelity_review.py -k 50k                      # the X11 import budget
 ```
 
-**Three xfails are expected, and all three are strict** (X7, X11, X13 — §2). A strict xfail that
+**Two xfails are expected, and both are strict** (X7, X13 — §2; X11 was closed on 2026-09-18). A strict xfail that
 starts passing *fails* the suite; that is deliberate, so a divergence cannot quietly rot. Never
 weaken one to make a run green.
 
@@ -75,14 +75,15 @@ neither the owner nor the machine.
 ## 0. Numbers at a glance
 
 Every row was measured on the owner's laptop on **2026-09-16**, idle unless it says otherwise,
-except the two rows that name an earlier run.
+except the two rows that name an earlier run and the rows marked **2026-09-18** (§5 task 7), which
+were measured while another agent's test run shared the laptop — their `speed_factor` is given.
 
 | Item | Value |
 |---|---|
-| Full suite, `NEXCUT_SRC=…/Mlaser-v0.0.0.52 QT_QPA_PLATFORM=offscreen .venv/bin/pytest -q -p no:cacheprovider` | **1676 passed, 3 xfailed (all strict), 0 failed, 0 skipped** in 224.44 s |
-| Same suite with `NEXCUT_SRC=/nonexistent` (what CI runs) | **1540 passed, 136 skipped, 3 xfailed** in 212.00 s |
+| Full suite, `NEXCUT_SRC=…/Mlaser-v0.0.0.52 QT_QPA_PLATFORM=offscreen .venv/bin/pytest -q -p no:cacheprovider` | **2026-09-18: 1734 passed, 2 xfailed (both strict), 0 failed, 0 skipped** in 298.04 s (laptop shared with another agent's run; 2026-09-16 idle: 1676 passed, 3 xfailed in 224.44 s) |
+| Same suite with `NEXCUT_SRC=/nonexistent` (what CI runs) | **2026-09-18: 1590 passed, 144 skipped, 2 xfailed** in 290.58 s (shared laptop; 2026-09-16 idle: 1540 passed, 136 skipped, 3 xfailed in 212.00 s) |
 | Same suite with every core busy | **not re-run for this report.** The last load sweep was the previous phase's tree (1571 tests): **1571 passed, 3 xfailed** twice, 332.08 s and 332.19 s against 212.8 s idle (1.56x), and the timing-sensitive files green five times over under the same load (§6). The 172 tests added since have no sleeps, no wall-clock budgets and no periodic-event assertions; re-running the sweep is §5 task 10 |
-| Tests collected | **1679 in 67 files** (+ `conftest.py`) |
+| Tests collected | **2026-09-18: 1736 in 68 files** (+ `conftest.py` and the `gates_reference.py` helper) |
 | `.venv/bin/ruff check . tools/m1_session.py` | **All checks passed!** |
 | CI (`.github/workflows/ci.yml`) | ruff + pytest on Python 3.12/3.13/3.14, offscreen Qt, `-p no:cacheprovider --durations=15`. `SRC` is absent there, so the 136 vendor-golden tests skip |
 | `UNVERIFIED` markers in `src/` + `tools/m1_session.py` | **261 lines** (grep), inventoried in §3 |
@@ -91,9 +92,9 @@ except the two rows that name an earlier run.
 | PORT-PLAN §8.3 streaming jitter gate (**simulator only**) | <!-- JITTER-GATE: `NEXCUT_JITTER_SECONDS=120 QT_QPA_PLATFORM=offscreen .venv/bin/pytest -q -s tests/test_perf_streaming.py` is the 4-minute short form; the full gate is the same command with 600 --> **met** (re-measured for this report at **120 s of machine time per tick**, 4 min for the pair, `nexcut-mccd` + `CardSimulator` in one process). **250 µs tick** (cadence 24.8 ms/frame): 4 848 frames in 120.2 s — DONE, every tick consumed, **0 re-sends, 0 starvation events**, queue low water **4 559 items** (card) / 4 596 (reg 1016) against the `FifoAlarmNum` = 30 floor; frame interval p50 **27.6 ms**, p90 **32.9**, p99 **36.0**, max **44.8** — a producer stall of 11.2 ms (p99) / 20.0 ms (max) on top of the cadence. **1 ms tick** (cadence 99.0 ms/frame): 1 212 frames in 120.2 s, low water **4 695 / 4 703**, p50 **91.1**, p90 **121.5**, p99 **125.7**, max **126.7** — stall 26.7 / 27.7 ms. Limits on this run: p99 stall < 103 ms, max stall < 513 ms (§8.3's 100 / 500 ms × `conftest.speed_factor()` = 1.03 here), and at the 250 µs tick the absolute p99 < 103 / max < 513 are asserted as well. Only the two *time* limits are scaled; the stream criteria — DONE, every tick consumed, 0 re-sends, 0 starvation, the queue floor — never are. **The full 600 s form was last run in the previous phase** and is recorded there: 24 242 frames in 600.2 s at the 250 µs tick with p99 55.8 / max 80.2 ms, and 6 061 frames at 1 ms with p99 125.8 / max 139.4 — the same picture over 5x the duration |
 | PORT-PLAN §8.3 planner throughput gate | <!-- PLANNER-GATE: `.venv/bin/pytest -q -s tests/test_perf_planner.py` --> **not met**, strict xfail **X13**. 250 contours in 0.49 s = **1.94 ms/contour**, 168 756 ticks, **2.88 µs/tick** → **194 s for 100 000 contours** against the 30 s budget; 1.93 ms/contour at 62 contours and 675 ticks/contour at every size, so the extrapolation is linear. It was 4.61 ms/contour = 461 s (earlier runs 478–520 s) before the vectorised item path. **The memory half of this gate is closed** (next row). What is left is per-contour numpy dispatch in the geometry stages, itemised in §2 |
 | Planner peak memory | **solved, re-measured for this report** in a fresh interpreter: a 3 000-contour job (2 147 816 ticks, 21 877 frames, 6 491 455 words) grows the RSS by **+2.6 MB while streaming** against **+197.7 MB** materialised as a frame list — 76x, and the gap widens with every contour. The previous phase measured the full 100 000-contour job (72.0 M ticks, 733 756 frames, 218 M words) at a **140.3 MB peak**, of which 135.3 MB is the `.chf` document itself: planning and writing cost **4.9 MB, flat in job size**, where a frame list would need ~8 GB |
-| Import budget (PORT-PLAN §4 M2, `speed_factor` 1.03 → 3.08 s) | 50 000-segment path, open + fit + paint: DXF lwpolyline **0.39 s**, G-code **0.83 s**, PLT **0.36 s**, `.chf` **0.41 s**; 50 000 separate `.chf` contours **2.38 s**; 50 000 separate contours on the canvas **1.02 s**. **50 000 separate DXF `LINE`s: 5.18 s — not met, strict xfail X11**, of which the streaming reader is **0.80 s** and `ops/import_gates` + `ops/sort` are **3.39 s** |
+| Import budget (PORT-PLAN §4 M2, 3 s × `speed_factor`) | 2026-09-16, `speed_factor` 1.03 → 3.08 s: 50 000-segment path, open + fit + paint: DXF lwpolyline **0.39 s**, G-code **0.83 s**, PLT **0.36 s**, `.chf` **0.41 s**; 50 000 separate `.chf` contours **2.38 s**; 50 000 separate contours on the canvas **1.02 s**. **50 000 separate DXF `LINE`s: met, X11 closed (2026-09-18, §5 task 7)** — five runs **2.72–2.86 s** against budgets of 3.13–3.39 s (`speed_factor` 1.04–1.13), of which the streaming reader **0.64–0.66 s** and `ops/import_gates` + `ops/sort` **0.82–0.83 s**; the 50 000-contour `.chf` control case in the same runs 2.44–2.59 s. The pre-task-7 code measured in the same session (three runs, `speed_factor` 1.03–1.12): **5.34–5.44 s**, gates **3.52–3.69 s**, control 2.38–2.47 s |
 
-Tests per area (collected, 1679 total):
+Tests per area (collected, 1736 total; only `ops` changed on 2026-09-18):
 
 | Area | Tests | Largest files |
 |---|---|---|
@@ -102,7 +103,7 @@ Tests per area (collected, 1679 total):
 | `mcc` (framing, CRC, dissector, simulator, commands, registers, transaction, fifo, safety) | 299 | `test_mcc_safety` 79, `test_mcc_protocol_fidelity` 44, `test_mcc_safety_adversarial` 37 |
 | `io` + `.chf` | 293 | `test_io_gcode` 53, `test_io_dxf_stream` 46, `test_io_dxf` 41, `test_chf_writer` 37, `test_io_dxf_stream_review` 21 |
 | `mccd` + `core/config` + `tools/` (`m1_session.py`, `wine_session_h.sh`) | 206 | `test_mccd_safety_review` 55, `test_mccd_job` 32, `test_mccd_cli_tui` 29, `test_m1_session` 14 |
-| `ops` | 28 | `test_ops_sort` 17, `test_ops_scan` 11 |
+| `ops` | 85 | `test_ops_gates_equivalence` 57, `test_ops_sort` 17, `test_ops_scan` 11 |
 | integration + smoke | 22 | `test_smoke` 11, `test_integration_consistency` 11 |
 | `core/schema` | 18 | — |
 | cross-cutting stream/plan review | 9 | `test_stream_plan_fidelity_review` |
@@ -122,7 +123,7 @@ Adversarial review suites, counted inside the areas above: **354 tests in 10 fil
 |---|---|---|---|
 | M0 | Foundations, passive instrumentation | **done**, one gate item waiting for the first capture | golden tests green ✔ · dissector on the package logs ✔ (805 transactions, 22 frames, 0 remainder) · dissector on a real tcpdump capture ✘ — **no capture of this machine exists** (§5 task 1) |
 | M1 | Hello machine: jog/home on the real card | **software complete and through three safety reviews; hardware not run** | simulator rehearsal ✔ (`tools/m1_session.py`, 14 tests; a re-arm after a link blip now needs its own operator `y`) · ruler/homing/exception gate ✘ — needs the owner at the machine (11 §7 steps 1–10) |
-| M2 | File load and render | **partial** | "renders identically" ✔ only on the relaxed metric (IoU ≥ 0.9 + chamfer 1.000; pixel-identical on 2 of 8) · `ManuContour` order via `SortType=4` ✘ — the gate's premise is wrong (§1.3) · the 50 k-`LINE` import budget ✘ (X11: 5.18 s against 3.08 s) |
+| M2 | File load and render | **partial** | "renders identically" ✔ only on the relaxed metric (IoU ≥ 0.9 + chamfer 1.000; pixel-identical on 2 of 8) · `ManuContour` order via `SortType=4` ✘ — the gate's premise is wrong (§1.3) · the 50 k-`LINE` import budget ✔ (X11 closed 2026-09-18: 2.72–2.86 s against 3.13–3.39 s, §5 task 7) |
 | M3 | Layers, parameters, hardware config | **partial**: file layer complete, six property pages + the curve and crafts editors, write-back wired — and since the UI review the pages no longer move a value the operator did not edit | XML round-trip ✔ on every vendor file · every editor on every page opened and committed over the real `BkHardPara.xml` / `BkManuPara.xml` without changing a byte ✔ (§1.4) · Wine load of port-written files ✘ — not run (§5 task 4) |
 | M4 | Job streaming, dry run | **partial**: end to end into the simulator, never onto the card; the planner streams, the memory ceiling is gone, and the *production* stream path now reproduces vendor frames byte for byte | raster geometry ✔ · 3 leaked vendor frames re-encoded byte-identically through `JobFrameStream` + `push_uniform` ✔ (new, §1.5) · vendor item-stream diff ✘ (no vendor capture) · §8.3 jitter gate ✔ **simulator only** · §8.3 planner throughput ✘ (X13, 194 s against 30 s) · machine dry run ✘ |
 | M5 | Live CO2 cutting | **not started, deliberately** — `LASER_ARMED` is unreachable from any client, and D13 is written but unsigned | — (needs D13 signed off: §5 task 5) |
@@ -252,13 +253,16 @@ Gate measured 2026-09-16 (render each sample, compare ink masks against `tools/o
   where PORT-PLAN asks 3 s): a 50 000-segment path opens, fits and paints in **0.39 s** (DXF
   lwpolyline), **0.83 s** (G-code), **0.36 s** (PLT) and **0.41 s** (`.chf`); 50 000 *separate*
   contours from a `.chf` in **2.38 s**; 50 000 separate contours on the canvas in **1.02 s**.
-  50 000 *separate* DXF `LINE` entities take **5.18 s** and are still strict xfail X11 — but no
-  longer because of the parse: `io/dxf_stream.py` reads the `ENTITIES` section tag by tag without
+  50 000 *separate* DXF `LINE` entities took **5.18 s** in that run (strict xfail X11) — not
+  because of the parse: `io/dxf_stream.py` reads the `ENTITIES` section tag by tag without
   ever building an ezdxf document (**0.80 s** for those 50 000 `LINE`s in this run, against
   3.22–3.63 s through ezdxf), and `read_dxf(reader="auto")` falls back to ezdxf for anything the
   fast path will not vouch for (binary DXF, `INSERT`, text-to-curves, a tilted OCS, any structural
-  anomaly), recording which reader ran in `DxfImportResult.reader` / `fallback_reason`. **What is
-  left of X11 is `ops/import_gates` + `ops/sort`: 3.39 s of the 5.18 s in this run** (§2).
+  anomaly), recording which reader ran in `DxfImportResult.reader` / `fallback_reason`. What was
+  left was `ops/import_gates` + `ops/sort`: 3.39 s of the 5.18 s. **Closed on 2026-09-18 by §5
+  task 7**: the gates now take 0.82–0.83 s and the whole open 2.72–2.86 s against 3.13–3.39 s
+  (`speed_factor` 1.04–1.13, shared laptop), with output pinned to the old code by
+  `tests/test_ops_gates_equivalence.py`.
 * **The streaming reader survived an adversarial review** (2026-09-16, lens *silent divergence
   between the two readers*, `tests/test_io_dxf_stream_review.py`, 21 tests): **no finding of
   substance**. cp936 layer names resolved through the `LAYER` table, nested and block-local
@@ -457,7 +461,7 @@ masks; and 200 random jobs through `JobFrameStream` versus `JobStreamBuilder.fra
 
 ---
 
-## 2. Strict xfails (3)
+## 2. Strict xfails (2)
 
 Each documents a known divergence. Fixing one turns the test into an XPASS failure, which forces the
 marker to be removed — so this list cannot rot. **Never relax one to make a run green**; a strict
@@ -468,12 +472,14 @@ Ten of the original thirteen were closed on 2026-09-16 and are ordinary passing 
 D11, D12 decided and implemented), **X6** (D14: a non-empty v2–v4 reserved line is kept in
 `ChfDocument.legacy_reserved` and re-emitted verbatim), **X8**, **X9** (boost double spelling and
 the whole-literal number grammar), **X10** (spline sampling honours the chord step), **X12**
-(vectorised `.chf` token reader). What remains:
+(vectorised `.chf` token reader). **X11** (the 50 000-`LINE` import budget) followed on
+2026-09-18 with §5 task 7: `test_import_ui_fidelity_review::test_open_50k_separate_dxf_lines` is a
+plain timed test now — 2.72–2.86 s in five runs against 3.13–3.39 s (`speed_factor` 1.04–1.13),
+where the pre-task-7 code took 5.34–5.44 s in the same session. What remains:
 
 | # | Test | Sharpened reason, with this report's numbers | Resolved by |
 |---|---|---|---|
 | X7 | `test_io_fidelity_review::test_unknown_attribute_survives_rewrite` | **The only one of the three that is a fidelity gap rather than a speed gap, and the only one no amount of work here can close.** Unknown XML attributes are dropped on rewrite. ParaModule's set-value path (`0x10010cdf` FindElem/AddElem/SetAttrib) keeps a CMarkup DOM and *may* preserve them — which decides whether a file round-tripped through the port loses data a future vendor version added. It cannot be settled by reading the disassembly further: the answer is a diff of two files the vendor tool wrote | **§5 task 4, Wine session H, question H-3**: add an attribute, load and re-save in Mlaser, diff. One afternoon, no machine |
-| X11 | `test_import_ui_fidelity_review::test_open_50k_separate_dxf_lines` | **Not a DXF problem any more.** 50 000 separate `LINE`s open + fit + paint in **5.18 s** against the 3.08 s budget (3 s × `speed_factor` 1.03). Of that: `ops/import_gates.apply_import_gates` + `ops/sort` **3.39 s (65 %)** — `sort._nearest` ~45 %, `merge_connected` ~27 %, `remove_overlaps` ~10 % of the gate time; the canvas build/fit/paint ~1.0 s (~19 %); the streaming parse **0.80 s (15 %)**, down from ezdxf's 3.22–3.63 s. The `.chf` control case in the same run (50 000 separate contours, 2.38 s) passes, which is the proof that the machine was at budget speed | **§5 task 7**: the same vectorise-the-per-item-Python-path treatment the reader just had, applied to `ops/import_gates.py` + `ops/sort.py`. No capture, no owner |
 | X13 | `test_perf_planner::test_100k_contour_job_plans_in_under_30_s` | PORT-PLAN §8.3: 100 k contours project to **194 s** against 30 s, i.e. **6.5x**, down from 461–520 s (**15–17x**). The *memory* half of this entry is **closed** — the planner streams, so a job of any size costs ~2.6 MB of frames instead of the ~8 GB `build_job` used to demand — and so is the item path, which is 5.4x faster and now costs 47 s of the 194. What is left is **per-contour numpy call overhead in the geometry stages**: the inter-contour rapid plan 55 s, `lookahead.plan_velocity` 30 s, the rapid stream 25 s, `sampler.sample_plan` 18 s, everything else 24 s. A one-segment contour is ~675 ticks and each stage makes tens of small array calls on it at ~1–3 µs each whatever the length, so the next factor has to come from planning **many contours in one array pass** | **§5 task 8**: batch `plan/lookahead.py`, `plan/junction.py`, `plan/scurve.py` and the rapid planner. No capture, no owner |
 
 ---
@@ -736,7 +742,7 @@ amendments written by the safety reviews, and D15 is new this phase.
 
 **What the last phase closed**, so nobody repeats it: the streaming, numpy-vectorised planner item
 path (old task 6 — memory solved, 2.4x end to end, X13 still open on the geometry stages); the
-streaming DXF reader (old task 7 — the parse is 4–5.8x faster, X11 still open on the import gates);
+streaming DXF reader (old task 7 — the parse is 4–5.8x faster, X11 then still open on the import gates, since closed by task 7 below);
 D13 written and marked *proposed* (old task 8); the five remaining M3 property pages plus the curve
 and crafts editors (old task 9); the A9 doc corrections, D14/X6, `arm_owner` in the status snapshot
 and the m1-session re-arm (old task 10).
@@ -813,12 +819,34 @@ list is worth less than the first hour of this session.
 
 ### Can be done without the owner and without the machine (tasks 7–10)
 
-7. **X11 — vectorise `ops/import_gates.py` and `ops/sort.py`.** The 50 000-`LINE` import is 5.18 s
-   against a 3.08 s budget and **3.39 s of it is these two modules** (§2). `sort._nearest` is ~45 %
-   of that, `merge_connected` ~27 %, `remove_overlaps` ~10 %. It is the same work the DXF reader
-   just had — one array pass instead of one Python object at a time — and the 50 000-contour `.chf`
-   control case (2.38 s, passing) is the ready-made check that a change did not simply move the
-   cost. Closing this closes the last performance item in M2.
+7. **Done 2026-09-18 — X11 closed: `ops/import_gates.py` and `ops/sort.py` vectorised.** The
+   50 000-`LINE` open now takes **2.72–2.86 s** (five runs, budgets 3.13–3.39 s at `speed_factor`
+   1.04–1.13 on a laptop shared with another agent's test run); the same session measured the
+   pre-task-7 code at 5.34–5.44 s, and the 50 000-contour `.chf` control case at 2.44–2.59 s
+   after against 2.38–2.47 s before, so the cost was removed, not moved. The gates went from
+   **3.52–3.69 s to 0.82–0.83 s**; per stage on the X11 drawing after the change (best of five,
+   stages timed separately): `sort._nearest` 0.42 s, `remove_overlaps` 0.14 s, `merge_connected`
+   0.11 s, open flags + containment + reversals 0.08 s. How:
+   * `sort._nearest`: every step starts at the exit point of the row just chosen, so the 8
+     nearest entry rows of every possible exit point come from one batched KD-tree query; a step
+     scans that list with the same tie window as the live query and falls back to the live
+     KD-tree only when the list cannot prove its answer (about 370 of 50 000 steps here).
+   * `remove_overlaps` / `merge_connected`: one KD-tree pass (glyph bbox corners, Chebyshev; open
+     contour endpoints, Euclidean; radius widened by 1e-6 relative so it is a superset of the exact
+     test) finds the items that can possibly be a duplicate / touch another contour, and only
+     those go through the unchanged per-item grid logic, in document order.
+   * smaller: `contour_endpoints` / `is_closed` / `_is_point_contour` short-cut plain segments,
+     `reverse_contour` calls the constructor instead of `dataclasses.replace` (guarded by a
+     field-list check), the nearest sort computes open/closed flags once for both containment
+     and the walk.
+   Behaviour is unchanged by construction and by test: `tests/gates_reference.py` is the
+   pre-task-7 code, frozen, and `tests/test_ops_gates_equivalence.py` (57 tests) requires identical
+   graphs, identity pattern, counts, order, reversal flags and notes on 45 seeded random drawings
+   (exact-tie lattices, gate-boundary gaps, duplicates, nesting, every glyph and graph kind), a
+   tie-only point cloud, the X11 drawing itself and the eight vendor `.chf` samples. Two mutants
+   (dropping the tie-window check; halving the prefilter radius) both fail it.
+   What is left of the 2.7–2.9 s is outside `ops/`: the canvas build/fit/paint ~1.0 s and the
+   parse ~0.65 s.
 8. **X13 — plan many contours in one array pass.** 194 s against 30 s (§2), and the item path is
    already done: what is left is the inter-contour rapid plan (55 s), `lookahead.plan_velocity`
    (30 s), the rapid stream (25 s) and `sampler.sample_plan` (18 s), all of it per-contour numpy

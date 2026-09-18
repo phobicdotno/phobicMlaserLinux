@@ -33,6 +33,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
+from itertools import chain
 
 import numpy as np
 from scipy.spatial import cKDTree
@@ -143,6 +144,10 @@ def _outline(g: Graph) -> list[tuple[float, float]] | None:
     """Flattened polygon of a single closed contour (None when not a closed contour)."""
     if not isinstance(g, Contour) or not is_closed(g):
         return None
+    return _closed_outline(g)
+
+
+def _closed_outline(g: Contour) -> list[tuple[float, float]] | None:
     pts: list[tuple[float, float]] = []
     for el in g.elements:
         for pl in flatten_glyph(el.glyph, 0.5):
@@ -196,10 +201,32 @@ def containment_depths(graphs: Sequence[Graph]) -> tuple[list[int], list[set[int
     graphs is not quadratic (import-ui fidelity review: the pairwise loop took
     minutes at 5 000 graphs).
     """
+    return _containment_depths(graphs, None)
+
+
+def _containment_depths(
+    graphs: Sequence[Graph], open_flags: Sequence[bool] | None
+) -> tuple[list[int], list[set[int]]]:
+    """:func:`containment_depths`, reusing ``_is_open_contour`` flags the caller already has.
+
+    For a contour with elements ``is_closed`` is exactly ``not open``; without
+    elements it is ``False``; so the flags decide :func:`_outline` without a second
+    ``is_closed`` pass over every graph.
+    """
     n = len(graphs)
     depth = [0] * n
     inside: list[set[int]] = [set() for _ in graphs]
-    outlines = {j: poly for j, g in enumerate(graphs) if (poly := _outline(g)) is not None}
+    if open_flags is None:
+        outlines = {j: poly for j, g in enumerate(graphs) if (poly := _outline(g)) is not None}
+    else:
+        outlines = {
+            j: poly
+            for j, g in enumerate(graphs)
+            if isinstance(g, Contour)
+            and g.elements
+            and not open_flags[j]
+            and (poly := _closed_outline(g)) is not None
+        }
     if not outlines or n == 0:
         return depth, inside
     boxes = [_bbox(g) for g in graphs]
@@ -237,6 +264,13 @@ def _reverse(g: Graph) -> Graph:
     return reverse_contour(g)
 
 
+_PRE_K = 8
+"""Neighbours precomputed per exit point by :func:`_nearest` (the live query's first ``k`` too)."""
+
+_PRE_MIN_ROWS = 64
+"""Below this many entry rows the live query alone is cheaper than the batched precompute."""
+
+
 def _nearest(
     graphs: Sequence[Graph],
     candidates: list[int],
@@ -253,6 +287,15 @@ def _nearest(
     end of the same graph; an all-blocked set takes the first remaining
     candidate) but uses a KD-tree over the entry points, rebuilt as rows are
     consumed, so it is ~O(n log n) instead of O(n^2) (review finding).
+
+    Every step starts where the previous graph was left, and that exit point is known
+    in advance (the other end of the chosen entry row), so the ``_PRE_K`` nearest entry
+    rows of every possible exit point come from one batched KD-tree query up front
+    (STATUS §5 task 7 / X11).  A step first scans that precomputed list with exactly the
+    rule of the live query below; only when the list cannot prove its answer (every row
+    in it consumed or blocked, or the tie window reaching its end) does the step fall
+    back to the live KD-tree query.  The chosen row is the same either way:
+    ``tests/test_ops_gates_equivalence.py`` pins it against the per-step code.
     """
     order: list[int] = []
     flags: list[bool] = []
@@ -261,21 +304,29 @@ def _nearest(
     if open_flags is None:
         open_flags = [_is_open_contour(g) for g in graphs]
     ends = {idx: _ends(graphs[idx]) for idx in candidates}
+    # One entry row per graph (its start), plus one at its end when it may be entered
+    # reversed; ``exits[r]`` is where the tool is left after cutting through row ``r``.
+    # ``candidates`` are distinct graph indices (both callers pass a partition of range(n)).
     owner: list[int] = []
     rev: list[bool] = []
-    coords: list[tuple[float, float]] = []
+    coords: list[Vec2] = []
+    exits: list[Vec2] = []
+    rows_of: dict[int, list[int]] = {}
     for idx in candidates:
         s, e = ends[idx]
+        r0 = len(owner)
         owner.append(idx)
         rev.append(False)
-        coords.append((s[0], s[1]))
+        coords.append(s)
+        exits.append(e)
         if allow_reverse and open_flags[idx]:
             owner.append(idx)
             rev.append(True)
-            coords.append((e[0], e[1]))
-    rows_of: dict[int, list[int]] = {}
-    for r, idx in enumerate(owner):
-        rows_of.setdefault(idx, []).append(r)
+            coords.append(e)
+            exits.append(s)
+            rows_of[idx] = [r0, r0 + 1]
+        else:
+            rows_of[idx] = [r0]
     alive = bytearray(b"\x01") * len(owner)
     pending: dict[int, int] = dict.fromkeys(candidates, 0)
     blocked_count = 0
@@ -289,42 +340,77 @@ def _nearest(
                 containers.setdefault(b, []).append(idx)
     remaining = list(candidates)
     remaining_set = set(candidates)
-    all_xy = np.asarray(coords, dtype=np.float64).reshape(-1, 2)
-    tree_rows_list = list(range(len(owner)))
-    tree = cKDTree(all_xy)
+    n_rows = len(owner)
+    all_xy = np.fromiter(chain.from_iterable(coords), np.float64, 2 * n_rows).reshape(-1, 2)
+    tree_rows_list = list(range(n_rows))
+    tree = cKDTree(all_xy, balanced_tree=False, compact_nodes=False)
     dead_in_tree = 0
 
+    # Precomputed neighbour lists of every exit point (docstring).  Only worth it, and
+    # only used, for finite coordinates; with fewer rows than _PRE_K the list is the
+    # whole set and the "list covers every row" branch below applies.
+    pre_k = min(_PRE_K, n_rows)
+    pre_d: list[list[float]] = []
+    pre_i: list[list[int]] = []
+    if n_rows >= _PRE_MIN_ROWS and bool(np.isfinite(all_xy).all()):
+        exit_xy = np.fromiter(chain.from_iterable(exits), np.float64, 2 * n_rows).reshape(-1, 2)
+        if bool(np.isfinite(exit_xy).all()):
+            dq_all, lq_all = tree.query(exit_xy, k=pre_k, workers=-1)
+            pre_d = dq_all.reshape(n_rows, pre_k).tolist()
+            pre_i = lq_all.reshape(n_rows, pre_k).tolist()
+    pre_covers_all = pre_k >= n_rows
+    use_pre = bool(pre_d)
+    last_row = -1
+
     while remaining_set:
-        if len(tree_rows_list) > 64 and dead_in_tree * 2 > len(tree_rows_list):
-            tree_rows_list = [r for r in tree_rows_list if alive[r]]
-            tree = cKDTree(all_xy[tree_rows_list])
-            dead_in_tree = 0
-        total = len(tree_rows_list)
-        k = min(8, total)
-        best: tuple[float, int, bool] | None = None
         check_blocked = blocked_count > 0
-        while True:
-            dq, lq = tree.query((pos[0], pos[1]), k=k)
-            dists = [float(dq)] if k == 1 else dq.tolist()
-            locs = [int(lq)] if k == 1 else lq.tolist()
+        best: tuple[float, int, bool] | None = None
+        if use_pre and last_row >= 0:
+            ds = pre_d[last_row]
             limit = -1.0
-            for d_tree, loc in zip(dists, locs, strict=True):
-                if limit >= 0.0 and d_tree > limit:
-                    break
-                r = tree_rows_list[loc]
-                if not alive[r] or (check_blocked and pending[owner[r]]):
-                    continue
-                if limit < 0.0:
+            for d_tree, r in zip(ds, pre_i[last_row], strict=True):
+                if limit >= 0.0:
+                    if d_tree > limit:
+                        break
+                    if not alive[r] or (check_blocked and pending[owner[r]]):
+                        continue
+                    key = (math.dist(pos, coords[r]), owner[r], rev[r])
+                    if key < best:  # type: ignore[operator]
+                        best = key
+                elif alive[r] and not (check_blocked and pending[owner[r]]):
                     limit = d_tree * (1.0 + 1e-9) + 1e-12
-                key = (math.dist(pos, coords[r]), owner[r], rev[r])
-                if best is None or key < best:
-                    best = key
-            if best is not None and (k >= total or dists[-1] > limit):
-                break
-            if k >= total:
-                break
-            best = None
-            k = min(total, k * 4)
+                    best = (math.dist(pos, coords[r]), owner[r], rev[r])
+            if best is not None and not (pre_covers_all or ds[-1] > limit):
+                best = None  # the tie window may reach past the list: ask the tree
+        if best is None:
+            if len(tree_rows_list) > 64 and dead_in_tree * 2 > len(tree_rows_list):
+                tree_rows_list = [r for r in tree_rows_list if alive[r]]
+                tree = cKDTree(all_xy[tree_rows_list])
+                dead_in_tree = 0
+            total = len(tree_rows_list)
+            k = min(8, total)
+            while True:
+                dq, lq = tree.query((pos[0], pos[1]), k=k)
+                dists = [float(dq)] if k == 1 else dq.tolist()
+                locs = [int(lq)] if k == 1 else lq.tolist()
+                limit = -1.0
+                for d_tree, loc in zip(dists, locs, strict=True):
+                    if limit >= 0.0 and d_tree > limit:
+                        break
+                    r = tree_rows_list[loc]
+                    if not alive[r] or (check_blocked and pending[owner[r]]):
+                        continue
+                    if limit < 0.0:
+                        limit = d_tree * (1.0 + 1e-9) + 1e-12
+                    key = (math.dist(pos, coords[r]), owner[r], rev[r])
+                    if best is None or key < best:
+                        best = key
+                if best is not None and (k >= total or dists[-1] > limit):
+                    break
+                if k >= total:
+                    break
+                best = None
+                k = min(total, k * 4)
         if best is None:  # every remaining graph is blocked (containment cycle)
             while remaining[0] not in remaining_set:
                 remaining.pop(0)
@@ -332,9 +418,10 @@ def _nearest(
         _, idx, rv = best
         remaining_set.discard(idx)
         done.add(idx)
-        for r in rows_of[idx]:
+        rows = rows_of[idx]
+        for r in rows:
             alive[r] = 0
-            dead_in_tree += 1
+        dead_in_tree += len(rows)
         for c in containers.get(idx, ()):
             pending[c] -= 1
             if pending[c] == 0:
@@ -343,6 +430,7 @@ def _nearest(
         flags.append(rv)
         s, e = ends[idx]
         pos = s if rv else e
+        last_row = rows[1] if rv else rows[0]
     return order, flags, pos
 
 
@@ -389,7 +477,7 @@ def sort_graphs(
         )
     elif st is SortType.NEAREST:
         open_flags = [_is_open_contour(g) for g in graphs]
-        blockers = containment_depths(graphs)[1] if inner_first else None
+        blockers = _containment_depths(graphs, open_flags)[1] if inner_first else None
         idx, flags, _ = _nearest(
             graphs,
             list(range(n)),
@@ -401,7 +489,7 @@ def sort_graphs(
         )
     else:
         open_flags = [_is_open_contour(g) for g in graphs]
-        depth, _ = containment_depths(graphs)
+        depth, _ = _containment_depths(graphs, open_flags)
         levels = sorted(set(depth), reverse=st is SortType.INSIDE_TO_OUTSIDE)
         idx, flags = [], []
         pos = start

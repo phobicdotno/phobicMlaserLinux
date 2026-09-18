@@ -192,14 +192,14 @@ NEXCUT_SRC=/nonexistent QT_QPA_PLATFORM=offscreen \
 .venv/bin/pytest -q tests/test_mcc_simulator.py     # one file
 ```
 
-Expected on the owner's machine (2026-09-16, Python 3.14, 1 574 tests in 64 files):
-`1571 passed, 3 xfailed in 212.81s` with `NEXCUT_SRC` set (or unset: the fixture default is the
-owner's copy); with `NEXCUT_SRC=/nonexistent`, which is what CI does,
-`1439 passed, 132 skipped, 3 xfailed in 199.39s` — the SRC-dependent tests skip instead. With
-every core busy the same suite is `1571 passed, 3 xfailed in 332s`. The 3 strict xfails (X7 in
-`tests/test_io_fidelity_review.py`, X11 in `tests/test_import_ui_fidelity_review.py`, X13 in
-`tests/test_perf_planner.py`) are documented gaps listed in `docs/STATUS.md` §2, not regressions
-— X6 was closed by decision D14. The UI tests need `QT_QPA_PLATFORM=offscreen` when no display is
+Expected on the owner's machine (2026-09-18, Python 3.14, 1 736 tests in 68 files, measured
+while another test run shared the laptop): `1734 passed, 2 xfailed in 298.04s` with `NEXCUT_SRC`
+set (or unset: the fixture default is the owner's copy); with `NEXCUT_SRC=/nonexistent`, which is
+what CI does, `1590 passed, 144 skipped, 2 xfailed in 290.58s` — the SRC-dependent tests skip
+instead. (The last every-core-busy run, on the 1 574-test tree of 2026-09-16, was
+`1571 passed, 3 xfailed in 332s`.) The 2 strict xfails (X7 in `tests/test_io_fidelity_review.py`,
+X13 in `tests/test_perf_planner.py`) are documented gaps listed in `docs/STATUS.md` §2, not
+regressions — X6 was closed by decision D14 and X11 by STATUS §5 task 7. The UI tests need `QT_QPA_PLATFORM=offscreen` when no display is
 available.
 
 ### Performance gates (PORT-PLAN §8.3)

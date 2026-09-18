@@ -387,8 +387,9 @@ ticked only when the deliverable *and* its gate were actually run and passed.
   - [x] byte-identical `.chf` re-save on every sample
   - [x] a streaming DXF reader with an ezdxf fallback, cross-checked against it on the vendor
         drawing, 240+ randomised corpora and the full entity zoo at R12/R2000/R2018
-  - [ ] the 3 s import budget for 50 000 separate `LINE`s (X11: 5.18 s, of which 3.39 s is
-        `ops/import_gates` + `ops/sort`)
+  - [x] the 3 s import budget for 50 000 separate `LINE`s (X11 closed 2026-09-18: 2.72–2.86 s
+        against 3 s × `speed_factor` 1.04–1.13; was 5.18 s, 3.39 s of it `ops/import_gates` +
+        `ops/sort`, now vectorised — STATUS §5 task 7)
   - [ ] render gate on the strict metric, or an agreed relaxed one (open decision, STATUS §4.2)
   - [ ] a valid sort reference, and any editing operation at all
 - [ ] **M3: parameter/layer/technology editors round-trip vendor files.** The file layer is

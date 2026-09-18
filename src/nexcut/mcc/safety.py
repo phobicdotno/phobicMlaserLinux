@@ -719,8 +719,8 @@ def fifo_digest(words: Sequence[int], frame: bytes) -> FifoDigest:
 
 @dataclass(frozen=True, slots=True)
 class WriteLogLimits:
-    """Caps of :class:`WriteLog`. Defaults bound the log at roughly 10 MB (measured in
-    ``tests/test_bounded_logs.py``)."""
+    """Caps of :class:`WriteLog`. With the defaults a long FIFO stream holds the log at
+    13.05 MB (measured 2026-09-18, ``tests/test_bounded_logs.py``, 24 000 and 48 000 frames)."""
 
     fifo_full_keep: int = 32
     """The most recent ``0x66`` frames kept in full (words and frame bytes)."""

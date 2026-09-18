@@ -41,7 +41,7 @@ if the owner is at the machine; `docs/WINE-SESSION-H.md` if the owner is at a Wi
 ```sh
 cd ~/phobicMlaserLinux
 NEXCUT_SRC=~/Documents/CF1390-250715-1084-0973/Mlaser-v0.0.0.52 QT_QPA_PLATFORM=offscreen \
-    .venv/bin/pytest -q -p no:cacheprovider     # 1676 passed, 3 xfailed, ~3 min 45 s
+    .venv/bin/pytest -q -p no:cacheprovider     # 1703 passed, 14 skipped, 3 xfailed, ~4 min
 NEXCUT_SRC=/nonexistent QT_QPA_PLATFORM=offscreen \
     .venv/bin/pytest -q -p no:cacheprovider     # what CI runs: the vendor-golden tests skip
 .venv/bin/ruff check . tools/m1_session.py      # All checks passed!
@@ -79,10 +79,10 @@ except the two rows that name an earlier run.
 
 | Item | Value |
 |---|---|
-| Full suite, `NEXCUT_SRC=…/Mlaser-v0.0.0.52 QT_QPA_PLATFORM=offscreen .venv/bin/pytest -q -p no:cacheprovider` | **1676 passed, 3 xfailed (all strict), 0 failed, 0 skipped** in 224.44 s |
-| Same suite with `NEXCUT_SRC=/nonexistent` (what CI runs) | **1540 passed, 136 skipped, 3 xfailed** in 212.00 s |
+| Full suite, `NEXCUT_SRC=…/Mlaser-v0.0.0.52 QT_QPA_PLATFORM=offscreen .venv/bin/pytest -q -p no:cacheprovider` | **2026-09-18 (tasks 9/10 pass): 1703 passed, 14 skipped, 3 xfailed (all strict), 0 failed** in 240.35 s — the 14 skips are `tests/test_session_h.py` waiting for Wine session H's artefacts. Run while another agent was running performance tests on the same laptop, so the time is not an idle figure. (2026-09-16, idle: 1676 passed, 3 xfailed in 224.44 s) |
+| Same suite with `NEXCUT_SRC=/nonexistent` (what CI runs) | **2026-09-18: 1566 passed, 151 skipped, 3 xfailed** in 230.42 s (shared laptop, as above; 136 vendor-golden + 14 session H + 1 vendor save-warning skip). (2026-09-16, idle: 1540 passed, 136 skipped, 3 xfailed in 212.00 s) |
 | Same suite with every core busy | **not re-run for this report.** The last load sweep was the previous phase's tree (1571 tests): **1571 passed, 3 xfailed** twice, 332.08 s and 332.19 s against 212.8 s idle (1.56x), and the timing-sensitive files green five times over under the same load (§6). The 172 tests added since have no sleeps, no wall-clock budgets and no periodic-event assertions; re-running the sweep is §5 task 10 |
-| Tests collected | **1679 in 67 files** (+ `conftest.py`) |
+| Tests collected | **1720 in 70 files** (+ `conftest.py`) on 2026-09-18: +41 from tasks 9/10 (`test_bounded_logs` 11, `test_session_h` 18, `test_ui_save_range_warning` 7, 2 in `test_mccd_cli_tui`, 2 in `test_mccd_job`, 1 in `test_plan_items_cli`). The per-area table below is still the 2026-09-16 count of 1679 |
 | `.venv/bin/ruff check . tools/m1_session.py` | **All checks passed!** |
 | CI (`.github/workflows/ci.yml`) | ruff + pytest on Python 3.12/3.13/3.14, offscreen Qt, `-p no:cacheprovider --durations=15`. `SRC` is absent there, so the 136 vendor-golden tests skip |
 | `UNVERIFIED` markers in `src/` + `tools/m1_session.py` | **261 lines** (grep), inventoried in §3 |
@@ -317,10 +317,10 @@ legacy lines untouched; the curve editor clamping a typed coordinate, locking on
 curve and sorting a non-monotonic curve through the same code path the stream uses
 (`plan.pwm_schedule.CurveNodes.parse`), so the preview cannot diverge from what is streamed.
 
-*Residual, reported and deliberately not changed:* `LayerFileBar.save` / `ParamPage.save` do not
-surface `document.validate()` before writing. Blocking would be wrong — vendor files already
-violate their own schema, which is the whole of U3 — but a "N values outside their range" line on
-save would be an improvement (§5 task 10).
+*Since 2026-09-18:* `LayerFileBar.save` / `ParamPage.save` write the file and then show "N values
+outside their range (saved anyway): …" from `document.validate()`. Blocking would be wrong —
+vendor files already violate their own schema, which is the whole of U3. The same pass fixed a
+bool row stored as `2` being rewritten to `1` merely by building a page (§5 task 10).
 
 * **Absent.** Hardware-page read-back of 50000/50200/59600+ (the daemon reads 50000/26 only, for
   K, the bus cycle and ZFType); the vendor's `CSelectTechnologyDlg` preset browser over
@@ -722,7 +722,7 @@ amendments written by the safety reviews, and D15 is new this phase.
 
 | Id | Question | Blocks | What decides it |
 |---|---|---|---|
-| **D13** | Laser arming: the IPC shape, the job token it must quote, the operator confirmation, the auto-disarm rule. D5 says `LASER_ARMED` needs its own entry | **all of M5** | **written 2026-09-16 and marked "proposed — needs the owner's sign-off before implementation"** (`docs/DECISIONS.md` D13). No M5 code exists or may exist until it is signed off; §4 of the entry also depends on the audit-log bound of §5 task 9 (a laser-arming incident review needs a log that can be kept). Signing it off is §5 task 5 |
+| **D13** | Laser arming: the IPC shape, the job token it must quote, the operator confirmation, the auto-disarm rule. D5 says `LASER_ARMED` needs its own entry | **all of M5** | **written 2026-09-16 and marked "proposed — needs the owner's sign-off before implementation"** (`docs/DECISIONS.md` D13). No M5 code exists or may exist until it is signed off; The audit-log bound its §4 depended on is in place (§5 task 9, `mcc.safety.WriteLog`). Signing it off is §5 task 5 |
 | D7-open | May the operator jog off a pressed hard limit while `alarm_1 ≠ 0`? The gate refuses all non-ALWAYS writes in that state | M1 step 7 sign-off | 11 §7 step 7: press each limit, read 1006 and 2000+10·slot, then decide |
 | D2-follow | Set `position_counts_per_mm` and flip `position_scale_verified` | homed soft limits, absolute moves | measured values from steps 3/4 only |
 | M2-gate | The `ManuContour`/`SortType=4` gate has a wrong premise and must be replaced by a vendor-sorted reference | M2 sign-off | Wine session H (§5 task 4): Sort, save, commit the order as a golden; then rewrite the gate (§5 task 6) |
@@ -803,8 +803,8 @@ list is worth less than the first hour of this session.
 5. **Sign off, amend or reject D13 (laser arming).** It is written (`docs/DECISIONS.md` D13) and
    marked *proposed*; **no M5 code exists or may exist until the owner signs it**, and M5 is the
    milestone the machine actually exists for. Reading it takes twenty minutes; §2's eight checks and
-   §3's eleven auto-disarm events are where the argument is. Note that §4 of that entry depends on
-   task 9 (the audit log has to be boundable before an arming incident can be reviewed).
+   §3's eleven auto-disarm events are where the argument is. The audit-log bound §4 of that
+   entry depended on is done (task 9, 2026-09-18).
 6. **Settle the two M2 gate wordings** (`docs/PORT-PLAN.md` §4 M2, and §4.2 of this file). One is a
    decision only the owner can make — accept "IoU ≥ 0.9 **and** chamfer 1.000 against an asymmetric
    control" as the meaning of "renders identically", or pay for a DDA reference rasteriser. The
@@ -825,38 +825,71 @@ list is worth less than the first hour of this session.
    *call* overhead in `plan/lookahead.py`, `plan/junction.py`, `plan/scurve.py` and the rapid
    planner. Larger and riskier than task 7 — these are the files the vendor goldens pin — so do it
    after task 7, and keep every golden byte-identical.
-9. **Bound the audit log and the simulator's request list.** `SafeMccClient.write_log` keeps a
-   298-word tuple plus the 1 206 frame bytes for every FIFO frame (~10 kB each) and is trimmed only
-   opportunistically by the daemon watchdog, so a streaming job sits at tens of MB; a compact record
-   for `0x66`, or a cap inside `safety.py`, is the fix. **D13 §4 depends on this** — a laser-arming
-   incident review needs a log that can be kept. `CardSimulator.requests` grows the same way
-   (~60 MB over a ten-minute gate run); a ring buffer makes long simulator runs cheap.
-10. **The correctness and hygiene backlog.** Small, independent, each worth doing when passing by:
-    * **Re-run the under-load sweep** on this tree (§6): the last one was the previous phase's
-      1 571 tests, and 172 have been added since.
-    * **Give `nexcut-mccd run-job` a retry for one poll period.** Two runs in quick succession are
-      refused with `busy: axis status not refreshed since the last motion command`: `_require_ready`
-      wants a 2000/50 poll newer than the last motion write, and a FIFO program start is not a jog.
-      Either exempt `start_job` from that gate or retry in the CLI, as
-      `tests/test_mccd_job.start_job()` already does.
-    * **Warn on save when values are outside their range.** `LayerFileBar.save` / `ParamPage.save`
-      do not surface `document.validate()`. Blocking would be wrong (vendor files already violate
-      it — that is U3), but a "N values outside their range" line would be an improvement.
-    * **A test that every key named in the TUI's two hand-written footer lines is in
-      `KEY_BINDINGS`.** Only the `?` overlay is generated from the table, so the footer can drift
-      away from D11's single source of truth.
-    * **Expose `LaserOffBeforeDelay` / `LaserOffAfterDelay` on `plan/pwm_schedule.LayerLaser`** —
-      both are absent from this machine's CO2 XML, so `build_job` passes 0 today, and the schema
-      already carries them (pd137/pd138).
-    * **Rename the two tests in `tests/test_plan_fidelity_review.py` that still carry splice wording
-      in their names** (`test_prologue_dwell_is_14_stationary_ticks_in_frames_0x39_0x3a`,
-      `test_vendor_cut_start_kinematics_frame_0x3a`); their docstrings are already corrected.
-    * **`plan/lookahead.format_veldecc()`** writes a line per node; the vendor writes one only for a
-      node whose piece speed factor is below 0.99 (A9 §1). Documented at the function, not fixed.
-    * **The consumers session H's artefacts need** (`docs/WINE-SESSION-H.md`): the `SortType`
-      goldens in `tests/test_ops_sort.py`, the vendor-re-saved files as byte-identity samples, the
-      X7 verdict, and a `session_h_dir` fixture (`NEXCUT_SESSION_H`, skip when absent) beside
-      `src_dir`. Write these *before* task 4, so the session's output has somewhere to land.
+9. **Done (2026-09-18): the audit log and the simulator's request list are bounded.**
+   `SafeMccClient.write_log` is a `mcc.safety.WriteLog`: every non-FIFO write and every refusal
+   (FIFO frames included) is kept in full, the newest 32 sent/failed `0x66` frames in full, and
+   older ones are compacted to a `FifoDigest` (frame id, word count, CRC32 of the words as sent
+   and of the encoded frame, frame length, first three opcodes). Each part has a cap
+   (`WriteLogLimits`: 10 000 other records, 32 full frames, 20 000 digests); iteration, `[i]`
+   and slicing see one sequence in write order, and `compacted` / `dropped_fifo` /
+   `dropped_other` / `summary()` say what was trimmed. `WriteRecord.laser_items` now carries the
+   laser-record count of a `LASER_ARMED` frame — the counter D13 §4 asks for. The daemon no longer
+   trims the log. Measured with the default caps: **13.05 MB after 24 000 frames and 13.05 MB after
+   48 000** (flat; a list of full records would be ~580 MB), ~14 µs per appended frame including
+   the compaction. `CardSimulator.requests` is a `RequestLog` ring (`SimConfig.request_log_limit`,
+   default 20 000, `None` = unbounded, `requests.dropped` counts), which still supports
+   `len`/iteration/`[i]`/`[a:b]` and iterates a snapshot. Tests: `tests/test_bounded_logs.py`
+   (11), written first; the 321 tests that read either log pass unchanged.
+10. **The correctness and hygiene backlog.** Six of the eight items were done on 2026-09-18;
+    two are still open:
+    * **Open — re-run the under-load sweep** on this tree (§6): the last one was the previous
+      phase's 1 571 tests. Not done in the 2026-09-18 pass because another agent was running
+      performance measurements on the same four cores at the time, and a sweep that loads every
+      core would have corrupted both.
+    * **Open — `plan/lookahead.format_veldecc()`** writes a line per node; the vendor writes one
+      only for a node whose piece speed factor is below 0.99 (A9 §1). Documented at the function,
+      not fixed; left alone on 2026-09-18 because `plan/lookahead.py` was being changed by the
+      performance work at the same time.
+    * **Done — `nexcut-mccd run-job` retries `start_job`** (`cli._start_job`) while the daemon
+      refuses it with exactly `busy: axis status not refreshed since the last motion command`
+      (`daemon.STALE_POLL_REFUSAL`), for at most `START_JOB_RETRY_S` = 1.0 s (~11 periods of the
+      90 ms 2000/50 poll); every other refusal — MOVING, homing, arming (D9), a missing job — is
+      final at once. The CLI retry was chosen over exempting `start_job` from `_require_ready`: the
+      exemption would let a FIFO program start on a READY read taken *before* the last motion
+      write, which is the D8 check the gate exists for. Tests:
+      `tests/test_mccd_job.py::test_cli_run_job_twice_in_quick_succession` (two back-to-back runs,
+      then the refusal forced by a motion timestamp 0.3 s in the future — failed before the fix)
+      and `test_cli_start_job_retries_only_the_stale_poll_refusal`.
+    * **Done — Save warns when values are outside their range.** `LayerFileBar.save` and
+      `ParamPage.save` write the file, then show `param_pages.out_of_range_message()` ("N values
+      outside their range (saved anyway): …", the first three named) in the status / problem label
+      and keep it as `last_save_warning`. Never blocking (U3). Writing the tests found a D15
+      defect: building a page over a bool row stored as `2` rewrote it to `1` without an edit,
+      because the checkbox handler compared the check state with the raw value
+      (`PropertyGrid._on_item_changed`); fixed. The descriptor defaults of `BkManuPara` already
+      carry 2 out-of-range values (`GRP.EdgeBoardSizeX/Y` = 5 against a minimum of 50), so a
+      Save of a default manu document warns. Tests: `tests/test_ui_save_range_warning.py` (7, one needs `src_dir`).
+    * **Done — the footer lines are data and checked.** `tui.FOOTER_LINES` holds the two lines;
+      `tests/test_mccd_cli_tui.py::test_every_footer_key_is_in_the_key_table` parses every key they
+      name, resolves it with `binding_for(key, MODE_NORMAL)`, and also checks that every
+      normal-mode and global action appears on the footer; a second test proves the parser flags a
+      key that is not in `KEY_BINDINGS`.
+    * **Done — `LayerLaser.laser_off_before_ms` / `laser_off_after_ms`** from
+      `LaserOffBeforeDelay` / `LaserOffAfterDelay` (pd137/pd138, default 0), passed by `build_job`
+      into `ContourLaser`'s two epilogue wait records. The CO2 layer layout has no such attributes,
+      so every vendor golden stays byte-identical (150 plan tests re-run). Test:
+      `tests/test_plan_items_cli.py::test_laser_off_delays_reach_the_stream`.
+    * **Done — the two splice-worded tests are renamed**
+      `test_committed_splice_0x39_0x3a_has_14_stationary_ticks_after_do9_on` and
+      `test_frame_0x3a_is_mid_ramp_kinematics_not_a_contour_start` (helper `_splice_cumulative_x`).
+    * **Done — the session H consumers.** `session_h_dir` in `tests/conftest.py`
+      (`NEXCUT_SESSION_H`, default `~/mlaser-captures/session-h`, skip when absent) and
+      `tests/test_session_h.py`: the eight `SortType` goldens, the vendor-written `.chf` / `Bk*.xml`
+      / technology files as byte-identity samples (the technology one is the `CutFreq` verdict),
+      and the X7 verdict, each skipping when its file is absent (14 skipped today), plus 4 tests
+      that run the same consumers on synthetic artefacts. The exact file layout is
+      `docs/WINE-SESSION-H.md` §2.1. Run once end to end against a synthetic `session-h/` built from
+      the package's `autosave.chf` and `BkLayerPara.xml`: 18 passed.
 
 ---
 
@@ -905,7 +938,7 @@ got `[1, 2]`, deterministically red — the closing `0x67 ← [3]` / `[1]` are s
 | `test_r1_stop_reaches_card_after_long_comm_loss_despite_refreshing_client` snapshotted the healthy-refresh count *after* observing `LINK_LOST` | The snapshot is taken before the link is cut, which is healthy by construction |
 | `test_watchdog_simulator_drop_disarms_and_stops` asserted `DISARMED` the instant it saw `LINK_LOST` | Wait for `DISARMED` with a 3 s deadline |
 | The `.chf` open budget still missed by 11 ms under load: the pure-interpreter calibration reported 2.32x while the Qt + file-I/O path had slowed by 3.2x | `LOAD_HEADROOM = 1.5` in `tests/conftest.py`, applied to the *excess* over 1.0, so a machine at the reference speed still gets the exact 3 s gate |
-| `start_job` for a second job right after the first is refused until the next 2000/50 poll (~90 ms) lands | `tests/test_mccd_job.start_job()` retries while the daemon answers `busy`, which is what a real client has to do. The CLI does **not** yet — §5 task 10 (hygiene backlog) |
+| `start_job` for a second job right after the first is refused until the next 2000/50 poll (~90 ms) lands | `tests/test_mccd_job.start_job()` retries while the daemon answers `busy`, which is what a real client has to do. Since 2026-09-18 `nexcut-mccd run-job` retries that one refusal for up to 1 s as well (§5 task 10) |
 
 Under that sweep the suite was run three times end to end with every core busy and once under
 `pytest-xdist -n 4`, plus five repeats of the sixteen timing-sensitive files. The under-load

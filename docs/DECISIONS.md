@@ -430,8 +430,13 @@ The last item is the one number an incident review needs and the only one nothin
 it is part of the decision rather than an implementation detail: `SafeMccClient` already returns
 `laser_items` from `strip_laser_records(…, laser_ok=True)` on the `LASER_ARMED` path
 (`mcc/safety.py`, the `0x66` branch), so it is a counter, not a new mechanism. The audit-log size
-item in STATUS §5 task 10 has to be settled first — a per-frame 298-word record at tens of MB per
-job is not a log one can keep for a review.
+item (STATUS §5 task 9) had to be settled first — a per-frame 298-word record at tens of MB per
+job is not a log one can keep for a review. **Settled 2026-09-18:** `SafeMccClient.write_log` is a
+bounded `WriteLog` (every non-FIFO write and every refusal in full, the newest 32 FIFO frames in
+full, older ones as a `FifoDigest`, write order preserved, dropped counts in `summary()`; 13 MB
+with the default caps, flat over a stream), and `WriteRecord.laser_items` already carries the
+per-frame laser-record count on the `LASER_ARMED` path, so the revocation counter above is a sum
+over it.
 
 Nothing in the log is a secret, and the `confirm` string is operator-typed text about this machine,
 so it is logged verbatim.
@@ -622,9 +627,15 @@ port is a *lossless* editor of somebody else's file and an edit is something the
 * *Clamp the value into the descriptor range and warn.* This is what the code did by accident, and
   it is what U3 is. A warning the operator sees after the file is written is not consent.
 * *Refuse to load a file that violates its own schema.* Refuses this machine's real files.
-* *Block the save on `document.validate()`.* Same objection. A non-blocking "N values outside their
-  range" line on save is worth having and is `docs/STATUS.md` §5 task 10; it does not change this
-  entry.
+* *Block the save on `document.validate()`.* Same objection. The non-blocking "N values outside
+  their range" line after a save exists since 2026-09-18 (`param_pages.out_of_range_message`,
+  `docs/STATUS.md` §5 task 10); it does not change this entry.
+
+**Amendment (2026-09-18).** A bool row whose stored value is neither 0 nor 1 (e.g. `2`) was
+rewritten to `1` merely by building the page: `PropertyGrid._on_item_changed` compared the
+checkbox state with the raw value, and the initial check state went through it. It now compares
+with the value as displayed (non-zero = checked), so only a real toggle writes. Test:
+`tests/test_ui_save_range_warning.py::test_opening_a_page_leaves_an_out_of_range_bool_alone`.
 
 **UNVERIFIED in the implementation** (`docs/STATUS.md` §3.8, settle in Wine session H):
 `property_grid.INT32_MIN/INT32_MAX` as the editor bound for a u32 descriptor - a port choice

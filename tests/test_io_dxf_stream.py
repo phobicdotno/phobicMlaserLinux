@@ -666,17 +666,22 @@ def test_streaming_reader_is_much_faster_than_ezdxf() -> None:
     """X11: the fast path must be a different order of cost, not a tuned constant.
 
     Informational numbers are printed; the assertion only demands a 2x margin, which
-    is far below the 5-6x measured, so it holds on a loaded or slower runner.
+    is far below the 4-6x measured, so it holds on a loaded or slower runner.  Each
+    reader is timed best-of-3, interleaved, because a single sample flaked on a CI
+    runner (2026-09-18, Python 3.13: stream 0.69 s against 0.96 s for ezdxf, where the
+    same pair measures 0.31-0.36 s against 1.49-1.57 s locally).
     """
     import time
 
     data = _many_lines(20_000)
-    t = time.perf_counter()
-    fast = read_dxf(data, reader="stream")
-    t_fast = time.perf_counter() - t
-    t = time.perf_counter()
-    slow = read_dxf(data, reader="ezdxf")
-    t_slow = time.perf_counter() - t
+    t_fast = t_slow = math.inf
+    for _ in range(3):
+        t = time.perf_counter()
+        fast = read_dxf(data, reader="stream")
+        t_fast = min(t_fast, time.perf_counter() - t)
+        t = time.perf_counter()
+        slow = read_dxf(data, reader="ezdxf")
+        t_slow = min(t_slow, time.perf_counter() - t)
     print(f"20k LINEs: stream {t_fast:.2f} s, ezdxf {t_slow:.2f} s ({t_slow / t_fast:.1f}x)")
     assert len(fast.document.graphs) == 20_000
     assert fast.document == slow.document

@@ -639,7 +639,9 @@ class PropertyGrid(QTreeWidget):
         if row is None or not row.is_bool or row.read_only:
             return
         new = 1 if item.checkState(_VALUE_COLUMN) == Qt.CheckState.Checked else 0
-        if new != int(self._get(key)):
+        # Compare with what the checkbox shows, not the raw value: a stored 2 is drawn
+        # checked, and re-drawing it must not rewrite it to 1 (D15).
+        if new != (1 if int(self._get(key)) else 0):
             self.set_value(key, new)
 
     # ---------------------------------------------------------------- helpers

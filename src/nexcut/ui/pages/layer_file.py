@@ -41,6 +41,7 @@ from nexcut.io.params import (
     write_params,
 )
 from nexcut.ui.i18n import Translator, get_translator
+from nexcut.ui.pages.param_pages import out_of_range_message
 
 __all__ = ["LayerFileBar"]
 
@@ -67,6 +68,8 @@ class LayerFileBar(QWidget):
         self.document = document
         self.path: Path | None = Path(path) if path is not None else None
         self.last_backup: Path | None = None
+        self.last_save_warning = ""
+        """:func:`~nexcut.ui.pages.param_pages.out_of_range_message` of the last save."""
         self._ask_path: Callable[[bool], str | None] | None = None
 
         row = QHBoxLayout(self)
@@ -128,6 +131,8 @@ class LayerFileBar(QWidget):
             return self.save_as()
         self.last_backup = write_params(target, self.document, backup_suffix=BACKUP_SUFFIX)
         self.path = target
+        # Never blocks (U3: vendor files violate the ranges); said after the write.
+        self.last_save_warning = out_of_range_message(self.document)
         self._refresh()
         self.documentSaved.emit(str(target))
         return target
@@ -157,6 +162,8 @@ class LayerFileBar(QWidget):
         text = self.report_text()
         if self.last_backup is not None:
             text = f"{text}; previous kept as {self.last_backup.name}"
+        if self.last_save_warning:
+            text = f"{text}; {self.last_save_warning}"
         self.status_label.setText(text)
         self.reload_button.setEnabled(self.path is not None)
 

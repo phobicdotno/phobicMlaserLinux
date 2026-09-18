@@ -180,6 +180,22 @@ PAGE_SPECS: dict[str, PageSpec] = {
 }
 
 
+def out_of_range_message(document: ParamDocument, show: int = 3) -> str:
+    """``"N values outside their range: …"`` for :meth:`ParamDocument.validate`, or ``""``.
+
+    A warning shown *after* a save, never a reason to refuse one: the vendor's own files
+    violate the descriptor ranges (U3), and D15 writes what the operator did not touch
+    byte for byte. The first ``show`` problems are named.
+    """
+    problems = document.validate()
+    if not problems:
+        return ""
+    n = len(problems)
+    head = f"{n} value outside its range" if n == 1 else f"{n} values outside their range"
+    more = f" (+{n - show} more)" if n > show else ""
+    return f"{head} (saved anyway): " + "; ".join(problems[:show]) + more
+
+
 class ParamPage(QWidget):
     """One parameter page: a section selector over a :class:`PropertyGrid` (module docstring)."""
 
@@ -211,6 +227,8 @@ class ParamPage(QWidget):
         self.document = self._check(document)
         self.path: Path | None = Path(path) if path is not None else None
         self._ask_path: Callable[[bool], str | None] | None = None
+        self.last_save_warning = ""
+        """:func:`out_of_range_message` of the last save ("" = nothing out of range)."""
 
         outer = QVBoxLayout(self)
         outer.addLayout(self._build_header())
@@ -383,6 +401,10 @@ class ParamPage(QWidget):
             target = Path(chosen)
         write_params(target, self.document, backup_suffix=BACKUP_SUFFIX)
         self.set_path(target)
+        # Never blocks (U3): the file is written; the count is shown afterwards.
+        self.last_save_warning = out_of_range_message(self.document)
+        if self.last_save_warning:
+            self.problem_label.setText(self.last_save_warning)
         self.documentSaved.emit(str(target))
         return target
 

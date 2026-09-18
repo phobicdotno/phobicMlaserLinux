@@ -461,6 +461,36 @@ def _format_job(js: dict[str, Any]) -> str:
     )
 
 
+START_JOB_RETRY_S = 1.0
+"""How long ``run-job`` retries a ``start_job`` refused only because no axis poll has landed
+since the last motion command (STATUS §5 task 10). The daemon polls 2000/50 every
+``MccdConfig.axis_ro_period_ms`` = 90 ms, so this is ~11 poll periods: enough for a loaded
+machine, short enough that the operator's intent is still current."""
+
+
+def _start_job(client: Any, token: str, retry_s: float = START_JOB_RETRY_S) -> dict[str, Any]:
+    """``start_job``, retrying the one refusal that a fresh poll clears.
+
+    ``MccDaemon._require_ready`` (D8) wants a 2000/50 read *newer* than the last motion write
+    before it trusts READY; a job started right after another one is refused for up to one
+    poll period. Retrying keeps that check whole, where exempting ``start_job`` from it would
+    let a FIFO program start on a READY read from before the last move. Every other refusal -
+    another ``busy`` reason (MOVING, homing), arming (D9), a missing job - is final.
+    """
+    from nexcut.mccd.daemon import STALE_POLL_REFUSAL
+    from nexcut.mccd.ipc import IpcError
+
+    deadline = time.monotonic() + retry_s
+    while True:
+        try:
+            return dict(client.call("start_job", token=token))
+        except IpcError as exc:
+            stale = exc.code == "busy" and exc.message == STALE_POLL_REFUSAL
+            if not stale or time.monotonic() > deadline:
+                raise
+        time.sleep(0.03)
+
+
 def _run_job(ns: argparse.Namespace) -> int:
     path = Path(ns.file)
     if not path.is_file():
@@ -471,7 +501,7 @@ def _run_job(ns: argparse.Namespace) -> int:
         with _armed(client, "run-job", ns.arm):
             loaded = client.call("load_job", path=str(path.resolve()))
             print(f"loaded {loaded['frames']} frames, token {loaded['token'][:8]}", file=sys.stderr)
-            client.call("start_job", token=loaded["token"])
+            _start_job(client, loaded["token"])
             deadline = None if ns.timeout <= 0 else time.monotonic() + ns.timeout
             js: dict[str, Any] = {}
             try:

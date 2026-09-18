@@ -773,6 +773,71 @@ def test_cli_run_job_streams_a_frame_file(
         assert daemon.gate.arming.state is ArmState.DISARMED  # --arm disarmed again
 
 
+def test_cli_run_job_twice_in_quick_succession(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """STATUS §5 task 10: the second ``run-job`` used to fail with ``busy: axis status not
+    refreshed since the last motion command``. The CLI now retries that one refusal for a
+    bounded window; the daemon's READY gate (D8) is unchanged."""
+    from nexcut.mccd import cli
+
+    path = tmp_path / "job.txt"
+    write_frame_file(path, [(i + 1, tick_frame()) for i in range(2)], ["cli test"])
+    sim_cfg = SimConfig(tick_s=0.0002, fifo_starvation_alarm=False)
+    with running(sim_config=sim_cfg, arm=False) as (daemon, sim, _client):
+        sock = ["--socket", str(daemon.socket_path)]
+        for _ in range(2):
+            code = cli.main(["run-job", str(path), "--arm", *sock])
+            out = capsys.readouterr()
+            assert code == cli.EXIT_OK, out.err
+            assert "DONE 2/2 frames" in out.out
+        # the refusal itself, forced: a motion command "now + 0.3 s" makes every axis
+        # poll until then stale, so the first start_job is refused and the retry succeeds
+        daemon._last_motion_t = time.monotonic() + 0.3
+        code = cli.main(["run-job", str(path), "--arm", *sock])
+        out = capsys.readouterr()
+        assert code == cli.EXIT_OK, out.err
+        assert "DONE 2/2 frames" in out.out
+        assert sim.snapshot()["ticks_consumed"] == 3 * 2 * 99
+
+
+class _BusyClient:
+    def __init__(self, errors: list[Exception]) -> None:
+        self.errors = errors
+        self.calls = 0
+
+    def call(self, cmd: str, **kw: Any) -> dict[str, Any]:
+        assert cmd == "start_job"
+        self.calls += 1
+        if self.errors:
+            raise self.errors.pop(0)
+        return {"token": kw["token"], "state": "RUNNING"}
+
+
+def test_cli_start_job_retries_only_the_stale_poll_refusal() -> None:
+    from nexcut.mccd import cli
+
+    stale = "axis status not refreshed since the last motion command"
+    c = _BusyClient([IpcError("busy", stale), IpcError("busy", stale)])
+    assert cli._start_job(c, "tok")["state"] == "RUNNING" and c.calls == 3
+    # any other refusal - another busy reason included - is final at once
+    for err in (
+        IpcError("busy", "machine state MOVING (jog/home need READY, A1 §1)"),
+        IpcError("busy", "homing job running (11 §2 V6: one motion at a time)"),
+        IpcError("arming", "start_job needs MOTION_ARMED armed on this connection"),
+    ):
+        c = _BusyClient([err])
+        with pytest.raises(IpcError) as info:
+            cli._start_job(c, "tok")
+        assert info.value is err and c.calls == 1
+    # and the stale-poll refusal is retried for a bounded window only
+    c = _BusyClient([IpcError("busy", stale)] * 1000)
+    t0 = time.monotonic()
+    with pytest.raises(IpcError):
+        cli._start_job(c, "tok", retry_s=0.2)
+    assert time.monotonic() - t0 < 5.0 and 1 < c.calls < 1000
+
+
 def test_cli_run_job_without_arming_is_refused(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

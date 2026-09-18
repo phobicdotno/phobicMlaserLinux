@@ -163,6 +163,9 @@ _PUBLISH_TICK_S = 0.01
 _LOG_KEEP = 2000
 """Arming-history entries kept in memory (the gate's write log has its own caps,
 :class:`nexcut.mcc.safety.WriteLogLimits`)."""
+STALE_POLL_REFUSAL = "axis status not refreshed since the last motion command"
+"""The ``busy`` refusal of ``_require_ready`` that the next 2000/50 poll clears; the CLI
+retries exactly this one (``cli._start_job``)."""
 MAX_JOB_FRAMES = 1_000_000
 """Frames one ``load_job`` accepts (~7 h of machine time at 99 ticks x 250 us per frame).
 A port choice: the feeder streams lazily, so this only bounds pathological input."""
@@ -1255,7 +1258,7 @@ class MccDaemon:
         if self._homing is not None:
             raise IpcError("busy", "homing job running (11 §2 V6: one motion at a time)")
         if ro_t <= self._last_motion_t:
-            raise IpcError("busy", "axis status not refreshed since the last motion command")
+            raise IpcError("busy", STALE_POLL_REFUSAL)
         state = derive_machine_state(b, ro)
         if state is not MachineState.READY:
             raise IpcError("busy", f"machine state {state.name} (jog/home need READY, A1 §1)")
